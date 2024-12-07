@@ -170,34 +170,6 @@ static inline void write_mask(buffer_t *b, const unsigned char mask, const size_
     }
 }
 
-static inline size_t read_fixed_metadata(buffer_t *b)
-{
-    return (size_t)INCBYTE;
-}
-
-static inline size_t read_short_metadata(buffer_t *b)
-{
-    b->offset++;
-    return (size_t)INCBYTE & 0xFF;
-}
-
-static inline size_t read_medium_metadata(buffer_t *b)
-{
-    size_t size = 0;
-    memcpy(&size, b->base + b->offset + 1, 2);
-    b->offset += 3;
-    return size;
-}
-
-static inline size_t read_large_metadata(buffer_t *b)
-{
-    size_t size = 0;
-    memcpy(&size, b->base + b->offset + 1, 4);
-    b->offset += 5;
-    return size;
-}
-
-
 static inline bool write_str_metadata(buffer_t *b, const size_t size)
 {
     if (size <= STR_FIXED_MAXSIZE)
@@ -672,8 +644,8 @@ static bool encode_object(PyObject *obj, buffer_t *b, size_t *reallocs)
     }
     else
     {
-        // Custom type logic will be placed here
-        PyErr_SetString(PyExc_NotImplementedError, "CUSTOM/INCORRECT TYPES NOT IMPLEMENTED");
+        // Custom type logic will be placed here later
+        PyErr_Format(PyExc_NotImplementedError, "Received unsupported type: '%s'", Py_TYPE(obj)->tp_name);
         return false;
     }
 
@@ -832,7 +804,7 @@ static PyObject *fixstr_decode(buffer_t *b, const size_t size)
 
     if (match != NULL)
     {
-        const char *cbase = (PyASCIIObject *)match + 1;
+        const char *cbase = (const char *)((PyASCIIObject *)match + 1);
         const size_t csize = ((PyASCIIObject *)match)->length;
 
         if (_LIKELY(csize == size && memcmp(cbase, b->base + b->offset, size) == 0))
@@ -1114,9 +1086,13 @@ static PyObject *decode_bytes(buffer_t *b)
             else LENMODE_4BYTE
             else
             {
-                PyErr_SetString(PyExc_ValueError, INVALID_MSG " (invalid length bits in bin type)");
+                PyErr_SetString(PyExc_ValueError, INVALID_MSG " (invalid length bits in bin type, OR got currently unsupported ext type)");
                 return NULL;
             }
+
+            PyObject *obj = PyBytes_FromStringAndSize(b->base + b->offset, n);
+            b->offset += n;
+            return obj;
         }
         default:
         {
@@ -1161,7 +1137,7 @@ static PyObject *decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
 //     MODULE     //
 ////////////////////
 
-static void *cleanup_module(PyObject *m)
+static void cleanup_module(PyObject *m)
 {
     // Decref all common strings and free the buffer itself
     for (size_t i = 0; i < FIXASCII_COMMON_SLOTS; ++i)
@@ -1195,7 +1171,7 @@ static struct PyModuleDef cmsgpack = {
 
 PyMODINIT_FUNC PyInit_cmsgpack(void) {
     // Allocate the fixascii commons table, initialize with NULL using calloc
-    fixascii_common = (char *)calloc(FIXASCII_COMMON_SLOTS, sizeof(PyObject *));
+    fixascii_common = (PyObject **)calloc(FIXASCII_COMMON_SLOTS, sizeof(PyObject *));
 
     if (fixascii_common == NULL)
         return PyErr_NoMemory();
