@@ -54,7 +54,7 @@ typedef struct {
 #define DT_UINT_BIT32 0xCEULL
 #define DT_UINT_BIT64 0xCFULL
 
-#define UINT_FIXED_MAXVAL 0x7FULL
+#define UINT_FIXED_MAXVAL 0x7FLL
 #define UINT_BIT08_MAXVAL 0xFFULL
 #define UINT_BIT16_MAXVAL 0xFFFFULL
 #define UINT_BIT32_MAXVAL 0xFFFFFFFFULL
@@ -245,7 +245,7 @@ static inline bool write_map_metadata(buffer_t *b, const size_t npairs)
 
 static inline void write_int_metadata_and_data(buffer_t *b, const int64_t num)
 {
-    if (num >= 0 && (uint64_t)num <= UINT_FIXED_MAXVAL)
+    if (num >= 0 && num <= UINT_FIXED_MAXVAL)
     {
         write_mask(b, DT_UINT_FIXED, num, 0);
         return;
@@ -939,8 +939,14 @@ static PyObject *decode_bytes(buffer_t *b)
         }
         case FIXLEN_DT(DT_INT_FIXED):
         {
-            // Also no increment, same-byte value
-            return PyLong_FromLong((long)n & 0x1F);
+            n &= 0x1F;
+
+            // Sign-extend the integer
+            long num = (long)n;
+            if (num & 0x10)
+                num |= ~0x1F;
+
+            return PyLong_FromLong((long)num);
         }
         case FIXLEN_DT(DT_MAP_FIXED): // Also catches DT_ARR_FIXED
         {
@@ -1062,18 +1068,15 @@ static PyObject *decode_bytes(buffer_t *b)
 
             if (mask == DT_FLOAT_BIT32)
             {
-                #ifdef IS_BIG_ENDIAN
-                n = n & 0xFFFFFFFF;
-                #else
-                n = (n >> 32) & 0xFFFFFFFF;
-                #endif
+                float _num;
+                memcpy(&n, &_num, 4);
+                num = (double)_num;
 
-                num = (double)((float)n); // Promote N to float first, the promote float to double
                 b->offset += 4;
             }
             else
             {
-                num = (double)n;
+                memcpy(&num, &n, 8);
                 b->offset += 8;
             }
 
