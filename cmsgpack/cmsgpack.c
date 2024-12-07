@@ -149,21 +149,21 @@ static inline void write_mask(buffer_t *b, const unsigned char mask, const size_
     }
     else if (nbytes == 1)
     {
-        const uint16_t mdata = BIG_16(size | (mask << 8));
+        const uint16_t mdata = BIG_16((size & 0xFF) | ((uint16_t)mask << 8));
         const size_t mdata_off = 0;
         memcpy(b->base + b->offset, (char *)(&mdata) + mdata_off, 2);
         b->offset += 2;
     }
     else if (nbytes == 2)
     {
-        const uint32_t mdata = BIG_32(size | (mask << 16));
+        const uint32_t mdata = BIG_32((size & 0xFFFF) | ((uint32_t)mask << 16));
         const size_t mdata_off = 1;
         memcpy(b->base + b->offset, (char *)(&mdata) + mdata_off, 3);
         b->offset += 3;
     }
     else if (nbytes == 4)
     {
-        const uint64_t mdata = BIG_64((uint64_t)size | ((uint64_t)mask << 32));
+        const uint64_t mdata = BIG_64((uint64_t)(size & 0xFFFFFFFF) | ((uint64_t)mask << 32));
         const size_t mdata_off = 3;
         memcpy(b->base + b->offset, (char *)(&mdata) + mdata_off, 5);
         b->offset += 5;
@@ -273,7 +273,7 @@ static inline void write_int_metadata_and_data(buffer_t *b, const int64_t num)
     }
     else
     {
-        INCBYTE[0] = num >= 0 ? DT_UINT_BIT64 : DT_INT_BIT64;
+        INCBYTE[0] = (num >= 0 ? DT_UINT_BIT64 : DT_INT_BIT64);
 
         const uint64_t _num = BIG_64(num);
         memcpy(b->base + b->offset, &_num, 8);
@@ -389,7 +389,7 @@ static bool fetch_long(PyObject *obj, int64_t *num)
     case 2:
     {
         *num = lobj->long_value.ob_digit[0] |
-               (lobj->long_value.ob_digit[1] << PyLong_SHIFT);
+               ((uint64_t)lobj->long_value.ob_digit[1] << PyLong_SHIFT);
         
         break;
     }
@@ -748,37 +748,39 @@ static PyObject *encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
 
 #ifdef IS_BIG_ENDIAN
 
-#define LENMODE_1BYTE if (lenmode == 0) { \
-    n = n & 0xFF; \
-    b->offset += 1; \
-}
-#define LENMODE_2BYTE if (lenmode == 1) { \
-    n = n & 0xFFFF; \
-    b->offset += 2; \
-}
-#define LENMODE_4BYTE if (lenmode == 2) { \
-    n = n & 0xFFFFFFFF; \
-    b->offset += 4; \
-}
+#define EXTRACT1(n) n = n & 0xFF
+#define EXTRACT2(n) n = n & 0xFFFF
+#define EXTRACT4(n) n = n & 0xFFFFFFFF
 
 #else
 
-#define LENMODE_1BYTE if (lenmode == 0) { \
-    n = (n >> 56) & 0xFF; \
-    b->offset += 1; \
-}
-#define LENMODE_2BYTE if (lenmode == 1) { \
-    n = (n >> 48) & 0xFFFF; \
-    b->offset += 2; \
-}
-#define LENMODE_4BYTE if (lenmode == 2) { \
-    n = (n >> 32) & 0xFFFFFFFF; \
-    b->offset += 4; \
-}
+#define EXTRACT1(n) n = (n >> 56) & 0xFF
+#define EXTRACT2(n) n = (n >> 48) & 0xFFFF
+#define EXTRACT4(n) n = (n >> 32) & 0xFFFFFFFF
 
 #endif
 
+#define LENMODE_1BYTE if (lenmode == 0) { \
+    EXTRACT1(n); \
+    b->offset += 1; \
+}
+#define LENMODE_2BYTE if (lenmode == 1) { \
+    EXTRACT2(n); \
+    b->offset += 2; \
+}
+#define LENMODE_4BYTE if (lenmode == 2) { \
+    EXTRACT4(n); \
+    b->offset += 4; \
+}
+
+
 #define INVALID_MSG "Received invalid encoded data"
+
+
+// The number of slots to use in the common value caches
+#ifndef COMMONCACHE_SLOTS
+#define COMMONCACHE_SLOTS 256
+#endif
 
 
 // FNV-1a hashing algorithm
@@ -794,12 +796,11 @@ static inline uint32_t fnv1a(const void *data, size_t len) {
     return hash;
 }
 
-#define FIXASCII_COMMON_SLOTS 256
-static PyObject **fixascii_common; // Allocated on module init
+static PyObject **fixascii_common;
 
-static PyObject *fixstr_decode(buffer_t *b, const size_t size)
+static PyObject *fixstr_to_py(const char *ptr, const size_t size)
 {
-    const size_t hash = (size_t)(fnv1a(b->base + b->offset, size) & (FIXASCII_COMMON_SLOTS - 1));
+    const size_t hash = (size_t)(fnv1a(ptr, size) % COMMONCACHE_SLOTS);
     PyObject *match = fixascii_common[hash];
 
     if (match != NULL)
@@ -807,7 +808,7 @@ static PyObject *fixstr_decode(buffer_t *b, const size_t size)
         const char *cbase = (const char *)((PyASCIIObject *)match + 1);
         const size_t csize = ((PyASCIIObject *)match)->length;
 
-        if (_LIKELY(csize == size && memcmp(cbase, b->base + b->offset, size) == 0))
+        if (_LIKELY(csize == size && memcmp(cbase, ptr, size) == 0))
         {
             Py_INCREF(match);
             return match;
@@ -815,16 +816,67 @@ static PyObject *fixstr_decode(buffer_t *b, const size_t size)
     }
 
     // No common value, create a new one
-    PyObject *obj = PyUnicode_DecodeUTF8(b->base + b->offset, size, "strict");
+    PyObject *obj = PyUnicode_DecodeUTF8(ptr, size, "strict");
 
     // Add to commons table if ascii
     if (PyUnicode_IS_COMPACT_ASCII(obj))
     {
+        Py_XDECREF(match);
         Py_INCREF(obj);
         fixascii_common[hash] = obj;
     }
 
     return obj;
+}
+
+typedef struct {
+    uintptr_t val;
+    PyObject *obj;
+} smallint_common_t;
+static smallint_common_t *smallint_common;
+
+static PyObject *varint_to_py(const int64_t num, const bool is_uint)
+{
+    // Pass numbers within Python's smallint range to a direct obj creation
+    if (num >= 0 ? num <= 256 : num >= -5)
+    {
+        return PyLong_FromLong((long)num);
+    }
+
+    // Only use commons table on small numbers, otherwise only rarely useful
+    if (num >= 0 ? num <= 0x1FFF : num >= 0x07FF)
+    {
+        // Use the number for the hash directly
+        const size_t hash = (num >> 8) % COMMONCACHE_SLOTS;
+        smallint_common_t match = smallint_common[hash];
+
+        if (match.obj != NULL)
+        {
+            if (_LIKELY(match.val == (uintptr_t)num))
+            {
+                Py_INCREF(match.obj);
+                return match.obj;
+            }
+
+            Py_DECREF(match.obj);
+        }
+
+        // Cache miss, create new value and add it to the list
+        PyObject *obj = PyLong_FromLong((long)num);
+        Py_INCREF(obj);
+
+        smallint_common[hash] = (smallint_common_t){
+            .obj = obj,
+            .val = (uintptr_t)num,
+        };
+
+        return obj;
+    }
+
+    // Create the object directly, caching such large values isn't useful often
+    if (is_uint)
+        return PyLong_FromUnsignedLongLong((unsigned long long)num);
+    return PyLong_FromLongLong((long long)num);
 }
 
 
@@ -871,9 +923,11 @@ static PyObject *decode_map(buffer_t *b, const size_t npairs)
             b->offset++;
 
             const size_t size = mask & 0b11111;
-            key = fixstr_decode(b, size);
-
+            const char *ptr = b->base + b->offset;
+            
             b->offset += size;
+
+            key = fixstr_to_py(ptr, size);
         }
         else
         {
@@ -925,9 +979,11 @@ static PyObject *decode_bytes(buffer_t *b)
         case FIXLEN_DT(DT_STR_FIXED):
         {
             n &= 0x1F;
-            PyObject *obj = fixstr_decode(b, n);
+
+            const char *ptr = b->base + b->offset;
             b->offset += n;
-            return obj;
+
+            return fixstr_to_py(ptr, n);
         }
         case 0b000: // Possible combinations for fixuint as uses just 1 bit and we're checking the 3 upper bits
         case 0b001:
@@ -982,7 +1038,8 @@ static PyObject *decode_bytes(buffer_t *b)
         // The length mode bits are stored in the lowest 2 bits
         unsigned int lenmode = mask & 0b11;
 
-        switch ((mask >> 2) & 0b111)
+        const unsigned int varlen_mask = (mask >> 2) & 0b111;
+        switch (varlen_mask)
         {
         case 0b110: // str
         {
@@ -1003,23 +1060,40 @@ static PyObject *decode_bytes(buffer_t *b)
             return obj;
         }
         case 0b011: // uint
-        {
-            LENMODE_1BYTE
-            else LENMODE_2BYTE
-            else LENMODE_4BYTE
-            // uint64_t takes up 8 bytes so no invalid data to mask away, as this is an 8-byte uint
-            else b->offset += 8;
-
-            return PyLong_FromUnsignedLongLong((unsigned long long)n);
-        }
         case 0b100: // int
         {
-            LENMODE_1BYTE
-            else LENMODE_2BYTE
-            else LENMODE_4BYTE
-            else b->offset += 8;
+            const bool is_uint = varlen_mask == 0b011;
 
-            return PyLong_FromLongLong((long long)n);
+            if (lenmode == 0)
+            {
+                EXTRACT1(n);
+                if (!is_uint && n & 0x80)
+                    n |= ~0xFF;
+
+                b->offset += 1;
+            }
+            else if (lenmode == 1)
+            {
+                EXTRACT2(n);
+                if (!is_uint && n & 0x8000)
+                    n |= ~0xFFFF;
+
+                b->offset += 2;
+            }
+            else if (lenmode == 2)
+            {
+                EXTRACT4(n);
+                if (!is_uint && n & 0x80000000)
+                    n |= ~0xFFFFFFFF;
+
+                b->offset += 4;
+            }
+            else
+            {
+                b->offset += 8;
+            }
+
+            return varint_to_py(n, is_uint);
         }
         case 0b111: // array & map
         {
@@ -1142,13 +1216,15 @@ static PyObject *decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
 
 static void cleanup_module(PyObject *m)
 {
-    // Decref all common strings and free the buffer itself
-    for (size_t i = 0; i < FIXASCII_COMMON_SLOTS; ++i)
+    // Decref all items in cache lists
+    for (size_t i = 0; i < COMMONCACHE_SLOTS; ++i)
     {
         Py_XDECREF(fixascii_common[i]);
+        Py_XDECREF(smallint_common[i].obj);
     }
 
     free(fixascii_common);
+    free(smallint_common);
 }
 
 static PyMethodDef CmsgpackMethods[] = {
@@ -1173,11 +1249,19 @@ static struct PyModuleDef cmsgpack = {
 };
 
 PyMODINIT_FUNC PyInit_cmsgpack(void) {
-    // Allocate the fixascii commons table, initialize with NULL using calloc
-    fixascii_common = (PyObject **)calloc(FIXASCII_COMMON_SLOTS, sizeof(PyObject *));
-
+    // Allocate the cache tables
+    fixascii_common = (PyObject **)calloc(COMMONCACHE_SLOTS, sizeof(PyObject *));
     if (fixascii_common == NULL)
+    {
         return PyErr_NoMemory();
+    }
+    
+    smallint_common = (smallint_common_t *)calloc(COMMONCACHE_SLOTS, sizeof(smallint_common_t));
+    if (smallint_common == NULL)
+    {
+        free(fixascii_common);
+        return PyErr_NoMemory();
+    }
 
     PyObject *m = PyModule_Create(&cmsgpack);
     return m;
