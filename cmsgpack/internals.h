@@ -1,11 +1,10 @@
 #ifndef INTERNALS_H
 #define INTERNALS_H
 
-#include <Python.h>
 
-#if Py_BIG_ENDIAN == 1
-#define IS_BIG_ENDIAN
-#endif
+///////////////////
+//   INTERNALS   //
+///////////////////
 
 #ifdef IS_BIG_ENDIAN
 
@@ -72,12 +71,14 @@
     #define LEADING_ZEROES_64(x) (__builtin_clzll((unsigned long long)(x)))
     #define LEADING_ZEROES_32(x) (__builtin_clz((unsigned int)(x)))
 
-    //#define LEADING_ZEROES(x) (sizeof(x) == 8 ? (LEADING_ZEROES_64(x)) : (LEADING_ZEROES_32(x)))
+    #define _always_inline __always_inline
 
 #elif defined(_MSC_VER)
 
     #include <intrin.h>
     #define LEADING_ZEROES_64(x) (8 - _BitScanReverse64(x))
+
+    #define __forceinline
 
 #else
 
@@ -94,6 +95,8 @@
 
         return n;
     }
+
+    #define _always_inline inline
 
 #endif
 
