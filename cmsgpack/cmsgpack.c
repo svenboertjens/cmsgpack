@@ -243,37 +243,37 @@ static inline bool write_map_metadata(buffer_t *b, const size_t npairs)
     return true;
 }
 
-static inline void write_int_metadata_and_data(buffer_t *b, const int64_t num)
+static inline void write_int_metadata_and_data(buffer_t *b, const uint64_t num, const bool neg)
 {
-    if (num >= 0 && num <= UINT_FIXED_MAXVAL)
+    if (!neg && num <= UINT_FIXED_MAXVAL)
     {
         write_mask(b, DT_UINT_FIXED, num, 0);
         return;
     }
-    else if (num < 0 && num >= INT_FIXED_MAXVAL)
+    else if (neg && (int64_t)num >= INT_FIXED_MAXVAL)
     {
         write_mask(b, DT_INT_FIXED, num, 0);
         return;
     }
 
     // Convert negative numbers into positive ones, upscaled to match the uint max values
-    const uint64_t pnum = num >= 0 ? num : ((~num + 1) << 1) - 1;
+    const uint64_t pnum = !neg ? num : ((~num + 1) << 1) - 1;
 
     if (pnum <= UINT_BIT08_MAXVAL)
     {
-        write_mask(b, num >= 0 ? DT_UINT_BIT08 : DT_INT_BIT08, num, 1);
+        write_mask(b, !neg ? DT_UINT_BIT08 : DT_INT_BIT08, num, 1);
     }
     else if (pnum <= UINT_BIT16_MAXVAL)
     {
-        write_mask(b, num >= 0 ? DT_UINT_BIT16 : DT_INT_BIT16, num, 2);
+        write_mask(b, !neg ? DT_UINT_BIT16 : DT_INT_BIT16, num, 2);
     }
     else if (pnum <= UINT_BIT32_MAXVAL)
     {
-        write_mask(b, num >= 0 ? DT_UINT_BIT32 : DT_INT_BIT32, num, 4);
+        write_mask(b, !neg ? DT_UINT_BIT32 : DT_INT_BIT32, num, 4);
     }
     else
     {
-        INCBYTE[0] = (num >= 0 ? DT_UINT_BIT64 : DT_INT_BIT64);
+        INCBYTE[0] = (!neg ? DT_UINT_BIT64 : DT_INT_BIT64);
 
         const uint64_t _num = BIG_64(num);
         memcpy(b->base + b->offset, &_num, 8);
@@ -349,18 +349,15 @@ static inline bool write_ext_metadata(buffer_t *b, const size_t size, const unsi
 
 static void fetch_str(PyObject *obj, char **base, size_t *size)
 {
-    if (_LIKELY(PyUnicode_IS_COMPACT_ASCII(obj))) {
+    if (_LIKELY(PyUnicode_IS_COMPACT_ASCII(obj)))
+    {
         *size = ((PyASCIIObject *)obj)->length;
         *base = (char *)(((PyASCIIObject *)obj) + 1);
     }
     else
     {
-        *size = ((PyCompactUnicodeObject *)obj)->utf8_length;
-        *base = ((PyCompactUnicodeObject *)obj)->utf8;
-    }
-
-    if (_UNLIKELY(base == NULL))
         *base = (char *)PyUnicode_AsUTF8AndSize(obj, (Py_ssize_t *)size);
+    }
 }
 
 static inline void fetch_bytes(PyObject *obj, char **base, size_t *size)
@@ -369,7 +366,7 @@ static inline void fetch_bytes(PyObject *obj, char **base, size_t *size)
     *size = PyBytes_GET_SIZE(obj);
 }
 
-static bool fetch_long(PyObject *obj, int64_t *num)
+static bool fetch_long(PyObject *obj, uint64_t *num, bool *neg)
 {
     // Use custom integer extraction on 3.12+
     #if PY_VERSION_HEX >= 0x030c0000
@@ -377,46 +374,37 @@ static bool fetch_long(PyObject *obj, int64_t *num)
     PyLongObject *lobj = (PyLongObject *)obj;
 
     const size_t digits = lobj->long_value.lv_tag >> _PyLong_NON_SIZE_BITS;
+    uint64_t n = 0;
 
-    switch (digits)
+    if (digits >= 1)
     {
-    case 0:
-    case 1:
-    {
-        *num = lobj->long_value.ob_digit[0];
-        break;
+        n |= (uint64_t)lobj->long_value.ob_digit[0];
     }
-    case 2:
+    if (digits >= 2)
     {
-        *num = lobj->long_value.ob_digit[0] |
-               ((uint64_t)lobj->long_value.ob_digit[1] << PyLong_SHIFT);
-        
-        break;
+        n |= (uint64_t)lobj->long_value.ob_digit[1] << PyLong_SHIFT;
     }
-    case 3:
+    if (digits >= 3)
     {
-        *num = (uint64_t)lobj->long_value.ob_digit[0] |
-               ((uint64_t)lobj->long_value.ob_digit[1] << (PyLong_SHIFT * 1)) |
-               ((uint64_t)lobj->long_value.ob_digit[2] << (PyLong_SHIFT * 2));
-        
-        const digit dig3 = lobj->long_value.ob_digit[2];
-        const digit dig3_overflow = ((1ULL << (64 - (2 * PyLong_SHIFT))) - 1);
+        const uint64_t dig3 = (uint64_t)lobj->long_value.ob_digit[2];
 
-        // Don't break if there's overflow
-        if (_LIKELY(dig3 < dig3_overflow))
-            break;
-    }
-    default:
-    {
-        PyErr_SetString(PyExc_OverflowError, "integers cannot be more than 8 bytes");
-        return false;
-    }
+        const uint64_t dig3_overflow_val = (1ULL << (64 - (2 * PyLong_SHIFT))) - 1;
+        const bool dig3_overflow = dig3 > dig3_overflow_val;
+
+        if (_UNLIKELY(digits > 3 || dig3_overflow))
+        {
+            PyErr_SetString(PyExc_OverflowError, "integers cannot be more than 8 bytes");
+            return false;
+        }
+
+        n |= dig3 << (2 * PyLong_SHIFT);
     }
 
-    bool neg = (lobj->long_value.lv_tag & _PyLong_SIGN_MASK) != 0;
-
-    if (neg)
-        *num = -*num;
+    *neg = (lobj->long_value.lv_tag & _PyLong_SIGN_MASK) != 0;
+    if (*neg)
+        n = -n;
+    
+    *num = n;
 
     return true;
 
@@ -579,12 +567,13 @@ static bool encode_object(PyObject *obj, buffer_t *b, size_t *reallocs)
 
     if (tp == &PyLong_Type)
     {
-        int64_t num;
+        uint64_t num;
+        bool neg;
 
-        if (_UNLIKELY(!fetch_long(obj, &num)))
+        if (_UNLIKELY(!fetch_long(obj, &num, &neg)))
             return false;
 
-        write_int_metadata_and_data(b, num);
+        write_int_metadata_and_data(b, num, neg);
     }
     else if (tp == &PyFloat_Type)
     {
@@ -830,21 +819,24 @@ static PyObject *fixstr_to_py(const char *ptr, const size_t size)
 }
 
 typedef struct {
-    uintptr_t val;
+    intptr_t val;
     PyObject *obj;
 } smallint_common_t;
 static smallint_common_t *smallint_common;
 
-static PyObject *varint_to_py(const int64_t num, const bool is_uint)
+static PyObject *varint_to_py(const uint64_t num, const bool is_uint)
 {
+    // Signed version of the number, for negative representations
+    const int64_t snum = (int64_t)num;
+
     // Pass numbers within Python's smallint range to a direct obj creation
-    if (num >= 0 ? num <= 256 : num >= -5)
+    if (num >= 0 ? num <= 256 : snum >= -5)
     {
         return PyLong_FromLong((long)num);
     }
 
     // Only use commons table on small numbers, otherwise only rarely useful
-    if (num >= 0 ? num <= 0x1FFF : num >= 0x07FF)
+    if (num >= 0 ? num <= 0x1FFF : snum >= 0x07FF)
     {
         // Use the number for the hash directly
         const size_t hash = (num >> 8) % COMMONCACHE_SLOTS;
@@ -852,7 +844,7 @@ static PyObject *varint_to_py(const int64_t num, const bool is_uint)
 
         if (match.obj != NULL)
         {
-            if (_LIKELY(match.val == (uintptr_t)num))
+            if (_LIKELY(match.val == (intptr_t)snum))
             {
                 Py_INCREF(match.obj);
                 return match.obj;
@@ -862,21 +854,21 @@ static PyObject *varint_to_py(const int64_t num, const bool is_uint)
         }
 
         // Cache miss, create new value and add it to the list
-        PyObject *obj = PyLong_FromLong((long)num);
+        PyObject *obj = PyLong_FromLong((long)snum);
         Py_INCREF(obj);
 
         smallint_common[hash] = (smallint_common_t){
             .obj = obj,
-            .val = (uintptr_t)num,
+            .val = (intptr_t)snum,
         };
 
         return obj;
     }
 
-    // Create the object directly, caching such large values isn't useful often
     if (is_uint)
         return PyLong_FromUnsignedLongLong((unsigned long long)num);
-    return PyLong_FromLongLong((long long)num);
+
+    return PyLong_FromLongLong((long long)snum);
 }
 
 
@@ -1084,7 +1076,7 @@ static PyObject *decode_bytes(buffer_t *b)
             {
                 EXTRACT4(n);
                 if (!is_uint && n & 0x80000000)
-                    n |= ~0xFFFFFFFF;
+                    n |= ~0xFFFFFFFFULL;
 
                 b->offset += 4;
             }
