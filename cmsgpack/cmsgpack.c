@@ -24,8 +24,6 @@
 //    TYPEDEFS    //
 ////////////////////
 
-#include <Python.h>
-
 // Check if the system is big-endian
 #if Py_BIG_ENDIAN == 1
 #define IS_BIG_ENDIAN
@@ -35,20 +33,54 @@
 #include "masks.h"
 #include "internals.h"
 
+
+// Number of slots in ext type hash tables
+#define EXT_TABLE_SLOTS 256
+
+typedef struct {
+    PyTypeObject *key;
+    PyObject *val;
+} keyval_t;
+
+typedef struct {
+    uint8_t offsets[EXT_TABLE_SLOTS];
+    uint8_t lengths[EXT_TABLE_SLOTS];
+    keyval_t *pairs;
+} hashtable_t;
+
+// Usertypes encode object struct
+typedef struct {
+    PyObject_HEAD
+    hashtable_t table;
+} ext_types_encode_t;
+
+// Usertypes decode object struct
+typedef struct {
+    PyObject_HEAD
+    PyObject *reads[EXT_TABLE_SLOTS];
+} ext_types_decode_t;
+
+static PyTypeObject ExtTypesEncodeObj;
+static PyTypeObject ExtTypesDecodeObj;
+
+
 // Struct holding buffer data for encoding
 typedef struct {
-    PyObject *ob_base;  // Base of allocated PyBytes object
+    PyObject *ob_base; // Base of allocated PyBytes object
     char *base;        // Base of buffer to write to
     size_t offset;     // Writing offset relative to the buffer base
     size_t allocated;  // Space allocated for the buffer (excluding PyBytesObject size)
+    ext_types_encode_t *ext; // object for encoding ext types
 } encbuffer_t;
 
 // Struct holding buffer data for decoding
 typedef struct {
-    char *base;
-    size_t offset;
-    size_t allocated;
+    char *base;        // Base of the buffer object that contains the data to decode
+    size_t offset;     // Writing offset relative to the base
+    size_t allocated;  // Space allocated in the buffer object
+    ext_types_decode_t *ext; // Object for decoding ext types
 } decbuffer_t;
+
 
 static bool encode_object(PyObject *obj, encbuffer_t *b);
 static PyObject *decode_bytes(decbuffer_t *b);
@@ -59,7 +91,7 @@ static size_t avg_item_size;
 
 // Copied from cpython/Objects/bytesobject.c. Used for byteobject reallocation
 #include <stddef.h>
-#define PyBytes_SIZE (offsetof(PyBytesObject, ob_sval) + 1)
+#define PyBytesObject_SIZE (offsetof(PyBytesObject, ob_sval) + 1)
 
 
 /////////////////////
@@ -79,169 +111,6 @@ static void error_incorrect_value(const char *msg)
 static void error_no_memory(void)
 {
     PyErr_NoMemory();
-}
-
-
-/////////////////////
-//  PY TYPE CHECK  //
-/////////////////////
-
-static _always_inline bool py_is_str(PyObject *obj)
-{
-    return PyUnicode_CheckExact(obj);
-}
-
-static _always_inline bool py_is_bin(PyObject *obj)
-{
-    return PyBytes_CheckExact(obj);
-}
-
-static _always_inline bool py_is_int(PyObject *obj)
-{
-    return PyLong_CheckExact(obj);
-}
-
-static _always_inline bool py_is_float(PyObject *obj)
-{
-    return PyFloat_CheckExact(obj);
-}
-
-static _always_inline bool py_is_bool(PyObject *obj)
-{
-    return PyBool_Check(obj);
-}
-
-static _always_inline bool py_is_nil(PyObject *obj)
-{
-    return obj == Py_None;
-}
-
-static _always_inline bool py_is_arr(PyObject *obj)
-{
-    return PyList_CheckExact(obj);
-}
-
-static _always_inline bool py_is_map(PyObject *obj)
-{
-    return PyDict_CheckExact(obj);
-}
-
-
-/////////////////////////
-//  EXPOSED FUNCTIONS  //
-/////////////////////////
-
-static PyObject *encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
-{
-    if (_UNLIKELY(nargs < 1))
-    {
-        PyErr_SetString(PyExc_ValueError, "Expected at least the 'obj' argument");
-        return NULL;
-    }
-
-    PyObject *obj = args[0];
-
-    encbuffer_t b;
-
-    // Handle allocations for lists and dicts separate from singular items
-    size_t nitems;
-    size_t initial_alloc;
-
-    PyTypeObject *tp = Py_TYPE(obj);
-    if (tp == &PyList_Type || tp == &PyDict_Type)
-    {
-        // Set the base of the initial alloc size to the average alloc size
-        initial_alloc = avg_alloc_size;
-
-        // Allocate extra space based on the number of items/pairs
-        if (tp == &PyList_Type)
-        {
-            nitems = PyList_GET_SIZE(obj);
-            initial_alloc += nitems * avg_item_size;
-        }
-        else if (tp == &PyDict_Type)
-        {
-            const size_t npairs = PyDict_GET_SIZE(obj);
-            nitems = npairs * 2; // One pair is two items
-            initial_alloc += nitems * avg_item_size;
-        }
-
-        // This creates a PyBytesObject with initialized internals. We will manually realloc this pointer
-        b.ob_base = (void *)PyBytes_FromStringAndSize(NULL, initial_alloc);
-
-        if (b.ob_base == NULL)
-        {
-            return PyErr_NoMemory();
-        }
-
-        // Set the other data of the buffer struct
-        b.base = PyBytes_AS_STRING(b.ob_base);
-        b.allocated = initial_alloc;
-        b.offset = 0;
-    }
-    else
-    {
-        // Set the object base to NULL. As it's a single item, the total required size will be known once we
-        // ensure the buffer has enough space. The realloc function accepts NULL and will handle it as a malloc,
-        // so having the buffer be malloc'd during the buffer ensure avoids over- or underallocation.
-        b.ob_base = NULL;
-        b.allocated = 0;
-        b.offset = 0;
-
-        // Set number of items to zero to avoid the dynamic allocation update
-        nitems = 0;
-    }
-    
-    if (_UNLIKELY(encode_object(obj, &b) == false))
-    {
-        // Error should be set already
-        PyObject_Free(b.ob_base);
-        return NULL;
-    }
-
-    // Update allocation settings if we worked with a container object
-    if (nitems != 0)
-        update_allocation_settings(b.allocated != initial_alloc, b.offset, initial_alloc, nitems);
-
-    // Correct the size of the bytes object and null-terminate before returning
-    Py_SET_SIZE(b.ob_base, b.offset);
-    b.base[b.offset] = 0;
-
-    // Return the bytes object holding the data
-    return (PyObject *)b.ob_base;
-}
-
-static PyObject *decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
-{
-    if (_UNLIKELY(nargs) < 1)
-    {
-        PyErr_SetString(PyExc_ValueError, "Expected at least the 'encoded' argument");
-        return NULL;
-    }
-
-    PyObject *encoded = args[0];
-
-    Py_buffer buffer;
-    if (PyObject_GetBuffer(encoded, &buffer, PyBUF_READ) != 0)
-        return NULL;
-
-    decbuffer_t b = {
-        .base = buffer.buf,
-        .allocated = buffer.len,
-        .offset = 0,
-    };
-
-    if (b.allocated <= 0)
-    {
-        PyBuffer_Release(&buffer);
-        PyErr_Format(PyExc_ValueError, "Expected the buffer to have a size of at least 1, got %zi", b.allocated);
-        return NULL;
-    }
-
-    PyObject *result = decode_bytes(&b);
-
-    PyBuffer_Release(&buffer);
-    return result;
 }
 
 
@@ -403,6 +272,308 @@ static _always_inline PyObject *nil_to_py(void)
     Py_RETURN_NONE;
 }
 
+
+/////////////////////
+//   EXT OBJECTS   //
+/////////////////////
+
+#define EXT_ENCODE_HASH(n) (((uintptr_t)(n) >> 8) % EXT_TABLE_SLOTS)
+
+static PyObject *ExtTypesEncode(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (_UNLIKELY(nargs != 1))
+    {
+        PyErr_SetString(PyExc_ValueError, "Expected just the 'pairs' argument");
+        return NULL;
+    }
+
+    PyObject *pairsdict = args[0];
+
+    ext_types_encode_t *obj = PyObject_New(ext_types_encode_t, &ExtTypesEncodeObj);
+    if (obj == NULL)
+        return PyErr_NoMemory();
+    
+    const size_t npairs = PyDict_GET_SIZE(pairsdict);
+    const size_t array_size = npairs * sizeof(PyObject *);
+
+    // Allocate a single buffer for both the keys and vals
+    PyObject **keys_vals = (PyObject **)malloc(2 * array_size);
+    if (keys_vals == NULL)
+        return PyErr_NoMemory();
+    
+    // Set the key array at the start of the shared buffer, and the val array directly on top of it
+    PyObject **keys = keys_vals;
+    PyObject **vals = (PyObject **)((char *)keys_vals + array_size);
+
+    // Pairs buffer for the hash table
+    keyval_t *pairs = (keyval_t *)PyObject_Malloc(npairs * sizeof(keyval_t));
+    if (pairs == NULL)
+    {
+        free(keys_vals);
+        return PyErr_NoMemory();
+    }
+
+    // Set the pairs array in the table
+    hashtable_t tbl = obj->table;
+    tbl.pairs = pairs;
+    
+    // Collect all keys and vals in their respective arrays and type check them
+    Py_ssize_t pos = 0;
+    for (size_t i = 0; i < npairs; ++i)
+    {
+        PyObject *key;
+        PyObject *val;
+
+        PyDict_Next(pairsdict, &pos, &key, &val);
+
+        if (!PyType_CheckExact(key) || !PyCallable_Check(val))
+        {
+            free(keys_vals);
+            free(pairs);
+
+            PyErr_Format(PyExc_ValueError, "Expected keys of type 'type' and values of type 'callable', got a key of type '%s' with a value of type '%s'", Py_TYPE(key)->tp_name, Py_TYPE(val)->tp_name);
+            return NULL;
+        }
+
+        keys[i] = key;
+        vals[i] = val;
+    }
+
+    // Calculate the length required per hash of each pair
+    uint8_t lengths[EXT_TABLE_SLOTS] = {0};
+    for (size_t i = 0; i < npairs; ++i)
+    {
+        const uint8_t hash = EXT_ENCODE_HASH(keys[i]);
+        lengths[hash]++;
+    }
+
+    // Copy the lengths into the table
+    memcpy(tbl.lengths, lengths, EXT_TABLE_SLOTS);
+
+    // Initialize the first offset as zero, calculate the others
+    tbl.offsets[0] = 0;
+    for (size_t i = 1; i < EXT_TABLE_SLOTS; ++i)
+    {
+        // Set the offset of the current index based on the offset and length of the previous hash
+        tbl.offsets[i] = tbl.offsets[i - 1] + tbl.lengths[i - 1];
+    }
+
+    for (size_t i = 0; i < npairs; ++i)
+    {
+        PyObject *key = keys[i];
+        PyObject *val = vals[i];
+
+        const size_t hash = EXT_ENCODE_HASH(key);
+        const size_t length = --lengths[hash]; // Decrement to place the next item under this hash one spot lower
+        const size_t offset = tbl.offsets[hash] + length;
+
+        pairs[offset].key = (PyTypeObject *)key;
+        pairs[offset].val = val;
+
+        // Incref to ensure a reference to the objects
+        Py_INCREF(key);
+        Py_INCREF(val);
+    }
+
+    free(keys_vals);
+
+    return (PyObject *)obj;
+}
+
+static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (_UNLIKELY(nargs != 1))
+    {
+        PyErr_SetString(PyExc_ValueError, "Expected just the 'pairs' argument");
+        return NULL;
+    }
+
+    PyObject *pairsdict = args[0];
+
+    ext_types_decode_t *obj = PyObject_New(ext_types_decode_t, &ExtTypesDecodeObj);
+    if (obj == NULL)
+        return PyErr_NoMemory();
+    
+    PyObject *key, *val;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(pairsdict, &pos, &key, &val))
+    {
+        if (!PyLong_CheckExact(key) || !PyCallable_Check(val))
+        {
+            PyErr_Format(PyExc_ValueError, "Expected keys of type 'int' and values of type 'callable', got a key of type '%s' with a value of type '%s'", Py_TYPE(key)->tp_name, Py_TYPE(val)->tp_name);
+            return NULL;
+        }
+
+        const long id = PyLong_AS_LONG(key);
+
+        if (id < -128 || id > 127)
+        {
+            PyErr_Format(PyExc_ValueError, "IDs are only allowed to range between -128 and 127, got %i", id);
+            return NULL;
+        }
+
+        // Index is the ID plus 128, to range from 0 to 255 for indexing
+        const uint8_t idx = (uint8_t)id;
+
+        // Set the reads function to the correct ID
+        obj->reads[idx] = val;
+    }
+
+    return (PyObject *)obj;
+}
+
+static void ext_types_encode_dealloc(ext_types_encode_t *obj)
+{
+    hashtable_t tbl = obj->table;
+
+    // Calculate the number of pairs in the table
+    size_t num_pairs = 0;
+    for (size_t i = 0; i < EXT_TABLE_SLOTS; ++i)
+    {
+        num_pairs += tbl.lengths[i];
+    }
+
+    keyval_t *pairs = tbl.pairs;
+
+    // Decref the PyObjects in the pairs
+    for (size_t i = 0; i < num_pairs; ++i)
+    {
+        Py_XDECREF(pairs[i].key);
+        Py_XDECREF(pairs[i].val);
+    }
+
+    PyObject_Free(pairs);
+    Py_TYPE(obj)->tp_free((PyObject *)obj);
+}
+
+static void ext_types_decode_dealloc(ext_types_decode_t *obj)
+{
+    // Decref all objects stored in the read slots
+    for (size_t i = 0; i < EXT_TABLE_SLOTS; ++i)
+    {
+        Py_XDECREF(obj->reads[i]);
+    }
+
+    Py_TYPE(obj)->tp_free((PyObject *)obj);
+}
+
+static PyObject *ext_encode_pull(ext_types_encode_t *obj, PyTypeObject *tp)
+{
+    const size_t hash = EXT_ENCODE_HASH(tp);
+
+    hashtable_t tbl = obj->table;
+    keyval_t *pairs = tbl.pairs;
+
+    const size_t offset = tbl.offsets[hash]; // Offset to index on
+    const size_t length = tbl.lengths[hash]; // Number of entries for this hash value
+    for (size_t i = 0; i < length; ++i)
+    {
+        keyval_t pair = pairs[offset + i];
+
+        if (_LIKELY(pair.key == tp))
+            return pair.val;
+    }
+
+    return NULL;
+}
+
+static PyObject *ext_decode_pull(ext_types_decode_t *obj, const int8_t id)
+{
+    const uint8_t idx = (uint8_t)id;
+
+    // Return the reads object located on the index. Will be NULL if it doesn't exist
+    return obj->reads[idx];
+}
+
+// Attempt to convert any object to bytes using an ext object. Returns a tuple to be decremented after copying data from PTR, NULL on failure
+static PyObject *any_to_ext(encbuffer_t *b, PyObject *obj, int8_t *id, char **ptr, size_t *size)
+{
+    if (b->ext == NULL)
+        return NULL;
+    
+    PyObject *func = ext_encode_pull(b->ext, Py_TYPE(obj));
+    if (_UNLIKELY(func == NULL))
+    {
+        error_unsupported_type(obj);
+        return NULL;
+    }
+    
+    PyObject *result = PyObject_CallOneArg(func, obj);
+    if (_UNLIKELY(result == NULL))
+        return NULL;
+    
+    if (_UNLIKELY(!PyTuple_CheckExact(result)))
+    {
+        Py_DECREF(result);
+        PyErr_Format(PyExc_ValueError, "Expected to receive a tuple from an ext type encode function, got return argument of type '%s'", Py_TYPE(result)->tp_name);
+        return NULL;
+    }
+
+    if (_UNLIKELY(PyTuple_GET_SIZE(result) != 2))
+    {
+        Py_DECREF(result);
+        PyErr_Format(PyExc_ValueError, "Expected the tuple from an ext type encode function to hold exactly 2 items, got %zi items", PyTuple_GET_SIZE(result));
+        return NULL;
+    }
+
+    PyObject *id_obj = PyTuple_GET_ITEM(result, 0);
+    PyObject *bytes_obj = PyTuple_GET_ITEM(result, 1);
+
+    if (_UNLIKELY(!PyLong_CheckExact(id_obj) || !PyBytes_CheckExact(bytes_obj)))
+    {
+        Py_DECREF(result);
+        PyErr_Format(PyExc_ValueError, "Expected the tuple from an ext type object to hold an int on index 0 and bytes on index 1, got a '%s' on index 0 and '%s' on index 1", Py_TYPE(id_obj)->tp_name, Py_TYPE(bytes_obj)->tp_name);
+        return NULL;
+    }
+
+    const long _id = PyLong_AS_LONG(id_obj);
+
+    if (_UNLIKELY(_id < -128 || _id > 127))
+    {
+        Py_DECREF(result);
+        PyErr_Format(PyExc_ValueError, "Expected the ID for an ext type to range between -128 to 127, got %i", id);
+        return NULL;
+    }
+
+    *id = (int8_t)_id;
+    *size = PyBytes_GET_SIZE(bytes_obj);
+    *ptr = PyBytes_AS_STRING(bytes_obj);
+
+    if (_UNLIKELY(*size == 0))
+    {
+        Py_DECREF(result);
+        PyErr_SetString(PyExc_ValueError, "Ext types do not support zero-length data");
+        return NULL;
+    }
+
+    return result;
+}
+
+static PyObject *ext_to_any(decbuffer_t *b, const int8_t id, const size_t size)
+{
+    if (b->ext == NULL)
+        return NULL;
+
+    PyObject *func = ext_decode_pull(b->ext, id);
+
+    if (_UNLIKELY(func == NULL))
+    {
+        PyErr_Format(PyExc_ValueError, "Could not match an ext function for decoding on id %i", id);
+        return NULL;
+    }
+
+    // Create a memoryview to the data
+    PyObject *view = PyMemoryView_FromMemory(b->base + b->offset, (Py_ssize_t)size, PyBUF_READ);
+    if (view == NULL)
+        return PyErr_NoMemory();
+    
+    b->offset += size;
+    
+    // Call the function, passing the memoryview to it, and return its result
+    return PyObject_CallOneArg(func, view);
+}
+
+
 /////////////////////
 //  COMMON CACHES  //
 /////////////////////
@@ -521,13 +692,17 @@ static bool setup_common_caches(void)
     return true;
 }
 
-static void cleanup_common_caches(void)
+static void cleanup_common_caches(const bool used)
 {
-    for (size_t i = 0; i < COMMONCACHE_SLOTS; ++i)
+    if (used)
     {
-        Py_XDECREF(fixascii_common[i]);
-        Py_XDECREF(smallint_common[i].obj);
+        for (size_t i = 0; i < COMMONCACHE_SLOTS; ++i)
+        {
+            Py_XDECREF(fixascii_common[i]);
+            Py_XDECREF(smallint_common[i].obj);
+        }
     }
+    
 
     free(fixascii_common);
     free(smallint_common);
@@ -612,45 +787,6 @@ static _always_inline PyObject *anymap_to_py(decbuffer_t *b, const size_t npairs
     }
 
     return dict;
-}
-
-
-////////////////////
-//     MODULE     //
-////////////////////
-
-static void cleanup_module(PyObject *m)
-{
-    cleanup_common_caches();
-}
-
-static PyMethodDef CmsgpackMethods[] = {
-    {"encode", (PyCFunction)encode, METH_FASTCALL, NULL},
-    {"decode", (PyCFunction)decode, METH_FASTCALL, NULL},
-
-    //{"validate", (PyCFunction)validate, METH_FASTCALL, NULL},
-
-    {NULL, NULL, 0, NULL}
-};
-
-static struct PyModuleDef cmsgpack = {
-    PyModuleDef_HEAD_INIT,
-    "cmsgpack",
-    NULL,
-    -1,
-    CmsgpackMethods,
-    NULL,
-    NULL,
-    NULL,
-    (freefunc)cleanup_module,
-};
-
-PyMODINIT_FUNC PyInit_cmsgpack(void) {
-    if (setup_common_caches() == false)
-        return PyErr_NoMemory();
-
-    PyObject *m = PyModule_Create(&cmsgpack);
-    return m;
 }
 
 
@@ -823,7 +959,7 @@ static _always_inline bool write_bin_metadata(encbuffer_t *b, const size_t size)
     return true;
 }
 
-static _always_inline bool write_ext_metadata(encbuffer_t *b, const size_t size, const unsigned char id)
+static _always_inline bool write_ext_metadata(encbuffer_t *b, const size_t size, const int8_t id)
 {
     const bool is_baseof2 = (size & (size - 1)) == 0;
 
@@ -917,33 +1053,24 @@ static void update_allocation_settings(const bool reallocd, const size_t offset,
 }
 
 // Ensure that there's ENSURE_SIZE space available in a buffer
-static _always_inline bool buffer_ensure_space(encbuffer_t *b, size_t ensure_size)
+static bool buffer_ensure_space(encbuffer_t *b, size_t ensure_size)
 {
-    const size_t required_size = b->offset + ensure_size;
-    if (_UNLIKELY(required_size >= b->allocated))
+    // Scale the buffer by 1.5 times the required size
+    b->allocated = (b->offset + ensure_size) * 1.5;
+
+    void *new_ob = PyObject_Realloc(b->ob_base, b->allocated + PyBytesObject_SIZE);
+
+    if (_UNLIKELY(new_ob == NULL))
     {
-        // Scale the buffer by 1.5 times the required size
-        b->allocated = required_size * 1.5;
-
-        void *new_ob = PyObject_Realloc(b->ob_base, PyBytes_SIZE + b->allocated);
-
-        if (_UNLIKELY(new_ob == NULL))
-        {
-            error_no_memory();
-            return false;
-        }
-
-        b->ob_base = new_ob;
-        b->base = PyBytes_AS_STRING(new_ob);
+        error_no_memory();
+        return false;
     }
 
+    b->ob_base = new_ob;
+    b->base = PyBytes_AS_STRING(new_ob);
+    
     return true;
 }
-
-
-/////////////////////
-//  COMMONS CACHE  //
-/////////////////////
 
 
 ////////////////////
@@ -952,16 +1079,17 @@ static _always_inline bool buffer_ensure_space(encbuffer_t *b, size_t ensure_siz
 
 bool encode_object(PyObject *obj, encbuffer_t *b)
 {
-    if (py_is_str(obj))
+    PyTypeObject *tp = Py_TYPE(obj);
+
+    if (tp == &PyUnicode_Type)
     {
         char *base;
         size_t size;
 
         py_str_data(obj, &base, &size);
 
-        // Ensure there's enough space for metadata plus the string size
-        if (_UNLIKELY(!buffer_ensure_space(b, 8 + size)))
-            return false;
+        if (_UNLIKELY(b->offset + 8 + size >= b->allocated))
+            buffer_ensure_space(b, 8 + size);
         
         write_str_metadata(b, size);
         
@@ -970,15 +1098,15 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
 
         return true;
     }
-    else if (py_is_bin(obj))
+    else if (tp == &PyBytes_Type)
     {
         char *base;
         size_t size;
 
         py_bin_data(obj, &base, &size);
 
-        if (_UNLIKELY(!buffer_ensure_space(b, 8 + size)))
-            return false;
+        if (_UNLIKELY(b->offset + 8 + size >= b->allocated))
+            buffer_ensure_space(b, 8 + size);
         
         write_bin_metadata(b, size);
         
@@ -988,10 +1116,10 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
         return true;
     }
 
-    if (_UNLIKELY(!buffer_ensure_space(b, 9)))
-        return false;
+    if (_UNLIKELY(b->offset + 9 >= b->allocated))
+        buffer_ensure_space(b, 9);
 
-    if (py_is_int(obj))
+    if (tp == &PyLong_Type)
     {
         uint64_t num;
         bool neg;
@@ -1001,7 +1129,7 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
 
         write_int_metadata_and_data(b, num, neg);
     }
-    else if (py_is_float(obj))
+    else if (tp == &PyFloat_Type)
     {
         double num;
         py_float_data(obj, &num);
@@ -1011,16 +1139,16 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
         memcpy(b->base + b->offset, &num, 8);
         b->offset += 8;
     }
-    else if (py_is_bool(obj))
+    else if (tp == &PyBool_Type)
     {
         // Write a typemask based on if the value is true or false
         INCBYTE[0] = obj == Py_True ? DT_TRUE : DT_FALSE;
     }
-    else if (py_is_nil(obj))
+    else if (tp == Py_TYPE(Py_None)) // No explicit PyNone_Type available
     {
         INCBYTE[0] = DT_NIL;
     }
-    else if (py_is_arr(obj))
+    else if (tp == &PyList_Type)
     {
         // Get the number of items in the list
         const size_t nitems = PyList_GET_SIZE(obj);
@@ -1030,7 +1158,7 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
 
         return iterate_over_arr(b, obj, nitems);
     }
-    else if (py_is_map(obj))
+    else if (tp == &PyDict_Type)
     {
         // Get the number of pairs in the dict
         const size_t npairs = PyDict_GET_SIZE(obj);
@@ -1041,10 +1169,27 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
     }
     else
     {
-        // Custom type logic will be placed here later
+        int8_t id;
+        char *ptr;
+        size_t size;
 
-        error_unsupported_type(obj);
-        return false;
+        PyObject *result = any_to_ext(b, obj, &id, &ptr, &size);
+
+        if (result == NULL)
+        {
+            // Error might not be set, so default to unsupported type error
+            if (!PyErr_Occurred())
+                error_unsupported_type(obj);
+            
+            return false;
+        }
+
+        write_ext_metadata(b, size, id);
+
+        memcpy(b->base + b->offset, ptr, size);
+        b->offset += size;
+
+        Py_DECREF(result);
     }
 
     return true;
@@ -1113,6 +1258,8 @@ PyObject *decode_bytes(decbuffer_t *b)
         size_t n = (size_t)mask; // N has to be masked before use
         b->offset++;
 
+        /* NOTE: CONVERT TO IF-CHAIN FOR BETTER PERFORMANCE */
+
         const unsigned char fixlen_mask = FIXLEN_DT(mask);
         switch (fixlen_mask)
         {
@@ -1180,11 +1327,16 @@ PyObject *decode_bytes(decbuffer_t *b)
         // The length mode bits are stored in the lowest 2 bits
         unsigned int lenmode = mask & 0b11;
 
+        /* NOTE: CONVERT TO IF-CHAIN TO SEE IF PERFORMANCE IMPROVES CONSISTENTLY */
+
         const unsigned int varlen_mask = VARLEN_DT(mask);
         switch (varlen_mask)
         {
-        case VARLEN_DT(DT_STR_SHORT):
+        case VARLEN_DT(DT_STR_SHORT): // Also matches DT_EXT_FIX16
         {
+            if (_UNLIKELY(mask == DT_EXT_FIX16))
+                goto ext_types_fix16;
+            
             // Lenmode starts at 1 for str type, so decrement for macro use
             lenmode--;
 
@@ -1276,8 +1428,13 @@ PyObject *decode_bytes(decbuffer_t *b)
                 return NULL;
             }
         }
-        case VARLEN_DT(DT_FLOAT_BIT32):
+        case VARLEN_DT(DT_FLOAT_BIT32): // Also matched DT_EXT_MEDIUM and DT_EXT_LARGE
         {
+            if (_UNLIKELY(mask == DT_EXT_MEDIUM))
+                goto ext_types_varlen_medium;
+            if (_UNLIKELY(mask == DT_EXT_LARGE))
+                goto ext_types_varlen_large;
+
             double num;
 
             if (mask == DT_FLOAT_BIT32)
@@ -1285,7 +1442,7 @@ PyObject *decode_bytes(decbuffer_t *b)
                 OVERREAD_CHECK(4);
 
                 float _num;
-                memcpy(&n, &_num, 4);
+                memcpy(&_num, &n, 4);
                 num = (double)_num;
 
                 b->offset += 4;
@@ -1300,8 +1457,11 @@ PyObject *decode_bytes(decbuffer_t *b)
 
             return anyfloat_to_py(num);
         }
-        case VARLEN_DT(DT_BIN_SHORT): // Also matches ext
+        case VARLEN_DT(DT_BIN_SHORT): // Also matches DT_EXT_SHORT
         {
+            if (_UNLIKELY(mask == DT_EXT_SHORT))
+                goto ext_types_varlen_short;
+            
             LENMODE_1BYTE
             else LENMODE_2BYTE
             else LENMODE_4BYTE
@@ -1315,16 +1475,286 @@ PyObject *decode_bytes(decbuffer_t *b)
             b->offset += n;
             return obj;
         }
+        case VARLEN_DT(DT_EXT_FIX1):
+        {
+            n = 1ULL << lenmode;
+            b->offset++;
+
+            // Break to go to the global ext type handling path
+            break;
+        }
         default:
         {
             error_incorrect_value(INVALID_MSG " (invalid varlen type bits)");
             return NULL;
         }
         }
+
+        // Special path for varlen ext types, as these are all matched in other types
+
+        if (0)
+        {
+            ext_types_varlen_short:
+            lenmode = 0;
+            LENMODE_1BYTE
+        }
+        if (0)
+        {
+            ext_types_varlen_medium:
+            lenmode = 1;
+            LENMODE_2BYTE
+        }
+        if (0)
+        {
+            ext_types_varlen_large:
+            lenmode = 4;
+            LENMODE_4BYTE
+        }
+        if (0)
+        {
+            ext_types_fix16:
+            n = 16;
+
+            b->offset++;
+        }
+
+        const int8_t id = INCBYTE[0];
+
+        PyObject *obj = ext_to_any(b, id, n);
+
+        if (obj == NULL)
+        {
+            if (!PyErr_Occurred())
+                PyErr_SetString(PyExc_ValueError, INVALID_MSG " (failed to match an ext type)");
+            
+            return NULL;
+        }
+
+        return obj;
     }
 
     // This shouldn't be reached
     error_incorrect_value(INVALID_MSG " (unknown error)");
     return NULL;
+}
+
+
+///////////////////////
+//  ENC/DEC HANDLES  //
+///////////////////////
+
+static PyObject *encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwargs)
+{
+    if (_UNLIKELY(nargs != 1))
+    {
+        if (nargs > 1)
+        {
+            PyErr_SetString(PyExc_ValueError, "Only the 'obj' argument is allowed to be positional");
+        }
+        else
+        {
+            PyErr_SetString(PyExc_ValueError, "Expected the positional 'obj' argument");
+        }
+        
+        return NULL;
+    }
+
+    PyObject *obj = args[0];
+
+
+    encbuffer_t b;
+
+    if (PyDict_GET_SIZE(kwargs) > 0)
+    {
+        b.ext = (ext_types_encode_t *)PyDict_GetItemString(kwargs, "ext");
+
+        if (b.ext && _UNLIKELY(!Py_IS_TYPE(b.ext, &ExtTypesEncodeObj)))
+        {
+            PyErr_Format(PyExc_ValueError, "Argument 'ext' should be of type 'ExtTypesEncodeObj', got type '%s'", Py_TYPE(b.ext)->tp_name);
+            return NULL;
+        }
+    }
+
+    // Handle allocations for lists and dicts separate from singular items
+    size_t nitems;
+    size_t initial_alloc;
+
+    PyTypeObject *tp = Py_TYPE(obj);
+    if (tp == &PyList_Type || tp == &PyDict_Type)
+    {
+        // Set the base of the initial alloc size to the average alloc size
+        initial_alloc = avg_alloc_size;
+
+        // Allocate extra space based on the number of items/pairs
+        if (tp == &PyList_Type)
+        {
+            nitems = PyList_GET_SIZE(obj);
+            initial_alloc += nitems * avg_item_size;
+        }
+        else if (tp == &PyDict_Type)
+        {
+            const size_t npairs = PyDict_GET_SIZE(obj);
+            nitems = npairs * 2; // One pair is two items
+            initial_alloc += nitems * avg_item_size;
+        }
+
+        // This creates a PyBytesObject with initialized internals. We will manually realloc this pointer
+        b.ob_base = (void *)PyBytes_FromStringAndSize(NULL, initial_alloc);
+
+        if (b.ob_base == NULL)
+        {
+            return PyErr_NoMemory();
+        }
+
+        // Set the other data of the buffer struct
+        b.base = PyBytes_AS_STRING(b.ob_base);
+        b.allocated = initial_alloc;
+        b.offset = 0;
+    }
+    else
+    {
+        // Set the object base to NULL. As it's a single item, the total required size will be known once we
+        // ensure the buffer has enough space. The realloc function accepts NULL and will handle it as a malloc,
+        // so having the buffer be malloc'd during the buffer ensure avoids over- or underallocation.
+        b.ob_base = NULL;
+        b.allocated = 0;
+        b.offset = 0;
+
+        // Set number of items to zero to avoid the dynamic allocation update
+        nitems = 0;
+    }
+    
+    if (_UNLIKELY(encode_object(obj, &b) == false))
+    {
+        // Error should be set already
+        PyObject_Free(b.ob_base);
+        return NULL;
+    }
+
+    // Update allocation settings if we worked with a container object
+    if (nitems != 0)
+        update_allocation_settings(b.allocated != initial_alloc, b.offset, initial_alloc, nitems);
+
+    // Correct the size of the bytes object and null-terminate before returning
+    Py_SET_SIZE(b.ob_base, b.offset);
+    b.base[b.offset] = 0;
+
+    // Return the bytes object holding the data
+    return (PyObject *)b.ob_base;
+}
+
+static PyObject *decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwargs)
+{
+    if (_UNLIKELY(nargs != 1))
+    {
+        if (nargs > 1)
+        {
+            PyErr_SetString(PyExc_ValueError, "Only the 'encoded' argument is allowed to be positional");
+        }
+        else
+        {
+            PyErr_SetString(PyExc_ValueError, "Expected the positional 'encoded' argument");
+        }
+        
+        return NULL;
+    }
+
+    PyObject *encoded = args[0];
+
+    decbuffer_t b;
+
+    if (PyDict_GET_SIZE(kwargs) > 0)
+    {
+        b.ext = (ext_types_decode_t *)PyDict_GetItemString(kwargs, "ext");
+
+        if (b.ext && _UNLIKELY(!Py_IS_TYPE(b.ext, &ExtTypesDecodeObj)))
+        {
+            PyErr_Format(PyExc_ValueError, "Argument 'ext' should be of type 'ExtTypesDecodeObj', got type '%s'", Py_TYPE(b.ext)->tp_name);
+            return NULL;
+        }
+    }
+
+    Py_buffer buffer;
+    if (PyObject_GetBuffer(encoded, &buffer, PyBUF_READ) != 0)
+        return NULL;
+    
+    b.base = buffer.buf;
+    b.allocated = buffer.len;
+    b.offset = 0;
+
+    if (b.allocated <= 0)
+    {
+        PyBuffer_Release(&buffer);
+        PyErr_Format(PyExc_ValueError, "Expected the buffer to have a size of at least 1, got %zi", b.allocated);
+        return NULL;
+    }
+
+    PyObject *result = decode_bytes(&b);
+
+    PyBuffer_Release(&buffer);
+    return result;
+}
+
+
+////////////////////
+//     MODULE     //
+////////////////////
+
+static void cleanup_module(PyObject *m)
+{
+    cleanup_common_caches(true);
+}
+
+static PyMethodDef CmsgpackMethods[] = {
+    {"encode", (PyCFunction)encode, METH_FASTCALL | METH_KEYWORDS, NULL},
+    {"decode", (PyCFunction)decode, METH_FASTCALL | METH_KEYWORDS, NULL},
+
+    {"ExtTypesEncode", (PyCFunction)ExtTypesEncode, METH_FASTCALL, NULL},
+    {"ExtTypesDecode", (PyCFunction)ExtTypesDecode, METH_FASTCALL, NULL},
+
+    //{"validate", (PyCFunction)validate, METH_FASTCALL, NULL},
+
+    {NULL, NULL, 0, NULL}
+};
+
+static PyTypeObject ExtTypesEncodeObj = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "ExtTypesEncodeobj",
+    .tp_basicsize = sizeof(ext_types_encode_t),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_dealloc = (destructor)ext_types_encode_dealloc,
+};
+
+static PyTypeObject ExtTypesDecodeObj = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "ExtTypesDecodeObj",
+    .tp_basicsize = sizeof(ext_types_decode_t),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_dealloc = (destructor)ext_types_decode_dealloc,
+};
+
+static struct PyModuleDef cmsgpack = {
+    PyModuleDef_HEAD_INIT,
+    "cmsgpack",
+    NULL,
+    -1,
+    CmsgpackMethods,
+    NULL,
+    NULL,
+    NULL,
+    (freefunc)cleanup_module,
+};
+
+PyMODINIT_FUNC PyInit_cmsgpack(void) {
+    if (!PyType_Ready(&ExtTypesEncodeObj))
+        return NULL;
+    if (!PyType_Ready(&ExtTypesDecodeObj))
+        return NULL;
+
+    if (setup_common_caches() == false)
+        return PyErr_NoMemory();
+
+    PyObject *m = PyModule_Create(&cmsgpack);
+    return m;
 }
 
