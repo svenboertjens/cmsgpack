@@ -28,7 +28,6 @@ encoded = cmsgpack.encode(test_values)
 decoded = cmsgpack.decode(encoded)
 
 if (decoded == test_values):
-    print("Passed!")
     exit()
 
 for i in range(len(decoded)):

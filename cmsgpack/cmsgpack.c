@@ -101,7 +101,7 @@ static size_t avg_item_size;
 
 static void error_unsupported_type(PyObject *obj)
 {
-    PyErr_Format(PyExc_ValueError, "Received unsupported type '%s'", Py_TYPE(obj)->tp_name);
+    PyErr_Format(PyExc_TypeError, "Received unsupported type '%s'", Py_TYPE(obj)->tp_name);
 }
 
 static void error_incorrect_value(const char *msg)
@@ -200,7 +200,7 @@ static _always_inline bool py_int_data(PyObject *obj, uint64_t *num, bool *neg)
 
         if (_UNLIKELY(digits > 3 || dig3_overflow))
         {
-            PyErr_SetString(PyExc_OverflowError, "integers cannot be more than 8 bytes");
+            PyErr_SetString(PyExc_OverflowError, "Integers cannot be more than 8 bytes");
             return false;
         }
 
@@ -222,7 +222,7 @@ static _always_inline bool py_int_data(PyObject *obj, uint64_t *num, bool *neg)
 
     if (_UNLIKELY(overflow != 0))
     {
-        PyErr_SetString(PyExc_OverflowError, "Python ints cannot be more than 8 bytes");
+        PyErr_SetString(PyExc_OverflowError, "Integers cannot be more than 8 bytes");
         return false;
     }
 
@@ -385,7 +385,10 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *const *args, Py_ssize_
 
     ext_types_encode_t *obj = PyObject_New(ext_types_encode_t, &ExtTypesEncodeObj);
     if (obj == NULL)
-        return PyErr_NoMemory();
+    {
+        error_no_memory();
+        return NULL;
+    }
     
     const size_t npairs = PyDict_GET_SIZE(pairsdict);
     const size_t array_size = npairs * sizeof(PyObject *);
@@ -393,7 +396,10 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *const *args, Py_ssize_
     // Allocate a single buffer for both the keys and vals
     PyObject **keys_vals = (PyObject **)malloc(2 * array_size);
     if (keys_vals == NULL)
-        return PyErr_NoMemory();
+    {
+        error_no_memory();
+        return NULL;
+    }
     
     // Set the key array at the start of the shared buffer, and the val array directly on top of it
     PyObject **keys = keys_vals;
@@ -404,7 +410,8 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *const *args, Py_ssize_
     if (pairs == NULL)
     {
         free(keys_vals);
-        return PyErr_NoMemory();
+        error_no_memory();
+        return NULL;
     }
 
     // Set the pairs array in the table
@@ -510,7 +517,13 @@ static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_
 
     ext_types_decode_t *obj = PyObject_New(ext_types_decode_t, &ExtTypesDecodeObj);
     if (obj == NULL)
-        return PyErr_NoMemory();
+    {
+        error_no_memory();
+        return NULL;
+    }
+
+    // Zero-initialize the reads field to set unused slots to NULL
+    memset(obj->reads, 0, sizeof(obj->reads));
     
     obj->argtype = argtype;
     
@@ -518,16 +531,18 @@ static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_
     Py_ssize_t pos = 0;
     while (PyDict_Next(pairsdict, &pos, &key, &val))
     {
-        if (!PyLong_CheckExact(key) || !PyCallable_Check(val))
+        if (_UNLIKELY(!PyLong_CheckExact(key) || !PyCallable_Check(val)))
         {
+            Py_DECREF(obj);
             PyErr_Format(PyExc_TypeError, "Expected keys of type 'int' and values of type 'callable', got a key of type '%s' with a value of type '%s'", Py_TYPE(key)->tp_name, Py_TYPE(val)->tp_name);
             return NULL;
         }
 
         const long id = PyLong_AS_LONG(key);
 
-        if (id < -128 || id > 127)
+        if (_UNLIKELY(id < -128 || id > 127))
         {
+            Py_DECREF(obj);
             PyErr_Format(PyExc_ValueError, "IDs are only allowed to range between -128 and 127, got %i", id);
             return NULL;
         }
@@ -537,6 +552,8 @@ static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_
 
         // Set the reads function to the correct ID
         obj->reads[idx] = val;
+
+        Py_INCREF(val);
     }
 
     return (PyObject *)obj;
@@ -544,16 +561,14 @@ static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_
 
 static void ext_types_encode_dealloc(ext_types_encode_t *obj)
 {
-    hashtable_t tbl = obj->table;
-
     // Calculate the number of pairs in the table
     size_t num_pairs = 0;
     for (size_t i = 0; i < EXT_TABLE_SLOTS; ++i)
     {
-        num_pairs += tbl.lengths[i];
+        num_pairs += obj->table.lengths[i];
     }
 
-    keyval_t *pairs = tbl.pairs;
+    keyval_t *pairs = obj->table.pairs;
 
     // Decref the PyObjects in the pairs
     for (size_t i = 0; i < num_pairs; ++i)
@@ -562,8 +577,7 @@ static void ext_types_encode_dealloc(ext_types_encode_t *obj)
         Py_XDECREF(pairs[i].val);
     }
 
-    PyObject_Free(pairs);
-    Py_TYPE(obj)->tp_free((PyObject *)obj);
+    PyObject_Del(obj);
 }
 
 static void ext_types_decode_dealloc(ext_types_decode_t *obj)
@@ -574,7 +588,7 @@ static void ext_types_decode_dealloc(ext_types_decode_t *obj)
         Py_XDECREF(obj->reads[i]);
     }
 
-    Py_TYPE(obj)->tp_free((PyObject *)obj);
+    PyObject_Del(obj);
 }
 
 static PyObject *ext_encode_pull(ext_types_encode_t *obj, PyTypeObject *tp)
@@ -653,7 +667,7 @@ static PyObject *any_to_ext(encbuffer_t *b, PyObject *obj, int8_t *id, char **pt
     if (_UNLIKELY(_id < -128 || _id > 127))
     {
         Py_DECREF(result);
-        PyErr_Format(PyExc_ValueError, "Expected the ID for an ext type to range between -128 to 127, got %i", id);
+        PyErr_Format(PyExc_ValueError, "Expected the ID for an ext type to range between -128 to 127, got %i", _id);
         return NULL;
     }
 
@@ -696,7 +710,10 @@ static PyObject *ext_to_any(decbuffer_t *b, const int8_t id, const size_t size)
     }
     
     if (arg == NULL)
-        return PyErr_NoMemory();
+    {
+        error_no_memory();
+        return NULL;
+    }
 
     b->offset += size;
 
@@ -1050,15 +1067,15 @@ static _always_inline void write_int_metadata_and_data(encbuffer_t *b, const uin
 
     if (pnum <= UINT_BIT08_MAXVAL)
     {
-        write_mask(b, !neg ? DT_UINT_BIT08 : DT_INT_BIT08, num, 1);
+        write_mask(b, neg ? DT_INT_BIT08 : DT_UINT_BIT08, num, 1);
     }
     else if (pnum <= UINT_BIT16_MAXVAL)
     {
-        write_mask(b, !neg ? DT_UINT_BIT16 : DT_INT_BIT16, num, 2);
+        write_mask(b, neg ? DT_INT_BIT16 : DT_UINT_BIT16, num, 2);
     }
     else if (pnum <= UINT_BIT32_MAXVAL)
     {
-        write_mask(b, !neg ? DT_UINT_BIT32 : DT_INT_BIT32, num, 4);
+        write_mask(b, neg ? DT_INT_BIT32 : DT_UINT_BIT32, num, 4);
     }
     else
     {
@@ -1101,7 +1118,7 @@ static _always_inline bool write_ext_metadata(encbuffer_t *b, const size_t size,
     {
         const unsigned char fixmask = (
             size == 16 ? DT_EXT_FIX16 :
-            DT_EXT_FIX1 | (32 - LEADING_ZEROES_32(size))
+            DT_EXT_FIX1 | (31 - LEADING_ZEROES_32(size))
         );
 
         write_mask(b, fixmask, (size_t)id, 1);
@@ -1116,7 +1133,7 @@ static _always_inline bool write_ext_metadata(encbuffer_t *b, const size_t size,
     {
         write_mask(b, DT_EXT_MEDIUM, size, 2);
     }
-    else if (size <= EXT_LARGE_MAXSIZE)
+    else if (_LIKELY(size <= EXT_LARGE_MAXSIZE))
     {
         write_mask(b, DT_EXT_LARGE, size, 4);
     }
@@ -1211,6 +1228,14 @@ static bool buffer_ensure_space(encbuffer_t *b, size_t ensure_size)
 //    ENCODING    //
 ////////////////////
 
+#define ENSURE_SPACE(extra) do { \
+    if (_UNLIKELY(b->offset + extra >= b->allocated)) \
+    { \
+        if (buffer_ensure_space(b, extra) == false) \
+            { return NULL; } \
+    } \
+} while (0)
+
 bool encode_object(PyObject *obj, encbuffer_t *b)
 {
     PyTypeObject *tp = Py_TYPE(obj);
@@ -1222,8 +1247,7 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
 
         py_str_data(obj, &base, &size);
 
-        if (_UNLIKELY(b->offset + 5 + size >= b->allocated))
-            buffer_ensure_space(b, 5 + size);
+        ENSURE_SPACE(5 + size);
         
         write_str_metadata(b, size);
         
@@ -1239,8 +1263,7 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
 
         py_bin_data(obj, &base, &size);
 
-        if (_UNLIKELY(b->offset + 5 + size >= b->allocated))
-            buffer_ensure_space(b, 5 + size);
+        ENSURE_SPACE(5 + size);
         
         write_bin_metadata(b, size);
         
@@ -1250,8 +1273,7 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
         return true;
     }
 
-    if (_UNLIKELY(b->offset + 9 >= b->allocated))
-        buffer_ensure_space(b, 9);
+    ENSURE_SPACE(9);
 
     if (tp == &PyLong_Type)
     {
@@ -1318,8 +1340,7 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
             return false;
         }
 
-        if (_UNLIKELY(b->offset + 5 + size >= b->allocated))
-            buffer_ensure_space(b, 5 + size);
+        ENSURE_SPACE(6 + size);
 
         write_ext_metadata(b, size, id);
 
@@ -1615,7 +1636,6 @@ PyObject *decode_bytes(decbuffer_t *b)
         case VARLEN_DT(DT_EXT_FIX1):
         {
             n = 1ULL << lenmode;
-            b->offset++;
 
             // Break to go to the global ext type handling path
             break;
@@ -1644,25 +1664,25 @@ PyObject *decode_bytes(decbuffer_t *b)
         if (0)
         {
             ext_types_varlen_large:
-            lenmode = 4;
+            lenmode = 2;
             LENMODE_4BYTE
         }
         if (0)
         {
             ext_types_fix16:
             n = 16;
-
-            b->offset++;
         }
 
         const int8_t id = INCBYTE[0];
+
+        OVERREAD_CHECK(n);
 
         PyObject *obj = ext_to_any(b, id, n);
 
         if (obj == NULL)
         {
             if (!PyErr_Occurred())
-                PyErr_SetString(PyExc_ValueError, INVALID_MSG " (failed to match an ext type)");
+                error_incorrect_value(INVALID_MSG " (failed to match an ext type)");
             
             return NULL;
         }
@@ -1740,7 +1760,8 @@ static PyObject *encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
 
         if (b.ob_base == NULL)
         {
-            return PyErr_NoMemory();
+            error_no_memory();
+            return NULL;
         }
 
         // Set the other data of the buffer struct
@@ -1750,9 +1771,10 @@ static PyObject *encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
     }
     else
     {
-        initial_alloc = Py_SIZE(obj) + 8;
-        b.ob_base = (PyObject *)PyBytes_FromStringAndSize(NULL, initial_alloc);
-        b.allocated = initial_alloc;
+        // Create an object with 64 bytes. Will be adjusted if insufficient dynamically, but is enough for a lot of values
+        b.ob_base = (PyObject *)PyBytes_FromStringAndSize(NULL, 64);
+        b.base = PyBytes_AS_STRING(b.ob_base);
+        b.allocated = 64;
         b.offset = 0;
 
         // Set number of items to zero to avoid the dynamic allocation update
@@ -1894,7 +1916,10 @@ PyMODINIT_FUNC PyInit_cmsgpack(void) {
         return NULL;
 
     if (setup_common_caches() == false)
-        return PyErr_NoMemory();
+    {
+        error_no_memory();
+        return NULL;
+    }
     
 
     PyObject *m = PyModule_Create(&cmsgpack);
