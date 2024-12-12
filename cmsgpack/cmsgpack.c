@@ -57,6 +57,7 @@ typedef struct {
 // Usertypes decode object struct
 typedef struct {
     PyObject_HEAD
+    PyTypeObject *argtype;
     PyObject *reads[EXT_TABLE_SLOTS];
 } ext_types_decode_t;
 
@@ -273,6 +274,99 @@ static _always_inline PyObject *nil_to_py(void)
 }
 
 
+//////////////////
+//    STATES    //
+//////////////////
+
+// Global states
+typedef struct {
+    PyObject *ext_types;
+    PyObject *arg_type;
+} gstates;
+
+// Get interned string of NAME
+#define GET_ISTR(name) if ((s->name = PyUnicode_InternFromString(#name)) == NULL) { return false; }
+
+static bool setup_gstates(gstates *s)
+{
+    GET_ISTR(ext_types)
+    GET_ISTR(arg_type)
+
+    return true;
+}
+
+// Get the global states of the module
+static _always_inline gstates *get_gstates(PyObject *m)
+{
+    return (gstates *)PyModule_GetState(m);
+}
+
+
+////////////////////
+//  KWARGS PARSE  //
+////////////////////
+
+#if PY_VERSION_HEX >= 0x030d0000 // Python 3.13 and up
+#define _unicode_equal(x, y) (PyUnicode_Compare(x, y) == 0)
+#else
+#define _unicode_equal(x, y) _PyUnicode_EQ(x, y)
+#endif
+
+static _always_inline PyObject *get_kwarg(PyObject *const *args, PyObject *kwargs, PyObject *key)
+{
+    const size_t nkwargs = PyTuple_GET_SIZE(kwargs);
+
+    // Attempt match with interned strings
+    for (size_t i = 0; i < nkwargs; ++i)
+    {
+        if (PyTuple_GET_ITEM(kwargs, i) == key)
+            return args[i];
+    }
+
+    // Fallback to comparing strings
+    for (size_t i = 0; i < nkwargs; ++i)
+    {
+        if (_unicode_equal(PyTuple_GET_ITEM(kwargs, i), key))
+            return args[i];
+    }
+
+    return NULL;
+}
+
+#define PARSE_KWARGS_START \
+    gstates *s = get_gstates(self); \
+    size_t nkwargs = PyTuple_GET_SIZE(kwargs);
+
+// Get kwarg NAME assigned to DEST, replaced by DEFVAL if not found. If TYPE != NULL, check if DEST is TYPE
+#define PARSE_KWARG(dest, name, type, defval) do { \
+    if (((dest) = get_kwarg(args + nargs, kwargs, s->name)) != NULL) \
+    { \
+        if (type != NULL) \
+        { \
+            if (_UNLIKELY(!Py_IS_TYPE(dest, type))) \
+            { \
+                PyErr_Format(PyExc_TypeError, "Argument '" #name "' should be of type '%s', got '%s'", (type)->tp_name, Py_TYPE(dest)->tp_name); \
+                return NULL; \
+            } \
+        } \
+        if (--nkwargs == 0) \
+            goto kwargs_parsing_end; \
+    } \
+    else \
+    { \
+        dest = defval; \
+    } \
+} while (0)
+
+#define PARSE_KWARGS_END \
+    kwargs_parsing_end: \
+    if (nkwargs > 0) \
+    { \
+        PyErr_SetString(PyExc_TypeError, "Received extra positional arguments"); \
+        return NULL; \
+    }
+
+
 /////////////////////
 //   EXT OBJECTS   //
 /////////////////////
@@ -283,7 +377,7 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *const *args, Py_ssize_
 {
     if (_UNLIKELY(nargs != 1))
     {
-        PyErr_SetString(PyExc_ValueError, "Expected just the 'pairs' argument");
+        PyErr_SetString(PyExc_TypeError, "Expected just the 'pairs' argument");
         return NULL;
     }
 
@@ -314,8 +408,7 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *const *args, Py_ssize_
     }
 
     // Set the pairs array in the table
-    hashtable_t tbl = obj->table;
-    tbl.pairs = pairs;
+    obj->table.pairs = pairs;
     
     // Collect all keys and vals in their respective arrays and type check them
     Py_ssize_t pos = 0;
@@ -331,7 +424,7 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *const *args, Py_ssize_
             free(keys_vals);
             free(pairs);
 
-            PyErr_Format(PyExc_ValueError, "Expected keys of type 'type' and values of type 'callable', got a key of type '%s' with a value of type '%s'", Py_TYPE(key)->tp_name, Py_TYPE(val)->tp_name);
+            PyErr_Format(PyExc_TypeError, "Expected keys of type 'type' and values of type 'callable', got a key of type '%s' with a value of type '%s'", Py_TYPE(key)->tp_name, Py_TYPE(val)->tp_name);
             return NULL;
         }
 
@@ -343,19 +436,19 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *const *args, Py_ssize_
     uint8_t lengths[EXT_TABLE_SLOTS] = {0};
     for (size_t i = 0; i < npairs; ++i)
     {
-        const uint8_t hash = EXT_ENCODE_HASH(keys[i]);
+        const size_t hash = EXT_ENCODE_HASH(keys[i]);
         lengths[hash]++;
     }
 
     // Copy the lengths into the table
-    memcpy(tbl.lengths, lengths, EXT_TABLE_SLOTS);
+    memcpy(obj->table.lengths, lengths, sizeof(lengths));
 
     // Initialize the first offset as zero, calculate the others
-    tbl.offsets[0] = 0;
+    obj->table.offsets[0] = 0;
     for (size_t i = 1; i < EXT_TABLE_SLOTS; ++i)
     {
         // Set the offset of the current index based on the offset and length of the previous hash
-        tbl.offsets[i] = tbl.offsets[i - 1] + tbl.lengths[i - 1];
+        obj->table.offsets[i] = obj->table.offsets[i - 1] + obj->table.lengths[i - 1];
     }
 
     for (size_t i = 0; i < npairs; ++i)
@@ -365,7 +458,7 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *const *args, Py_ssize_
 
         const size_t hash = EXT_ENCODE_HASH(key);
         const size_t length = --lengths[hash]; // Decrement to place the next item under this hash one spot lower
-        const size_t offset = tbl.offsets[hash] + length;
+        const size_t offset = obj->table.offsets[hash] + length;
 
         pairs[offset].key = (PyTypeObject *)key;
         pairs[offset].val = val;
@@ -382,17 +475,44 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *const *args, Py_ssize_
 
 static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
 {
-    if (_UNLIKELY(nargs != 1))
+    if (_UNLIKELY(nargs < 0))
     {
-        PyErr_SetString(PyExc_ValueError, "Expected just the 'pairs' argument");
+        PyErr_SetString(PyExc_TypeError, "Expected at least the positional 'pairs' argument");
+        return NULL;
+    }
+    if (_UNLIKELY(nargs > 2))
+    {
+        PyErr_Format(PyExc_TypeError, "Expected 2 positional arguments at max, got %zi", nargs);
         return NULL;
     }
 
     PyObject *pairsdict = args[0];
+    PyTypeObject *argtype = &PyBytes_Type;
+
+    if (nargs == 2)
+    {
+        argtype = (PyTypeObject *)args[1];
+
+        if (_UNLIKELY(argtype != &PyBytes_Type && argtype != &PyMemoryView_Type))
+        {
+            if (!PyType_CheckExact(argtype))
+            {
+                PyErr_Format(PyExc_TypeError, "Argument 'arg_type' should be of type 'type', got '%s'", Py_TYPE(argtype)->tp_name);
+            }
+            else
+            {
+                PyErr_Format(PyExc_ValueError, "Argument 'arg_type' should be either 'bytes' or 'memoryview', got '%s'", argtype->tp_name);
+            }
+
+            return NULL;
+        }
+    }
 
     ext_types_decode_t *obj = PyObject_New(ext_types_decode_t, &ExtTypesDecodeObj);
     if (obj == NULL)
         return PyErr_NoMemory();
+    
+    obj->argtype = argtype;
     
     PyObject *key, *val;
     Py_ssize_t pos = 0;
@@ -400,7 +520,7 @@ static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_
     {
         if (!PyLong_CheckExact(key) || !PyCallable_Check(val))
         {
-            PyErr_Format(PyExc_ValueError, "Expected keys of type 'int' and values of type 'callable', got a key of type '%s' with a value of type '%s'", Py_TYPE(key)->tp_name, Py_TYPE(val)->tp_name);
+            PyErr_Format(PyExc_TypeError, "Expected keys of type 'int' and values of type 'callable', got a key of type '%s' with a value of type '%s'", Py_TYPE(key)->tp_name, Py_TYPE(val)->tp_name);
             return NULL;
         }
 
@@ -464,8 +584,10 @@ static PyObject *ext_encode_pull(ext_types_encode_t *obj, PyTypeObject *tp)
     hashtable_t tbl = obj->table;
     keyval_t *pairs = tbl.pairs;
 
+
     const size_t offset = tbl.offsets[hash]; // Offset to index on
     const size_t length = tbl.lengths[hash]; // Number of entries for this hash value
+
     for (size_t i = 0; i < length; ++i)
     {
         keyval_t pair = pairs[offset + i];
@@ -505,7 +627,7 @@ static PyObject *any_to_ext(encbuffer_t *b, PyObject *obj, int8_t *id, char **pt
     if (_UNLIKELY(!PyTuple_CheckExact(result)))
     {
         Py_DECREF(result);
-        PyErr_Format(PyExc_ValueError, "Expected to receive a tuple from an ext type encode function, got return argument of type '%s'", Py_TYPE(result)->tp_name);
+        PyErr_Format(PyExc_TypeError, "Expected to receive a tuple from an ext type encode function, got return argument of type '%s'", Py_TYPE(result)->tp_name);
         return NULL;
     }
 
@@ -562,15 +684,27 @@ static PyObject *ext_to_any(decbuffer_t *b, const int8_t id, const size_t size)
         return NULL;
     }
 
-    // Create a memoryview to the data
-    PyObject *view = PyMemoryView_FromMemory(b->base + b->offset, (Py_ssize_t)size, PyBUF_READ);
-    if (view == NULL)
+    // Either create bytes or a memoryview object based on what the user wants
+    PyObject *arg;
+    if (b->ext->argtype == &PyMemoryView_Type)
+    {
+        arg = PyMemoryView_FromMemory(b->base + b->offset, (Py_ssize_t)size, PyBUF_READ);
+    }
+    else
+    {
+        arg = PyBytes_FromStringAndSize(b->base + b->offset, (Py_ssize_t)size);
+    }
+    
+    if (arg == NULL)
         return PyErr_NoMemory();
-    
+
     b->offset += size;
-    
+
     // Call the function, passing the memoryview to it, and return its result
-    return PyObject_CallOneArg(func, view);
+    PyObject *result = PyObject_CallOneArg(func, arg);
+
+    Py_DECREF(arg);
+    return result;
 }
 
 
@@ -1088,8 +1222,8 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
 
         py_str_data(obj, &base, &size);
 
-        if (_UNLIKELY(b->offset + 8 + size >= b->allocated))
-            buffer_ensure_space(b, 8 + size);
+        if (_UNLIKELY(b->offset + 5 + size >= b->allocated))
+            buffer_ensure_space(b, 5 + size);
         
         write_str_metadata(b, size);
         
@@ -1105,8 +1239,8 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
 
         py_bin_data(obj, &base, &size);
 
-        if (_UNLIKELY(b->offset + 8 + size >= b->allocated))
-            buffer_ensure_space(b, 8 + size);
+        if (_UNLIKELY(b->offset + 5 + size >= b->allocated))
+            buffer_ensure_space(b, 5 + size);
         
         write_bin_metadata(b, size);
         
@@ -1183,6 +1317,9 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
             
             return false;
         }
+
+        if (_UNLIKELY(b->offset + 5 + size >= b->allocated))
+            buffer_ensure_space(b, 5 + size);
 
         write_ext_metadata(b, size, id);
 
@@ -1549,30 +1686,30 @@ static PyObject *encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
     {
         if (nargs > 1)
         {
-            PyErr_SetString(PyExc_ValueError, "Only the 'obj' argument is allowed to be positional");
+            PyErr_SetString(PyExc_TypeError, "Only the 'obj' argument is allowed to be positional");
         }
         else
         {
-            PyErr_SetString(PyExc_ValueError, "Expected the positional 'obj' argument");
+            PyErr_SetString(PyExc_TypeError, "Expected the positional 'obj' argument");
         }
         
         return NULL;
     }
 
     PyObject *obj = args[0];
-
-
     encbuffer_t b;
 
-    if (PyDict_GET_SIZE(kwargs) > 0)
+    if (kwargs != NULL)
     {
-        b.ext = (ext_types_encode_t *)PyDict_GetItemString(kwargs, "ext");
+        PARSE_KWARGS_START
+        
+        PARSE_KWARG(b.ext, ext_types, &ExtTypesEncodeObj, NULL);
 
-        if (b.ext && _UNLIKELY(!Py_IS_TYPE(b.ext, &ExtTypesEncodeObj)))
-        {
-            PyErr_Format(PyExc_ValueError, "Argument 'ext' should be of type 'ExtTypesEncodeObj', got type '%s'", Py_TYPE(b.ext)->tp_name);
-            return NULL;
-        }
+        PARSE_KWARGS_END
+    }
+    else
+    {
+        b.ext = NULL;
     }
 
     // Handle allocations for lists and dicts separate from singular items
@@ -1599,7 +1736,7 @@ static PyObject *encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
         }
 
         // This creates a PyBytesObject with initialized internals. We will manually realloc this pointer
-        b.ob_base = (void *)PyBytes_FromStringAndSize(NULL, initial_alloc);
+        b.ob_base = (PyObject *)PyBytes_FromStringAndSize(NULL, initial_alloc);
 
         if (b.ob_base == NULL)
         {
@@ -1613,11 +1750,9 @@ static PyObject *encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
     }
     else
     {
-        // Set the object base to NULL. As it's a single item, the total required size will be known once we
-        // ensure the buffer has enough space. The realloc function accepts NULL and will handle it as a malloc,
-        // so having the buffer be malloc'd during the buffer ensure avoids over- or underallocation.
-        b.ob_base = NULL;
-        b.allocated = 0;
+        initial_alloc = Py_SIZE(obj) + 8;
+        b.ob_base = (PyObject *)PyBytes_FromStringAndSize(NULL, initial_alloc);
+        b.allocated = initial_alloc;
         b.offset = 0;
 
         // Set number of items to zero to avoid the dynamic allocation update
@@ -1640,7 +1775,7 @@ static PyObject *encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
     b.base[b.offset] = 0;
 
     // Return the bytes object holding the data
-    return (PyObject *)b.ob_base;
+    return b.ob_base;
 }
 
 static PyObject *decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwargs)
@@ -1663,15 +1798,15 @@ static PyObject *decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
 
     decbuffer_t b;
 
-    if (PyDict_GET_SIZE(kwargs) > 0)
-    {
-        b.ext = (ext_types_decode_t *)PyDict_GetItemString(kwargs, "ext");
+    b.ext = NULL;
 
-        if (b.ext && _UNLIKELY(!Py_IS_TYPE(b.ext, &ExtTypesDecodeObj)))
-        {
-            PyErr_Format(PyExc_ValueError, "Argument 'ext' should be of type 'ExtTypesDecodeObj', got type '%s'", Py_TYPE(b.ext)->tp_name);
-            return NULL;
-        }
+    if (kwargs != NULL)
+    {
+        PARSE_KWARGS_START
+        
+        PARSE_KWARG(b.ext, ext_types, &ExtTypesDecodeObj, NULL);
+
+        PARSE_KWARGS_END
     }
 
     Py_buffer buffer;
@@ -1719,7 +1854,7 @@ static PyMethodDef CmsgpackMethods[] = {
 
 static PyTypeObject ExtTypesEncodeObj = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "ExtTypesEncodeobj",
+    .tp_name = "ExtTypesEncode",
     .tp_basicsize = sizeof(ext_types_encode_t),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_dealloc = (destructor)ext_types_encode_dealloc,
@@ -1727,7 +1862,7 @@ static PyTypeObject ExtTypesEncodeObj = {
 
 static PyTypeObject ExtTypesDecodeObj = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "ExtTypesDecodeObj",
+    .tp_name = "ExtTypesDecode",
     .tp_basicsize = sizeof(ext_types_decode_t),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_dealloc = (destructor)ext_types_decode_dealloc,
@@ -1736,8 +1871,8 @@ static PyTypeObject ExtTypesDecodeObj = {
 static struct PyModuleDef cmsgpack = {
     PyModuleDef_HEAD_INIT,
     "cmsgpack",
-    NULL,
-    -1,
+    "fast msgpack-format serializer",
+    sizeof(gstates),
     CmsgpackMethods,
     NULL,
     NULL,
@@ -1746,15 +1881,30 @@ static struct PyModuleDef cmsgpack = {
 };
 
 PyMODINIT_FUNC PyInit_cmsgpack(void) {
-    if (!PyType_Ready(&ExtTypesEncodeObj))
+    PyObject *_m = PyState_FindModule(&cmsgpack);
+    if (_m != NULL)
+    {
+        Py_INCREF(_m);
+        return _m;
+    }
+
+    if (PyType_Ready(&ExtTypesEncodeObj))
         return NULL;
-    if (!PyType_Ready(&ExtTypesDecodeObj))
+    if (PyType_Ready(&ExtTypesDecodeObj))
         return NULL;
 
     if (setup_common_caches() == false)
         return PyErr_NoMemory();
+    
 
     PyObject *m = PyModule_Create(&cmsgpack);
+    
+    if (setup_gstates((gstates *)PyModule_GetState(m)) == false)
+    {
+        Py_DECREF(m);
+        return NULL;
+    }
+
     return m;
 }
 
