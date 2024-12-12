@@ -14,6 +14,8 @@
 #define DT_UINT_BIT32 0xCEULL
 #define DT_UINT_BIT64 0xCFULL
 
+#define DT_UINT_VARMASK (DT_UINT_BIT08 & 0b11100)
+
 #define UINT_FIXED_MAXVAL 0x7FLL
 #define UINT_BIT08_MAXVAL 0xFFULL
 #define UINT_BIT16_MAXVAL 0xFFFFULL
@@ -26,6 +28,8 @@
 #define DT_INT_BIT32 0xD2ULL
 #define DT_INT_BIT64 0xD3ULL
 
+#define DT_INT_VARMASK (DT_INT_BIT08 & 0b11100)
+
 #define INT_FIXED_MAXVAL -32LL
 #define INT_BIT08_MAXVAL -128LL
 #define INT_BIT16_MAXVAL -32768LL
@@ -36,11 +40,28 @@
 #define DT_FLOAT_BIT32 0xCAULL
 #define DT_FLOAT_BIT64 0xCBULL
 
+#define DT_FLOAT_VARMASK (DT_FLOAT_BIT32 & 0b11100)
+
 // Strings
 #define DT_STR_FIXED 0xA0ULL
 #define DT_STR_SHORT 0xD9ULL
 #define DT_STR_MEDIUM 0xDAULL
 #define DT_STR_LARGE 0xDBULL
+
+#define DT_STR_VARMASK (DT_STR_SHORT & 0b11100)
+
+/**
+ * stat: 000
+ * bin:  001 (ext_s)
+ * flt:  010 (ext_m, ext_l)
+ * uint: 011
+ * 
+ * int:  100
+ * ext:  101 (fix1, fix2, fix4 fix8)
+ * str:  110 (fix16)
+ * arr:  111 (also map)
+ * 
+ */
 
 #define STR_FIXED_MAXSIZE 0x1FULL
 #define STR_SHORT_MAXSIZE 0xFFULL
@@ -52,6 +73,8 @@
 #define DT_ARR_MEDIUM 0xDCULL
 #define DT_ARR_LARGE 0xDDULL
 
+#define DT_ARR_VARMASK (DT_ARR_MEDIUM & 0b11100)
+
 #define ARR_FIXED_MAXITEMS 0x0FULL
 #define ARR_MEDIUM_MAXITEMS 0xFFFFULL
 #define ARR_LARGE_MAXITEMS 0xFFFFFFFFULL
@@ -61,6 +84,8 @@
 #define DT_MAP_MEDIUM 0xDEULL
 #define DT_MAP_LARGE 0xDFULL
 
+// Varmask of MAP is the same as of ARR, so the ARR varmask is used to check for both ARR and MAP
+
 #define MAP_FIXED_MAXPAIRS 0x0FULL
 #define MAP_MEDIUM_MAXPAIRS 0xFFFFULL
 #define MAP_LARGE_MAXPAIRS 0xFFFFFFFFULL
@@ -69,6 +94,8 @@
 #define DT_NIL   0xC0ULL
 #define DT_TRUE  0xC3ULL
 #define DT_FALSE 0xC2ULL
+
+#define DT_STATE_VARMASK (DT_NIL & 0b11100)
 
 // Binary
 #define DT_BIN_SHORT 0xC4ULL

@@ -1416,12 +1416,8 @@ PyObject *decode_bytes(decbuffer_t *b)
         size_t n = (size_t)mask; // N has to be masked before use
         b->offset++;
 
-        /* NOTE: CONVERT TO IF-CHAIN FOR BETTER PERFORMANCE */
-
-        const unsigned char fixlen_mask = FIXLEN_DT(mask);
-        switch (fixlen_mask)
-        {
-        case FIXLEN_DT(DT_STR_FIXED):
+        const unsigned char fixmask = mask & 0b11100000;
+        if (fixmask == DT_STR_FIXED)
         {
             n &= 0x1F;
 
@@ -1432,14 +1428,11 @@ PyObject *decode_bytes(decbuffer_t *b)
 
             return fixstr_to_py(ptr, n);
         }
-        case 0b000: // All possible combinations for fixuint as it uses just the upper 1 bit, and we're checking the upper 3
-        case 0b001:
-        case 0b010:
-        case 0b011:
+        else if ((mask & 0x80) == 0) // uint only has upper bit set to 0
         {
             return anyint_to_py(n, true);
         }
-        case FIXLEN_DT(DT_INT_FIXED):
+        else if (fixmask == DT_INT_FIXED)
         {
             long num = (long)n;
 
@@ -1451,24 +1444,23 @@ PyObject *decode_bytes(decbuffer_t *b)
 
             return anyint_to_py(num, false);
         }
-        case FIXLEN_DT(DT_MAP_FIXED): // Also catches DT_ARR_FIXED
+        else if (fixmask == (DT_ARR_FIXED & 0b11100000)) // Catches both ARR and MAP
         {
             n &= 0x0F;
 
             if ((mask & 0b10000) == 0b10000) // Bit 5 is 1 on array, 0 on map
             {
-                return anyarr_to_py(b, n);
+                return anyarr_to_py(b, n & 0x0F);
             }
             else
             {
-                return anymap_to_py(b, n);
+                return anymap_to_py(b, n & 0x0F);
             }
         }
-        default:
+        else
         {
             error_incorrect_value(INVALID_MSG " (invalid fixlen type bits)");
             return NULL;
-        }
         }
     }
     else
@@ -1689,10 +1681,6 @@ PyObject *decode_bytes(decbuffer_t *b)
 
         return obj;
     }
-
-    // This shouldn't be reached
-    error_incorrect_value(INVALID_MSG " (unknown error)");
-    return NULL;
 }
 
 
