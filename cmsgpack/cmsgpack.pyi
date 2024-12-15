@@ -75,3 +75,17 @@ def decode(encoded: Buffer, ext_types: ExtTypesDecode=None) -> any:
     """
     ...
 
+class Encoder:
+    def __init__(self, ext_types: ExtTypesEncode=None) -> self:
+        ...
+    
+    def encode(self, obj: any) -> bytes:
+        ...
+
+class Decoder:
+    def __init__(self, ext_types: ExtTypesDecode=None) -> self:
+        ...
+    
+    def encode(self, encoded: Buffer) -> any:
+        ...
+
