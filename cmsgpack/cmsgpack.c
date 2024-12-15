@@ -82,6 +82,13 @@ typedef struct {
     ext_types_decode_t *ext; // Object for decoding ext types
 } decbuffer_t;
 
+// Struct holding buffer data for validation
+typedef struct {
+    char *base;
+    size_t offset;
+    size_t allocated;
+} valbuffer_t;
+
 
 static bool encode_object(PyObject *obj, encbuffer_t *b);
 static PyObject *decode_bytes(decbuffer_t *b);
@@ -159,7 +166,7 @@ static _always_inline void py_str_data(PyObject *obj, char **base, size_t *size)
     if (_LIKELY(PyUnicode_IS_COMPACT_ASCII(obj)))
     {
         *size = ((PyASCIIObject *)obj)->length;
-    *base = (char *)(((PyASCIIObject *)obj) + 1);
+        *base = (char *)(((PyASCIIObject *)obj) + 1);
     }
     else
     {
@@ -339,7 +346,7 @@ static _always_inline PyObject *get_kwarg(PyObject *const *args, PyObject *kwarg
 
 // Get kwarg NAME assigned to DEST, replaced by DEFVAL if not found. If TYPE != NULL, check if DEST is TYPE
 #define PARSE_KWARG(dest, name, type, defval) do { \
-    if (((dest) = get_kwarg(args + nargs, kwargs, s->name)) != NULL) \
+    if (((dest) = (void *)get_kwarg(args + nargs, kwargs, s->name)) != NULL) \
     { \
         if (type != NULL) \
         { \
@@ -784,7 +791,7 @@ typedef struct {
 } smallint_common_t;
 smallint_common_t *smallint_common;
 
-static _always_inline PyObject *anyint_to_py(const uint64_t num, const bool is_uint)
+static PyObject *anyint_to_py(const uint64_t num, const bool is_uint)
 {
     // Signed version of the number, for negative representations
     const int64_t snum = (int64_t)num;
@@ -843,17 +850,13 @@ static bool setup_common_caches(void)
     return true;
 }
 
-static void cleanup_common_caches(const bool used)
+static void cleanup_common_caches()
 {
-    if (used)
+    for (size_t i = 0; i < COMMONCACHE_SLOTS; ++i)
     {
-        for (size_t i = 0; i < COMMONCACHE_SLOTS; ++i)
-        {
-            Py_XDECREF(fixascii_common[i]);
-            Py_XDECREF(smallint_common[i].obj);
-        }
+        Py_XDECREF(fixascii_common[i]);
+        Py_XDECREF(smallint_common[i].obj);
     }
-    
 
     free(fixascii_common);
     free(smallint_common);
@@ -945,29 +948,31 @@ static _always_inline PyObject *anymap_to_py(decbuffer_t *b, const size_t npairs
 //    METADATA    //
 ////////////////////
 
-#define INCBYTE (b->base + b->offset++)
+// Get the current offset's byte and increment afterwards
+#define INCBYTE ((b->base + b->offset++)[0])
 
+// Write a header's typemask and its size based on the number of bytes the size should take up
 static _always_inline void write_mask(encbuffer_t *b, const unsigned char mask, const size_t size, const size_t nbytes)
 {
-    if (nbytes == 0)
+    if (nbytes == 0) // FIXSIZE
     {
-        INCBYTE[0] = mask | (unsigned char)size;
+        INCBYTE = mask | (unsigned char)size;
     }
-    else if (nbytes == 1)
+    else if (nbytes == 1) // SMALL
     {
         const uint16_t mdata = BIG_16((size & 0xFF) | ((uint16_t)mask << 8));
         const size_t mdata_off = 0;
         memcpy(b->base + b->offset, (char *)(&mdata) + mdata_off, 2);
         b->offset += 2;
     }
-    else if (nbytes == 2)
+    else if (nbytes == 2) // MEDIUM
     {
         const uint32_t mdata = BIG_32((size & 0xFFFF) | ((uint32_t)mask << 16));
         const size_t mdata_off = 1;
         memcpy(b->base + b->offset, (char *)(&mdata) + mdata_off, 3);
         b->offset += 3;
     }
-    else if (nbytes == 4)
+    else if (nbytes == 4) // LARGE
     {
         const uint64_t mdata = BIG_64((uint64_t)(size & 0xFFFFFFFF) | ((uint64_t)mask << 32));
         const size_t mdata_off = 3;
@@ -982,9 +987,9 @@ static _always_inline bool write_str_metadata(encbuffer_t *b, const size_t size)
     {
         write_mask(b, DT_STR_FIXED, size, 0);
     }
-    else if (size <= STR_SHORT_MAXSIZE)
+    else if (size <= STR_SMALL_MAXSIZE)
     {
-        write_mask(b, DT_STR_SHORT, size, 1);
+        write_mask(b, DT_STR_SMALL, size, 1);
     }
     else if (size <= STR_MEDIUM_MAXSIZE)
     {
@@ -1065,9 +1070,9 @@ static _always_inline void write_int_metadata_and_data(encbuffer_t *b, const uin
     // Convert negative numbers into positive ones, upscaled to match the uint max values
     const uint64_t pnum = !neg ? num : ((~num + 1) << 1) - 1;
 
-    if (pnum <= UINT_BIT08_MAXVAL)
+    if (pnum <= UINT_BIT8_MAXVAL)
     {
-        write_mask(b, neg ? DT_INT_BIT08 : DT_UINT_BIT08, num, 1);
+        write_mask(b, neg ? DT_INT_BIT8 : DT_UINT_BIT8, num, 1);
     }
     else if (pnum <= UINT_BIT16_MAXVAL)
     {
@@ -1079,7 +1084,7 @@ static _always_inline void write_int_metadata_and_data(encbuffer_t *b, const uin
     }
     else
     {
-        INCBYTE[0] = (!neg ? DT_UINT_BIT64 : DT_INT_BIT64);
+        INCBYTE = (!neg ? DT_UINT_BIT64 : DT_INT_BIT64);
 
         const uint64_t _num = BIG_64(num);
         memcpy(b->base + b->offset, &_num, 8);
@@ -1089,9 +1094,9 @@ static _always_inline void write_int_metadata_and_data(encbuffer_t *b, const uin
 
 static _always_inline bool write_bin_metadata(encbuffer_t *b, const size_t size)
 {
-    if (size <= BIN_SHORT_MAXSIZE)
+    if (size <= BIN_SMALL_MAXSIZE)
     {
-        write_mask(b, DT_BIN_SHORT, size, 1);
+        write_mask(b, DT_BIN_SMALL, size, 1);
     }
     else if (size <= BIN_MEDIUM_MAXSIZE)
     {
@@ -1112,22 +1117,25 @@ static _always_inline bool write_bin_metadata(encbuffer_t *b, const size_t size)
 
 static _always_inline bool write_ext_metadata(encbuffer_t *b, const size_t size, const int8_t id)
 {
+    // If the size is a base of 2 and not larger than 16, it can be represented with a fixsize mask
     const bool is_baseof2 = (size & (size - 1)) == 0;
-
     if (size <= 16 && is_baseof2)
     {
         const unsigned char fixmask = (
+            size ==  8 ? DT_EXT_FIX8  :
             size == 16 ? DT_EXT_FIX16 :
-            DT_EXT_FIX1 | (31 - LEADING_ZEROES_32(size))
+            size ==  4 ? DT_EXT_FIX4  :
+            size ==  2 ? DT_EXT_FIX2  :
+                         DT_EXT_FIX1
         );
 
         write_mask(b, fixmask, (size_t)id, 1);
         return true;
     }
     
-    if (size <= EXT_SHORT_MAXSIZE)
+    if (size <= EXT_SMALL_MAXSIZE)
     {
-        write_mask(b, DT_EXT_SHORT, size, 1);
+        write_mask(b, DT_EXT_SMALL, size, 1);
     }
     else if (size <= EXT_MEDIUM_MAXSIZE)
     {
@@ -1143,7 +1151,7 @@ static _always_inline bool write_ext_metadata(encbuffer_t *b, const size_t size,
         return false;
     }
 
-    INCBYTE[0] = id;
+    INCBYTE = id;
 
     return true;
 }
@@ -1163,7 +1171,7 @@ static size_t avg_item_size = 12;
 
 // Minimum values for the dynamic allocation values to prevent severe underallocation or underflow
 #define ALLOC_SIZE_MIN 64
-#define ITEM_SIZE_MIN 4
+#define ITEM_SIZE_MIN 5
 
 static void update_allocation_settings(const bool reallocd, const size_t offset, const size_t initial_allocated, const size_t nitems)
 {
@@ -1177,7 +1185,7 @@ static void update_allocation_settings(const bool reallocd, const size_t offset,
             return;
         }
 
-        const size_t difference = offset - (initial_allocated / 1.25);
+        const size_t difference = offset - (initial_allocated >> 1);
         const size_t med_diff = difference / nitems;
 
         avg_alloc_size += difference;
@@ -1186,10 +1194,10 @@ static void update_allocation_settings(const bool reallocd, const size_t offset,
     else
     {
         const size_t difference = initial_allocated - offset;
-        const size_t med_diff = difference / (nitems);
+        const size_t med_diff = difference / nitems;
 
         const size_t diff_small = difference >> 4;
-        const size_t med_small = med_diff >> 2;
+        const size_t med_small = med_diff >> 1;
 
         if (diff_small + ALLOC_SIZE_MIN < avg_alloc_size)
             avg_alloc_size -= diff_small;
@@ -1203,11 +1211,11 @@ static void update_allocation_settings(const bool reallocd, const size_t offset,
     }
 }
 
-// Ensure that there's ENSURE_SIZE space available in a buffer
-static bool buffer_ensure_space(encbuffer_t *b, size_t ensure_size)
+// Expand the buffer size based on the required size
+static bool buffer_expand(encbuffer_t *b, size_t required)
 {
     // Scale the buffer by 1.5 times the required size
-    b->allocated = (b->offset + ensure_size) * 1.5;
+    b->allocated = (b->offset + required) * 1.5;
 
     void *new_ob = PyObject_Realloc(b->ob_base, b->allocated + PyBytesObject_SIZE);
 
@@ -1231,12 +1239,12 @@ static bool buffer_ensure_space(encbuffer_t *b, size_t ensure_size)
 #define ENSURE_SPACE(extra) do { \
     if (_UNLIKELY(b->offset + extra >= b->allocated)) \
     { \
-        if (buffer_ensure_space(b, extra) == false) \
+        if (buffer_expand(b, extra) == false) \
             { return NULL; } \
     } \
 } while (0)
 
-bool encode_object(PyObject *obj, encbuffer_t *b)
+static bool encode_object(PyObject *obj, encbuffer_t *b)
 {
     PyTypeObject *tp = Py_TYPE(obj);
 
@@ -1290,7 +1298,7 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
         double num;
         py_float_data(obj, &num);
 
-        INCBYTE[0] = DT_FLOAT_BIT64;
+        INCBYTE = DT_FLOAT_BIT64;
 
         memcpy(b->base + b->offset, &num, 8);
         b->offset += 8;
@@ -1298,11 +1306,11 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
     else if (tp == &PyBool_Type)
     {
         // Write a typemask based on if the value is true or false
-        INCBYTE[0] = obj == Py_True ? DT_TRUE : DT_FALSE;
+        INCBYTE = obj == Py_True ? DT_TRUE : DT_FALSE;
     }
     else if (tp == Py_TYPE(Py_None)) // No explicit PyNone_Type available
     {
-        INCBYTE[0] = DT_NIL;
+        INCBYTE = DT_NIL;
     }
     else if (tp == &PyList_Type)
     {
@@ -1361,25 +1369,13 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
 // Prefix error message for invalid encoded data
 #define INVALID_MSG "Received invalid encoded data"
 
-// Get a typemask for the fixlen switch case
-#define FIXLEN_DT(mask) ((mask >> 5) & 0b111)
 // Typemask for varlen switch case
-#define VARLEN_DT(mask) ((mask >> 2) & 0b111)
+#define VARLEN_DT(mask) (mask & 0b11111)
 
-// Extract macros for little-endian and big-endian systems, as data will be stored differently in N based on endianness
-#ifdef IS_BIG_ENDIAN
-
-#define EXTRACT1(n) n = n & 0xFF
-#define EXTRACT2(n) n = n & 0xFFFF
-#define EXTRACT4(n) n = n & 0xFFFFFFFF
-
-#else
-
-#define EXTRACT1(n) n = (n >> 56) & 0xFF
-#define EXTRACT2(n) n = (n >> 48) & 0xFFFF
-#define EXTRACT4(n) n = (n >> 32) & 0xFFFFFFFF
-
-#endif
+// INCBYTE but masked for safety
+#define SIZEBYTE (INCBYTE & 0xFF)
+// SIZEBYTE casted to uint64_t
+#define SIZEBYTE64 ((uint64_t)(INCBYTE & 0xFF))
 
 // Check if the buffer won't be overread
 #define OVERREAD_CHECK(to_add) do { \
@@ -1390,23 +1386,9 @@ bool encode_object(PyObject *obj, encbuffer_t *b)
     } \
 } while (0)
 
-// Macros for adjusting N according to LENMODE
-#define LENMODE_1BYTE if (lenmode == 0) { \
-    EXTRACT1(n); \
-    b->offset += 1; \
-}
-#define LENMODE_2BYTE if (lenmode == 1) { \
-    EXTRACT2(n); \
-    b->offset += 2; \
-}
-#define LENMODE_4BYTE if (lenmode == 2) { \
-    EXTRACT4(n); \
-    b->offset += 4; \
-}
-
-PyObject *decode_bytes(decbuffer_t *b)
+static PyObject *decode_bytes(decbuffer_t *b)
 {
-    OVERREAD_CHECK(0);
+    OVERREAD_CHECK(1);
 
     const unsigned char mask = (b->base + b->offset)[0];
 
@@ -1467,37 +1449,24 @@ PyObject *decode_bytes(decbuffer_t *b)
     {
         b->offset++;
 
-        // Fetch the size of the bytes after the mask
-        uint64_t n; // Mask correctly before using N
-        memcpy(&n, b->base + b->offset, 8); // Copy 8 instead of 4 so that it also holds floats and large ints
-
-        // Convert N back to host endianness
-        n = BIG_64(n);
-
-        // The length mode bits are stored in the lowest 2 bits
-        unsigned int lenmode = mask & 0b11;
-
-        /* NOTE: CONVERT TO IF-CHAIN TO SEE IF PERFORMANCE IMPROVES CONSISTENTLY */
+        // Global variable to hold the size across multiple cases
+        uint64_t n = 0;
 
         const unsigned int varlen_mask = VARLEN_DT(mask);
         switch (varlen_mask)
         {
-        case VARLEN_DT(DT_STR_SHORT): // Also matches DT_EXT_FIX16
+        case VARLEN_DT(DT_STR_LARGE):
         {
-            if (_UNLIKELY(mask == DT_EXT_FIX16))
-                goto ext_types_fix16;
-            
-            // Lenmode starts at 1 for str type, so decrement for macro use
-            lenmode--;
-
-            LENMODE_1BYTE
-            else LENMODE_2BYTE
-            else LENMODE_4BYTE
-            else
-            {
-                error_incorrect_value(INVALID_MSG " (invalid length bits in str type)");
-                return NULL;
-            }
+            n |= SIZEBYTE64 << 24;
+            n |= SIZEBYTE64 << 16;
+        }
+        case VARLEN_DT(DT_STR_MEDIUM):
+        {
+            n |= SIZEBYTE << 8;
+        }
+        case VARLEN_DT(DT_STR_SMALL):
+        {
+            n |= SIZEBYTE;
 
             OVERREAD_CHECK(n);
 
@@ -1505,181 +1474,259 @@ PyObject *decode_bytes(decbuffer_t *b)
             b->offset += n;
             return obj;
         }
-        case VARLEN_DT(DT_UINT_BIT08):
-        case VARLEN_DT(DT_INT_BIT08):
+
+        case VARLEN_DT(DT_UINT_BIT8):
         {
-            const bool is_uint = varlen_mask == 0b011;
-
-            if (lenmode == 0)
-            {
-                EXTRACT1(n);
-                if (!is_uint && n & 0x80)
-                    n |= ~0xFF;
-
-                b->offset += 1;
-            }
-            else if (lenmode == 1)
-            {
-                EXTRACT2(n);
-                if (!is_uint && n & 0x8000)
-                    n |= ~0xFFFF;
-
-                b->offset += 2;
-            }
-            else if (lenmode == 2)
-            {
-                EXTRACT4(n);
-                if (!is_uint && n & 0x80000000)
-                    n |= ~0xFFFFFFFFULL;
-
-                b->offset += 4;
-            }
-            else
-            {
-                b->offset += 8;
-            }
-
-            return anyint_to_py(n, is_uint);
+            OVERREAD_CHECK(1);
+            n = SIZEBYTE;
+            
+            return anyint_to_py(n, true);
         }
-        case VARLEN_DT(DT_ARR_MEDIUM): // Also matches maps
+        case VARLEN_DT(DT_UINT_BIT16):
         {
-            // Set lenmode to 1 or 2 manually as 2nd bit is used to specify map or array
-            lenmode = (unsigned int)((mask & 1) == 1) + 1;
-
-            LENMODE_2BYTE
-            else LENMODE_4BYTE
-
-            if ((mask & 0b10) == 0) // array
-            {
-                return anyarr_to_py(b, n);
-            }
-            else
-            {
-                return anymap_to_py(b, n);
-            }
+            OVERREAD_CHECK(2);
+            n |= SIZEBYTE << 8;
+            n |= SIZEBYTE;
+            
+            return anyint_to_py(n, true);
         }
-        case VARLEN_DT(DT_NIL): // Matches all states
+        case VARLEN_DT(DT_UINT_BIT32):
         {
-            if (mask == DT_TRUE)
-            {
-                return true_to_py();
-            }
-            else if (mask == DT_FALSE)
-            {
-                return false_to_py();
-            }
-            else if (_LIKELY(mask == DT_NIL))
-            {
-                return nil_to_py();
-            }
-            else
-            {
-                error_incorrect_value(INVALID_MSG " (invalid state type)");
-                return NULL;
-            }
+            OVERREAD_CHECK(4);
+            n |= SIZEBYTE << 24;
+            n |= SIZEBYTE << 16;
+            n |= SIZEBYTE << 8;
+            n |= SIZEBYTE;
+            
+            return anyint_to_py(n, true);
         }
-        case VARLEN_DT(DT_FLOAT_BIT32): // Also matched DT_EXT_MEDIUM and DT_EXT_LARGE
+        case VARLEN_DT(DT_UINT_BIT64):
         {
-            if (_UNLIKELY(mask == DT_EXT_MEDIUM))
-                goto ext_types_varlen_medium;
-            if (_UNLIKELY(mask == DT_EXT_LARGE))
-                goto ext_types_varlen_large;
+            OVERREAD_CHECK(8);
 
+            memcpy(&n, b->base + b->offset, 8);
+            b->offset += 8;
+
+            n = BIG_64(n);
+
+            return anyint_to_py(n, true);
+        }
+
+        case VARLEN_DT(DT_INT_BIT8):
+        {
+            OVERREAD_CHECK(1);
+            n |= SIZEBYTE;
+
+            // Sign-extend
+            if (_LIKELY(n & 0x80))
+                n |= ~0xFF;
+            
+            return anyint_to_py(n, false);
+        }
+        case VARLEN_DT(DT_INT_BIT16):
+        {
+            OVERREAD_CHECK(2);
+            n |= SIZEBYTE << 8;
+            n |= SIZEBYTE;
+
+            if (_LIKELY(n & 0x8000))
+                n |= ~0xFFFF;
+            
+            return anyint_to_py(n, false);
+        }
+        case VARLEN_DT(DT_INT_BIT32):
+        {
+            OVERREAD_CHECK(4);
+            n |= SIZEBYTE << 24;
+            n |= SIZEBYTE << 16;
+            n |= SIZEBYTE << 8;
+            n |= SIZEBYTE;
+
+            if (_LIKELY(n & 0x80000000))
+                n |= ~0xFFFFFFFF;
+            
+            return anyint_to_py(n, false);
+        }
+        case VARLEN_DT(DT_INT_BIT64):
+        {
+            OVERREAD_CHECK(8);
+
+            memcpy(&n, b->base + b->offset, 8);
+            b->offset += 8;
+            n = BIG_64(n);
+
+            return anyint_to_py(n, false);
+        }
+
+        case VARLEN_DT(DT_ARR_LARGE):
+        {
+            OVERREAD_CHECK(4);
+            n |= SIZEBYTE64 << 24;
+            n |= SIZEBYTE64 << 16;
+        }
+        case VARLEN_DT(DT_ARR_MEDIUM):
+        {
+            OVERREAD_CHECK(2);
+            n |= SIZEBYTE << 8;
+            n |= SIZEBYTE;
+
+            return anyarr_to_py(b, n);
+        }
+
+        case VARLEN_DT(DT_MAP_LARGE):
+        {
+            OVERREAD_CHECK(4);
+            n |= SIZEBYTE64 << 24;
+            n |= SIZEBYTE64 << 16;
+        }
+        case VARLEN_DT(DT_MAP_MEDIUM):
+        {
+            OVERREAD_CHECK(2);
+            n |= SIZEBYTE << 8;
+            n |= SIZEBYTE;
+
+            return anymap_to_py(b, n);
+        }
+
+        case VARLEN_DT(DT_NIL):
+        {
+            Py_RETURN_NONE;
+        }
+        case VARLEN_DT(DT_TRUE):
+        {
+            Py_RETURN_TRUE;
+        }
+        case VARLEN_DT(DT_FALSE):
+        {
+            Py_RETURN_FALSE;
+        }
+
+        case VARLEN_DT(DT_FLOAT_BIT32):
+        case VARLEN_DT(DT_FLOAT_BIT64):
+        {
             double num;
 
-            if (mask == DT_FLOAT_BIT32)
+            if (mask == DT_FLOAT_BIT64)
+            {
+                OVERREAD_CHECK(8);
+
+                memcpy(&num, b->base + b->offset, 8);
+                b->offset += 8;
+            }
+            else
             {
                 OVERREAD_CHECK(4);
 
                 float _num;
-                memcpy(&_num, &n, 4);
+                memcpy(&_num, b->base + b->offset, 4);
                 num = (double)_num;
 
                 b->offset += 4;
             }
-            else
-            {
-                OVERREAD_CHECK(8);
 
-                memcpy(&num, &n, 8);
-                b->offset += 8;
-            }
+            BIG_DOUBLE(num);
 
             return anyfloat_to_py(num);
         }
-        case VARLEN_DT(DT_BIN_SHORT): // Also matches DT_EXT_SHORT
+
+        case VARLEN_DT(DT_BIN_LARGE):
         {
-            if (_UNLIKELY(mask == DT_EXT_SHORT))
-                goto ext_types_varlen_short;
-            
-            LENMODE_1BYTE
-            else LENMODE_2BYTE
-            else LENMODE_4BYTE
-            else
-            {
-                error_incorrect_value(INVALID_MSG " (invalid length bits in bin type, OR got currently unsupported ext type)");
-                return NULL;
-            }
+            OVERREAD_CHECK(4);
+            n |= SIZEBYTE64 << 24;
+            n |= SIZEBYTE64 << 16;
+        }
+        case VARLEN_DT(DT_BIN_MEDIUM):
+        {
+            OVERREAD_CHECK(2);
+            n |= SIZEBYTE << 8;
+        }
+        case VARLEN_DT(DT_BIN_SMALL):
+        {
+            OVERREAD_CHECK(1);
+            n |= SIZEBYTE;
 
             PyObject *obj = anybin_to_py(b->base + b->offset, n);
             b->offset += n;
             return obj;
         }
+
         case VARLEN_DT(DT_EXT_FIX1):
         {
-            n = 1ULL << lenmode;
+            OVERREAD_CHECK(1); // For the ID
+            n = 1;
 
-            // Break to go to the global ext type handling path
-            break;
+            goto ext_handling;
         }
+        case VARLEN_DT(DT_EXT_FIX2):
+        {
+            OVERREAD_CHECK(1);
+            n = 2;
+            
+            goto ext_handling;
+        }
+        case VARLEN_DT(DT_EXT_FIX4):
+        {
+            OVERREAD_CHECK(1);
+            n = 4;
+            
+            goto ext_handling;
+        }
+        case VARLEN_DT(DT_EXT_FIX8):
+        {
+            OVERREAD_CHECK(1);
+            n = 8;
+            
+            goto ext_handling;
+        }
+        case VARLEN_DT(DT_EXT_FIX16):
+        {
+            OVERREAD_CHECK(1);
+            n = 16;
+            
+            goto ext_handling;
+        }
+
+        case VARLEN_DT(DT_EXT_LARGE):
+        {
+            OVERREAD_CHECK(5); // 4 size bytes + 1 ID byte
+            n |= SIZEBYTE64 << 24;
+            n |= SIZEBYTE64 << 16;
+        }
+        case VARLEN_DT(DT_EXT_MEDIUM):
+        {
+            OVERREAD_CHECK(3);
+            n |= SIZEBYTE << 8;
+        }
+        case VARLEN_DT(DT_EXT_SMALL):
+        {
+            OVERREAD_CHECK(2);
+            n |= SIZEBYTE;
+
+            ext_handling: // For fixsize cases
+
+            const int8_t id = SIZEBYTE;
+
+            OVERREAD_CHECK(n);
+
+            PyObject *obj = ext_to_any(b, id, n);
+
+            if (obj == NULL)
+            {
+                if (!PyErr_Occurred())
+                    error_incorrect_value(INVALID_MSG " (failed to match an ext type)");
+                
+                return NULL;
+            }
+
+            return obj;
+        }
+
         default:
         {
-            error_incorrect_value(INVALID_MSG " (invalid varlen type bits)");
+            error_incorrect_value(INVALID_MSG " (invalid header found)");
             return NULL;
         }
         }
-
-        // Special path for varlen ext types, as these are all matched in other types
-
-        if (0)
-        {
-            ext_types_varlen_short:
-            lenmode = 0;
-            LENMODE_1BYTE
-        }
-        if (0)
-        {
-            ext_types_varlen_medium:
-            lenmode = 1;
-            LENMODE_2BYTE
-        }
-        if (0)
-        {
-            ext_types_varlen_large:
-            lenmode = 2;
-            LENMODE_4BYTE
-        }
-        if (0)
-        {
-            ext_types_fix16:
-            n = 16;
-        }
-
-        const int8_t id = INCBYTE[0];
-
-        OVERREAD_CHECK(n);
-
-        PyObject *obj = ext_to_any(b, id, n);
-
-        if (obj == NULL)
-        {
-            if (!PyErr_Occurred())
-                error_incorrect_value(INVALID_MSG " (failed to match an ext type)");
-            
-            return NULL;
-        }
-
-        return obj;
     }
 }
 
@@ -1827,16 +1874,15 @@ static PyObject *decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
     b.allocated = buffer.len;
     b.offset = 0;
 
-    if (b.allocated <= 0)
+    PyObject *result = decode_bytes(&b);
+    PyBuffer_Release(&buffer);
+
+    if (_UNLIKELY(result != NULL && b.offset != b.allocated))
     {
-        PyBuffer_Release(&buffer);
-        PyErr_Format(PyExc_ValueError, "Expected the buffer to have a size of at least 1, got %zi", b.allocated);
+        error_incorrect_value(INVALID_MSG " (reached end of encoded data before reaching end of received buffer)");
         return NULL;
     }
 
-    PyObject *result = decode_bytes(&b);
-
-    PyBuffer_Release(&buffer);
     return result;
 }
 
@@ -1847,7 +1893,7 @@ static PyObject *decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
 
 static void cleanup_module(PyObject *m)
 {
-    cleanup_common_caches(true);
+    cleanup_common_caches();
 }
 
 static PyMethodDef CmsgpackMethods[] = {
@@ -1856,8 +1902,6 @@ static PyMethodDef CmsgpackMethods[] = {
 
     {"ExtTypesEncode", (PyCFunction)ExtTypesEncode, METH_FASTCALL, NULL},
     {"ExtTypesDecode", (PyCFunction)ExtTypesDecode, METH_FASTCALL, NULL},
-
-    //{"validate", (PyCFunction)validate, METH_FASTCALL, NULL},
 
     {NULL, NULL, 0, NULL}
 };

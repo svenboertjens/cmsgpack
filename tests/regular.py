@@ -27,13 +27,18 @@ test_values = [
 encoded = cmsgpack.encode(test_values)
 decoded = cmsgpack.decode(encoded)
 
-if (decoded == test_values):
-    exit()
+if (type(decoded) != type(test_values)):
+    print("\n----\nDecoded object is not the same type as the test values object\n\n----\n")
+elif len(decoded) != len(test_values):
+    print(f"\n # Decoded object had {len(decoded)} items, test values has {len(test_values)}\n")
 
-for i in range(len(decoded)):
-    actual = test_values[i]
-    created = decoded[i]
+for i in range(len(test_values)):
+    val = test_values[i]
+    decoded = cmsgpack.decode(cmsgpack.encode(val))
     
-    if (actual != created):
-        print(f"----\nShould be: ({type(actual).__name__})'{actual}'\n\nGot: ({type(created).__name__})'{created}'\n----\n")
-    
+    if (val != decoded):
+        print(f"----\nShould be: ({type(val).__name__})'{str(val)[:100]}'\n\nGot: ({type(decoded).__name__})'{str(decoded)[:100]}'\n----\n")
+
+
+
+

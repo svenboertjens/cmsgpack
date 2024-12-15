@@ -49,15 +49,13 @@ def encode(obj: any, ext_types: ExtTypesEncode=None) -> bytes:
     
     
     Returns:
-    Bytes object with the encoded object, in MessagePack format.
-    
+    - Bytes object with the encoded object, in MessagePack format.
     
     obj:
-    The object to encode to bytes.
-    
+    - The object to encode to bytes.
     
     ext:
-    `ExtTypesEncode` object used for encoding custom (ext) types.
+    - `ExtTypesEncode` object used for encoding custom (ext) types.
     
     """
     ...

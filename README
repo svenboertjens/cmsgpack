@@ -1,6 +1,8 @@
-# cMsgpack
+# cmsgpack
 
-`cmsgpack` is a fast and lightweight MessagePack serialization library.
+`cmsgpack` is a fast MessagePack serialization library.
 
 This library is currently under development. Expect bugs.
+
+Specific usage details and documentation will follow during development.
 

@@ -68,40 +68,17 @@
 
 #if (defined(__GNUC__) || defined(__clang__))
 
-    #define LEADING_ZEROES_64(x) (__builtin_clzll((unsigned long long)(x)))
-    #define LEADING_ZEROES_32(x) (__builtin_clz((unsigned int)(x)))
-
     #define _always_inline __always_inline
 
 #elif defined(_MSC_VER)
 
-    #include <intrin.h>
-    #define LEADING_ZEROES_64(x) (8 - _BitScanReverse64(x))
-
-    #define __forceinline
+    #define _always_inline __forceinline
 
 #else
-
-    inline int LEADING_ZEROES_64(uint64_t x)
-    {
-        int n = 64;
-
-        if (x <= 0x00000000FFFFFFFF) { n -= 32; x <<= 32; }
-        if (x <= 0x0000FFFFFFFFFFFF) { n -= 16; x <<= 16; }
-        if (x <= 0x00FFFFFFFFFFFFFF) { n -=  8; x <<=  8; } 
-        if (x <= 0x0FFFFFFFFFFFFFFF) { n -=  4; x <<=  4; } 
-        if (x <= 0x3FFFFFFFFFFFFFFF) { n -=  2; x <<=  2; } 
-        if (x <= 0x7FFFFFFFFFFFFFFF) { n -=  1; }
-
-        return n;
-    }
 
     #define _always_inline inline
 
 #endif
-
-// Count the number of used bytes in an integer
-#define USED_BYTES(x) (x == 0 ? 1 : (sizeof(x) == 8 ? (8 - (LEADING_ZEROES_64(x) >> 3)) : (4 - (LEADING_ZEROES_32(x)) >> 3)))
 
 #if (defined(__GNUC__) || defined(__clang__)) 
 
