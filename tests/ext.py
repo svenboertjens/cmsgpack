@@ -77,3 +77,13 @@ memview_dec = cm.ExtTypesDecode({
 
 cm.decode(encoded_one, ext_types=memview_dec)
 
+
+# Test if encoder accepts ext types
+
+
+encoder = cm.Encoder(ext_types=enc)
+decoder = cm.Decoder(ext_types=dec)
+
+# Will throw error if incompatible
+decoder.decode(encoder.encode(test_values))
+

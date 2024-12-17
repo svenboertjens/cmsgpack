@@ -72,6 +72,7 @@ typedef struct {
     size_t offset;     // Writing offset relative to the buffer base
     size_t allocated;  // Space allocated for the buffer (excluding PyBytesObject size)
     ext_types_encode_t *ext; // object for encoding ext types
+    bool strict_keys;  // Whether map keys can only be strings
 } encbuffer_t;
 
 // Struct holding buffer data for decoding
@@ -80,6 +81,7 @@ typedef struct {
     size_t offset;     // Writing offset relative to the base
     size_t allocated;  // Space allocated in the buffer object
     ext_types_decode_t *ext; // Object for decoding ext types
+    bool strict_keys;  // Whether map keys can only be strings
 } decbuffer_t;
 
 // Struct holding buffer data for validation
@@ -136,41 +138,6 @@ static void error_no_memory(void)
 }
 
 
-////////////////////
-//  PY ITERATORS  //
-////////////////////
-
-static _always_inline bool iterate_over_arr(encbuffer_t *b, PyObject *obj, const size_t nitems)
-{
-    for (size_t i = 0; i < nitems; ++i)
-    {
-        if (_UNLIKELY(!encode_object(PyList_GET_ITEM(obj, i), b)))
-            return false;
-    }
-
-    return true;
-}
-
-static _always_inline bool iterate_over_map(encbuffer_t *b, PyObject *obj, const size_t npairs)
-{
-    Py_ssize_t pos = 0;
-    for (size_t i = 0; i < npairs; ++i)
-    {
-        PyObject *key;
-        PyObject *val;
-
-        PyDict_Next(obj, &pos, &key, &val);
-
-        if (_UNLIKELY(
-            !encode_object(key, b) ||
-            !encode_object(val, b)
-        )) return false;
-    }
-
-    return true;
-}
-
-
 /////////////////////
 //  PY FETCH DATA  //
 /////////////////////
@@ -192,64 +159,6 @@ static _always_inline void py_bin_data(PyObject *obj, char **base, size_t *size)
 {
     *base = PyBytes_AS_STRING(obj);
     *size = PyBytes_GET_SIZE(obj);
-}
-
-static _always_inline bool py_int_data(PyObject *obj, uint64_t *num, bool *neg)
-{
-    // Use custom integer extraction on Python 3.12+
-    #if PY_VERSION_HEX >= 0x030c0000
-
-    PyLongObject *lobj = (PyLongObject *)obj;
-
-    const size_t digits = lobj->long_value.lv_tag >> _PyLong_NON_SIZE_BITS;
-    uint64_t n = 0;
-
-    if (digits >= 1)
-    {
-        n |= (uint64_t)lobj->long_value.ob_digit[0];
-    }
-    if (digits >= 2)
-    {
-        n |= (uint64_t)lobj->long_value.ob_digit[1] << PyLong_SHIFT;
-    }
-    if (digits >= 3)
-    {
-        const uint64_t dig3 = (uint64_t)lobj->long_value.ob_digit[2];
-
-        const uint64_t dig3_overflow_val = (1ULL << (64 - (2 * PyLong_SHIFT))) - 1;
-        const bool dig3_overflow = dig3 > dig3_overflow_val;
-
-        if (_UNLIKELY(digits > 3 || dig3_overflow))
-        {
-            PyErr_SetString(PyExc_OverflowError, "Integers cannot be more than 8 bytes");
-            return false;
-        }
-
-        n |= dig3 << (2 * PyLong_SHIFT);
-    }
-
-    *neg = (lobj->long_value.lv_tag & _PyLong_SIGN_MASK) != 0;
-    if (*neg)
-        n = -n;
-    
-    *num = n;
-
-    return true;
-
-    #else
-
-    int overflow = 0;
-    *num = PyLong_AsLongLongAndOverflow(obj, &overflow);
-
-    if (_UNLIKELY(overflow != 0))
-    {
-        PyErr_SetString(PyExc_OverflowError, "Integers cannot be more than 8 bytes");
-        return false;
-    }
-
-    return true;
-
-    #endif
 }
 
 static _always_inline void py_float_data(PyObject *obj, double *num)
@@ -302,7 +211,7 @@ static _always_inline PyObject *nil_to_py(void)
 // Global states
 typedef struct {
     PyObject *ext_types;
-    PyObject *arg_type;
+    PyObject *strict_keys;
 } gstates;
 
 // Get interned string of NAME
@@ -311,7 +220,7 @@ typedef struct {
 static bool setup_gstates(gstates *s)
 {
     GET_ISTR(ext_types)
-    GET_ISTR(arg_type)
+    GET_ISTR(strict_keys)
 
     return true;
 }
@@ -333,7 +242,7 @@ static _always_inline gstates *get_gstates(PyObject *m)
 #define _unicode_equal(x, y) _PyUnicode_EQ(x, y)
 #endif
 
-static _always_inline PyObject *get_kwarg(PyObject *const *args, PyObject *kwargs, PyObject *key)
+static _always_inline void *get_kwarg(PyObject *const *args, PyObject *kwargs, PyObject *key)
 {
     const size_t nkwargs = PyTuple_GET_SIZE(kwargs);
 
@@ -348,7 +257,7 @@ static _always_inline PyObject *get_kwarg(PyObject *const *args, PyObject *kwarg
     for (size_t i = 0; i < nkwargs; ++i)
     {
         if (_unicode_equal(PyTuple_GET_ITEM(kwargs, i), key))
-            return args[i];
+            return (void *)args[i];
     }
 
     return NULL;
@@ -358,9 +267,16 @@ static _always_inline PyObject *get_kwarg(PyObject *const *args, PyObject *kwarg
     gstates *s = get_gstates(self); \
     size_t nkwargs = PyTuple_GET_SIZE(kwargs);
 
-// Get kwarg NAME assigned to DEST, replaced by DEFVAL if not found. If TYPE != NULL, check if DEST is TYPE
-#define PARSE_KWARG(dest, name, type, defval) do { \
-    if (((dest) = (void *)get_kwarg(args + nargs, kwargs, s->name)) != NULL) \
+#define PARSE_KWARGS_END \
+    if (_UNLIKELY(nkwargs > 0)) \
+    { \
+        PyErr_SetString(PyExc_TypeError, "Received extra positional arguments"); \
+        return NULL; \
+    }
+
+// Get kwarg NAME assigned to DEST. If TYPE != NULL, check if DEST is TYPE
+#define PARSE_KWARG(dest, name, type) do { \
+    if (((dest) = get_kwarg(args + nargs, kwargs, s->name)) != NULL) \
     { \
         if (type != NULL) \
         { \
@@ -370,22 +286,9 @@ static _always_inline PyObject *get_kwarg(PyObject *const *args, PyObject *kwarg
                 return NULL; \
             } \
         } \
-        if (--nkwargs == 0) \
-            goto kwargs_parsing_end; \
+        --nkwargs; \
     } \
-    else \
-    { \
-        dest = defval; \
-    } \
-} while (0)
-
-#define PARSE_KWARGS_END \
-    kwargs_parsing_end: \
-    if (nkwargs > 0) \
-    { \
-        PyErr_SetString(PyExc_TypeError, "Received extra positional arguments"); \
-        return NULL; \
-    }
+} while (0) \
 
 
 /////////////////////
@@ -937,6 +840,13 @@ static _always_inline PyObject *anymap_to_py(decbuffer_t *b, const size_t npairs
                 Py_DECREF(dict);
                 return NULL;
             }
+
+            if (b->strict_keys && _UNLIKELY(!PyUnicode_Check(key)))
+            {
+                Py_DECREF(dict);
+                PyErr_Format(PyExc_KeyError, "Only string types are supported as map keys in strict mode, received a key of type '%s'", Py_TYPE(key)->tp_name);
+                return NULL;
+            }
         }
 
         PyObject *val = decode_bytes(b);
@@ -955,219 +865,6 @@ static _always_inline PyObject *anymap_to_py(decbuffer_t *b, const size_t npairs
     }
 
     return dict;
-}
-
-
-////////////////////
-//    METADATA    //
-////////////////////
-
-// Get the current offset's byte and increment afterwards
-#define INCBYTE ((b->base + b->offset++)[0])
-
-// Write a header's typemask and its size based on the number of bytes the size should take up
-static _always_inline void write_mask(encbuffer_t *b, const unsigned char mask, const size_t size, const size_t nbytes)
-{
-    if (nbytes == 0) // FIXSIZE
-    {
-        INCBYTE = mask | (unsigned char)size;
-    }
-    else if (nbytes == 1) // SMALL
-    {
-        const uint16_t mdata = BIG_16((size & 0xFF) | ((uint16_t)mask << 8));
-        const size_t mdata_off = 0;
-        memcpy(b->base + b->offset, (char *)(&mdata) + mdata_off, 2);
-        b->offset += 2;
-    }
-    else if (nbytes == 2) // MEDIUM
-    {
-        const uint32_t mdata = BIG_32((size & 0xFFFF) | ((uint32_t)mask << 16));
-        const size_t mdata_off = 1;
-        memcpy(b->base + b->offset, (char *)(&mdata) + mdata_off, 3);
-        b->offset += 3;
-    }
-    else if (nbytes == 4) // LARGE
-    {
-        const uint64_t mdata = BIG_64((uint64_t)(size & 0xFFFFFFFF) | ((uint64_t)mask << 32));
-        const size_t mdata_off = 3;
-        memcpy(b->base + b->offset, (char *)(&mdata) + mdata_off, 5);
-        b->offset += 5;
-    }
-}
-
-static _always_inline bool write_str_metadata(encbuffer_t *b, const size_t size)
-{
-    if (size <= STR_FIXED_MAXSIZE)
-    {
-        write_mask(b, DT_STR_FIXED, size, 0);
-    }
-    else if (size <= STR_SMALL_MAXSIZE)
-    {
-        write_mask(b, DT_STR_SMALL, size, 1);
-    }
-    else if (size <= STR_MEDIUM_MAXSIZE)
-    {
-        write_mask(b, DT_STR_MEDIUM, size, 2);
-    }
-    else if (_LIKELY(size <= STR_LARGE_MAXSIZE))
-    {
-        write_mask(b, DT_STR_LARGE, size, 4);
-    }
-    else
-    {
-        error_incorrect_value("String values can only hold up to 0xFFFFFFFF bytes in data");
-        return false;
-    }
-
-    return true;
-}
-
-static _always_inline bool write_array_metadata(encbuffer_t *b, const size_t nitems)
-{
-    if (nitems <= ARR_FIXED_MAXITEMS)
-    {
-        write_mask(b, DT_ARR_FIXED, nitems, 0);
-    }
-    else if (nitems <= ARR_MEDIUM_MAXITEMS)
-    {
-        write_mask(b, DT_ARR_MEDIUM, nitems, 2);
-    }
-    else if (_LIKELY(nitems <= ARR_LARGE_MAXITEMS))
-    {
-        write_mask(b, DT_ARR_LARGE, nitems, 4);
-    }
-    else
-    {
-        error_incorrect_value("Array values can only hold up to 0xFFFFFFFF items");
-        return false;
-    }
-
-    return true;
-}
-
-static _always_inline bool write_map_metadata(encbuffer_t *b, const size_t npairs)
-{
-    if (npairs <= MAP_FIXED_MAXPAIRS)
-    {
-        write_mask(b, DT_MAP_FIXED, npairs, 0);
-    }
-    else if (npairs <= MAP_MEDIUM_MAXPAIRS)
-    {
-        write_mask(b, DT_MAP_MEDIUM, npairs, 2);
-    }
-    else if (_LIKELY(npairs <= MAP_LARGE_MAXPAIRS))
-    {
-        write_mask(b, DT_MAP_LARGE, npairs, 4);
-    }
-    else
-    {
-        error_incorrect_value("Map values can only hold up to 0xFFFFFFFF pairs");
-        return false;
-    }
-
-    return true;
-}
-
-static _always_inline void write_int_metadata_and_data(encbuffer_t *b, const uint64_t num, const bool neg)
-{
-    if (!neg && num <= UINT_FIXED_MAXVAL)
-    {
-        write_mask(b, DT_UINT_FIXED, num, 0);
-        return;
-    }
-    else if (neg && (int64_t)num >= INT_FIXED_MAXVAL)
-    {
-        write_mask(b, DT_INT_FIXED, num, 0);
-        return;
-    }
-
-    // Convert negative numbers into positive ones, upscaled to match the uint max values
-    const uint64_t pnum = !neg ? num : ((~num + 1) << 1) - 1;
-
-    if (pnum <= UINT_BIT8_MAXVAL)
-    {
-        write_mask(b, neg ? DT_INT_BIT8 : DT_UINT_BIT8, num, 1);
-    }
-    else if (pnum <= UINT_BIT16_MAXVAL)
-    {
-        write_mask(b, neg ? DT_INT_BIT16 : DT_UINT_BIT16, num, 2);
-    }
-    else if (pnum <= UINT_BIT32_MAXVAL)
-    {
-        write_mask(b, neg ? DT_INT_BIT32 : DT_UINT_BIT32, num, 4);
-    }
-    else
-    {
-        INCBYTE = (!neg ? DT_UINT_BIT64 : DT_INT_BIT64);
-
-        const uint64_t _num = BIG_64(num);
-        memcpy(b->base + b->offset, &_num, 8);
-        b->offset += 8;
-    }
-}
-
-static _always_inline bool write_bin_metadata(encbuffer_t *b, const size_t size)
-{
-    if (size <= BIN_SMALL_MAXSIZE)
-    {
-        write_mask(b, DT_BIN_SMALL, size, 1);
-    }
-    else if (size <= BIN_MEDIUM_MAXSIZE)
-    {
-        write_mask(b, DT_BIN_MEDIUM, size, 2);
-    }
-    else if (_LIKELY(size <= BIN_LARGE_MAXSIZE))
-    {
-        write_mask(b, DT_BIN_LARGE, size, 4);
-    }
-    else
-    {
-        error_incorrect_value("Binary values can only hold up to 0xFFFFFFFF bytes in data");
-        return false;
-    }
-
-    return true;
-}
-
-static _always_inline bool write_ext_metadata(encbuffer_t *b, const size_t size, const int8_t id)
-{
-    // If the size is a base of 2 and not larger than 16, it can be represented with a fixsize mask
-    const bool is_baseof2 = (size & (size - 1)) == 0;
-    if (size <= 16 && is_baseof2)
-    {
-        const unsigned char fixmask = (
-            size ==  8 ? DT_EXT_FIX8  :
-            size == 16 ? DT_EXT_FIX16 :
-            size ==  4 ? DT_EXT_FIX4  :
-            size ==  2 ? DT_EXT_FIX2  :
-                         DT_EXT_FIX1
-        );
-
-        write_mask(b, fixmask, (size_t)id, 1);
-        return true;
-    }
-    
-    if (size <= EXT_SMALL_MAXSIZE)
-    {
-        write_mask(b, DT_EXT_SMALL, size, 1);
-    }
-    else if (size <= EXT_MEDIUM_MAXSIZE)
-    {
-        write_mask(b, DT_EXT_MEDIUM, size, 2);
-    }
-    else if (_LIKELY(size <= EXT_LARGE_MAXSIZE))
-    {
-        write_mask(b, DT_EXT_LARGE, size, 4);
-    }
-    else
-    {
-        error_incorrect_value("Ext values can only hold up to 0xFFFFFFFF bytes in data");
-        return false;
-    }
-
-    INCBYTE = id;
-
-    return true;
 }
 
 
@@ -1245,18 +942,488 @@ static bool buffer_expand(encbuffer_t *b, size_t required)
     return true;
 }
 
-
-////////////////////
-//    ENCODING    //
-////////////////////
-
 #define ENSURE_SPACE(extra) do { \
-    if (_UNLIKELY(b->offset + extra >= b->allocated)) \
+    if (_UNLIKELY(b->offset + (extra) >= b->allocated)) \
     { \
         if (buffer_expand(b, extra) == false) \
             { return NULL; } \
     } \
 } while (0)
+
+
+////////////////////
+//  WRITING DATA  //
+////////////////////
+
+// Get the current offset's byte and increment afterwards
+#define INCBYTE ((b->base + b->offset++)[0])
+
+// Write a header's typemask and its size based on the number of bytes the size should take up
+static _always_inline void write_mask(encbuffer_t *b, const unsigned char mask, const size_t size, const size_t nbytes)
+{
+    if (nbytes == 0) // FIXSIZE
+    {
+        INCBYTE = mask | (unsigned char)size;
+    }
+    else if (nbytes == 1) // SMALL
+    {
+        const uint16_t mdata = BIG_16((size & 0xFF) | ((uint16_t)mask << 8));
+        const size_t mdata_off = 0;
+        memcpy(b->base + b->offset, (char *)(&mdata) + mdata_off, 2);
+        b->offset += 2;
+    }
+    else if (nbytes == 2) // MEDIUM
+    {
+        const uint32_t mdata = BIG_32((size & 0xFFFF) | ((uint32_t)mask << 16));
+        const size_t mdata_off = 1;
+        memcpy(b->base + b->offset, (char *)(&mdata) + mdata_off, 3);
+        b->offset += 3;
+    }
+    else if (nbytes == 4) // LARGE
+    {
+        const uint64_t mdata = BIG_64((uint64_t)(size & 0xFFFFFFFF) | ((uint64_t)mask << 32));
+        const size_t mdata_off = 3;
+        memcpy(b->base + b->offset, (char *)(&mdata) + mdata_off, 5);
+        b->offset += 5;
+    }
+}
+
+static _always_inline bool write_str(encbuffer_t *b, PyObject *obj)
+{
+    size_t size;
+    char *base;
+    py_str_data(obj, &base, &size);
+
+    if (_UNLIKELY(base == NULL))
+        return false;
+    
+    ENSURE_SPACE(size + 5);
+
+    if (size <= STR_FIXED_MAXSIZE)
+    {
+        write_mask(b, DT_STR_FIXED, size, 0);
+    }
+    else if (size <= STR_SMALL_MAXSIZE)
+    {
+        write_mask(b, DT_STR_SMALL, size, 1);
+    }
+    else if (size <= STR_MEDIUM_MAXSIZE)
+    {
+        write_mask(b, DT_STR_MEDIUM, size, 2);
+    }
+    else if (_LIKELY(size <= STR_LARGE_MAXSIZE))
+    {
+        write_mask(b, DT_STR_LARGE, size, 4);
+    }
+    else
+    {
+        error_incorrect_value("String values can only hold up to 0xFFFFFFFF bytes in data");
+        return false;
+    }
+
+    memcpy(b->base + b->offset, base, size);
+    b->offset += size;
+
+    return true;
+}
+
+static _always_inline bool write_bin(encbuffer_t *b, PyObject *obj)
+{
+    char *base;
+    size_t size;
+    py_bin_data(obj, &base, &size);
+
+    ENSURE_SPACE(5 + size);
+
+    if (size <= BIN_SMALL_MAXSIZE)
+    {
+        write_mask(b, DT_BIN_SMALL, size, 1);
+    }
+    else if (size <= BIN_MEDIUM_MAXSIZE)
+    {
+        write_mask(b, DT_BIN_MEDIUM, size, 2);
+    }
+    else if (_LIKELY(size <= BIN_LARGE_MAXSIZE))
+    {
+        write_mask(b, DT_BIN_LARGE, size, 4);
+    }
+    else
+    {
+        error_incorrect_value("Binary values can only hold up to 0xFFFFFFFF bytes in data");
+        return false;
+    }
+
+    return true;
+}
+
+static _always_inline bool write_arr(encbuffer_t *b, PyObject *obj)
+{
+    const size_t nitems = PyList_GET_SIZE(obj);
+
+    ENSURE_SPACE(5);
+
+    if (nitems <= ARR_FIXED_MAXITEMS)
+    {
+        write_mask(b, DT_ARR_FIXED, nitems, 0);
+    }
+    else if (nitems <= ARR_MEDIUM_MAXITEMS)
+    {
+        write_mask(b, DT_ARR_MEDIUM, nitems, 2);
+    }
+    else if (_LIKELY(nitems <= ARR_LARGE_MAXITEMS))
+    {
+        write_mask(b, DT_ARR_LARGE, nitems, 4);
+    }
+    else
+    {
+        error_incorrect_value("Array values can only hold up to 0xFFFFFFFF items");
+        return false;
+    }
+
+    for (size_t i = 0; i < nitems; ++i)
+    {
+        if (_UNLIKELY(!encode_object(PyList_GET_ITEM(obj, i), b)))
+            return false;
+    }
+
+    return true;
+}
+
+static _always_inline bool write_map(encbuffer_t *b, PyObject *obj)
+{
+    const size_t npairs = PyDict_GET_SIZE(obj);
+
+    ENSURE_SPACE(5);
+    
+    if (npairs <= MAP_FIXED_MAXPAIRS)
+    {
+        write_mask(b, DT_MAP_FIXED, npairs, 0);
+    }
+    else if (npairs <= MAP_MEDIUM_MAXPAIRS)
+    {
+        write_mask(b, DT_MAP_MEDIUM, npairs, 2);
+    }
+    else if (_LIKELY(npairs <= MAP_LARGE_MAXPAIRS))
+    {
+        write_mask(b, DT_MAP_LARGE, npairs, 4);
+    }
+    else
+    {
+        error_incorrect_value("Map values can only hold up to 0xFFFFFFFF pairs");
+        return false;
+    }
+
+    Py_ssize_t pos = 0;
+    for (size_t i = 0; i < npairs; ++i)
+    {
+        PyObject *key;
+        PyObject *val;
+
+        PyDict_Next(obj, &pos, &key, &val);
+
+        if (b->strict_keys && _UNLIKELY(!PyUnicode_Check(key)))
+        {
+            PyErr_Format(PyExc_KeyError, "Only string types are supported as map keys in strict mode, received a key of type '%s'", Py_TYPE(key)->tp_name);
+            return false;
+        }
+
+        if (_UNLIKELY(
+            !encode_object(key, b) ||
+            !encode_object(val, b)
+        )) return false;
+    }
+
+    return true;
+}
+
+static _always_inline bool write_int(encbuffer_t *b, PyObject *obj)
+{
+    // Use custom integer extraction on Python 3.12+
+    #if PY_VERSION_HEX >= 0x030c0000
+
+    PyLongObject *lobj = (PyLongObject *)obj;
+
+    const bool neg = (lobj->long_value.lv_tag & _PyLong_SIGN_MASK) != 0;
+    const size_t digits = lobj->long_value.lv_tag >> _PyLong_NON_SIZE_BITS;
+
+    if (digits <= 1)
+    {
+        uint32_t num = lobj->long_value.ob_digit[0];
+
+        if (neg)
+        {
+            int32_t _num = -((int32_t)num);
+
+            if (_num >= INT_FIXED_MAXVAL)
+            {
+                write_mask(b, DT_INT_FIXED, _num & 0b11111, 0);
+            }
+            else if (_num >= INT_BIT8_MAXVAL)
+            {
+                write_mask(b, DT_INT_BIT8, _num, 1);
+            }
+            else if (_num <= INT_BIT16_MAXVAL)
+            {
+                write_mask(b, DT_INT_BIT16, _num, 2);
+            }
+            else
+            {
+                write_mask(b, DT_INT_BIT32, _num, 4);
+            }
+        }
+        else
+        {
+            if (num <= UINT_FIXED_MAXVAL)
+            {
+                write_mask(b, DT_UINT_FIXED, num, 0);
+            }
+            else if (num <= UINT_BIT8_MAXVAL)
+            {
+                write_mask(b, DT_UINT_BIT8, num, 1);
+            }
+            else if (num <= UINT_BIT16_MAXVAL)
+            {
+                write_mask(b, DT_UINT_BIT16, num, 2);
+            }
+            else
+            {
+                write_mask(b, DT_UINT_BIT32, num, 4);
+            }
+        }
+
+        return true;
+    }
+
+    uint64_t num = (lobj->long_value.ob_digit[0]) | ((uint64_t)lobj->long_value.ob_digit[1] << PyLong_SHIFT);
+
+    if (digits > 2)
+    {
+        const uint64_t dig3 = (uint64_t)lobj->long_value.ob_digit[2];
+
+        const uint64_t dig3_overflow_val = (1ULL << (64 - (2 * PyLong_SHIFT))) - 1;
+        const bool dig3_overflow = dig3 > dig3_overflow_val;
+
+        if (_UNLIKELY(digits > 3 || dig3_overflow))
+        {
+            PyErr_SetString(PyExc_OverflowError, "Integers cannot be more than 8 bytes");
+            return false;
+        }
+
+        num |= dig3 << (2 * PyLong_SHIFT);
+
+        if (neg)
+            num = -num;
+
+        INCBYTE = (!neg ? DT_UINT_BIT64 : DT_INT_BIT64);
+
+        const uint64_t _num = BIG_64(num);
+        memcpy(b->base + b->offset, &_num, 8);
+        b->offset += 8;
+
+        return true;
+    }
+
+    if (neg)
+    {
+        int64_t _num = -((int64_t)num);
+
+        if (_num >= INT_BIT32_MAXVAL)
+        {
+            write_mask(b, DT_INT_BIT32, _num, 4);
+        }
+        else
+        {
+            INCBYTE = DT_INT_BIT64;
+
+            const uint64_t __num = BIG_64(_num);
+            memcpy(b->base + b->offset, &__num, 8);
+            b->offset += 8;
+        }
+    }
+    else
+    {
+        if (num <= UINT_BIT32_MAXVAL)
+        {
+            write_mask(b, DT_UINT_BIT32, num, 4);
+        }
+        else
+        {
+            INCBYTE = DT_UINT_BIT64;
+
+            const uint64_t _num = BIG_64(num);
+            memcpy(b->base + b->offset, &_num, 8);
+            b->offset += 8;
+        }
+    }
+
+    return true;
+
+    #else
+
+    int overflow = 0;
+    int64_t num = (int64_t)PyLong_AsLongLongAndOverflow(obj, &overflow);
+
+    if (_UNLIKELY(overflow != 0))
+    {
+        PyErr_SetString(PyExc_OverflowError, "Integers cannot be more than 8 bytes");
+        return false;
+    }
+
+    if (num <= 0)
+    {
+        if (num <= UINT_FIXED_MAXVAL)
+        {
+            write_mask(b, DT_UINT_FIXED, num, 0);
+        }
+        else if (num <= UINT_BIT8_MAXVAL)
+        {
+            write_mask(b, DT_UINT_BIT8, num, 1);
+        }
+        else if (num <= UINT_BIT16_MAXVAL)
+        {
+            write_mask(b, DT_UINT_BIT16, num, 2);
+        }
+        else if (num <= UINT_BIT32_MAXVAL)
+        {
+            write_mask(b, DT_UINT_BIT32, num, 4);
+        }
+        else
+        {
+            INCBYTE = DT_UINT_BIT64;
+
+            const uint64_t _num = BIG_64(num);
+            memcpy(b->base + b->offset, &_num, 8);
+            b->offset += 8;
+        }
+    }
+    else
+    {
+        if (num >= INT_FIXED_MAXVAL)
+        {
+            write_mask(b, DT_INT_FIXED, num, 0);
+        }
+        else if (num >= INT_BIT8_MAXVAL)
+        {
+            write_mask(b, DT_INT_BIT8, num, 1);
+        }
+        else if (num >= INT_BIT16_MAXVAL)
+        {
+            write_mask(b, DT_INT_BIT16, num, 2);
+        }
+        else if (num >= INT_BIT32_MAXVAL)
+        {
+            write_mask(b, DT_INT_BIT32, num, 4);
+        }
+        else
+        {
+            INCBYTE = DT_INT_BIT64;
+
+            const uint64_t _num = BIG_64(num);
+            memcpy(b->base + b->offset, &_num, 8);
+            b->offset += 8;
+        }
+    }
+
+    return true;
+
+    #endif
+}
+
+static _always_inline bool write_float(encbuffer_t *b, PyObject *obj)
+{
+    double num;
+    py_float_data(obj, &num);
+
+    char buf[9];
+
+    buf[0] = DT_FLOAT_BIT64;
+    memcpy(buf + 1, &num, 8);
+
+    memcpy(b->base + b->offset, buf, 9);
+    b->offset += 9;
+
+    return true;
+}
+
+static _always_inline bool write_bool(encbuffer_t *b, PyObject *obj)
+{
+    INCBYTE = obj == Py_True ? DT_TRUE : DT_FALSE;
+    return true;
+}
+
+static _always_inline bool write_nil(encbuffer_t *b)
+{
+    INCBYTE = DT_NIL;
+    return true;
+}
+
+static _always_inline bool write_ext(encbuffer_t *b, PyObject *obj)
+{
+    int8_t id;
+    char *ptr;
+    size_t size;
+
+    PyObject *result = any_to_ext(b, obj, &id, &ptr, &size);
+
+    if (result == NULL)
+    {
+        // Error might not be set, so default to unsupported type error
+        if (!PyErr_Occurred())
+            error_unsupported_type(obj);
+        
+        return false;
+    }
+
+    ENSURE_SPACE(6 + size);
+
+    // If the size is a base of 2 and not larger than 16, it can be represented with a fixsize mask
+    const bool is_baseof2 = (size & (size - 1)) == 0;
+    if (size <= 16 && is_baseof2)
+    {
+        const unsigned char fixmask = (
+            size ==  8 ? DT_EXT_FIX8  :
+            size == 16 ? DT_EXT_FIX16 :
+            size ==  4 ? DT_EXT_FIX4  :
+            size ==  2 ? DT_EXT_FIX2  :
+                         DT_EXT_FIX1
+        );
+
+        write_mask(b, fixmask, (size_t)id, 1);
+        return true;
+    }
+    
+    if (size <= EXT_SMALL_MAXSIZE)
+    {
+        write_mask(b, DT_EXT_SMALL, size, 1);
+    }
+    else if (size <= EXT_MEDIUM_MAXSIZE)
+    {
+        write_mask(b, DT_EXT_MEDIUM, size, 2);
+    }
+    else if (_LIKELY(size <= EXT_LARGE_MAXSIZE))
+    {
+        write_mask(b, DT_EXT_LARGE, size, 4);
+    }
+    else
+    {
+        error_incorrect_value("Ext values can only hold up to 0xFFFFFFFF bytes in data");
+        return false;
+    }
+
+    INCBYTE = id;
+
+    memcpy(b->base + b->offset, ptr, size);
+    b->offset += size;
+
+    Py_DECREF(result);
+
+    return true;
+}
+
+
+////////////////////
+//    ENCODING    //
+////////////////////
 
 static bool encode_object(PyObject *obj, encbuffer_t *b)
 {
@@ -1264,115 +1431,43 @@ static bool encode_object(PyObject *obj, encbuffer_t *b)
 
     if (tp == &PyUnicode_Type)
     {
-        char *base;
-        size_t size;
-
-        py_str_data(obj, &base, &size);
-
-        ENSURE_SPACE(5 + size);
-        
-        write_str_metadata(b, size);
-        
-        memcpy(b->base + b->offset, base, size);
-        b->offset += size;
-
-        return true;
+        return write_str(b, obj);
     }
     else if (tp == &PyBytes_Type)
     {
-        char *base;
-        size_t size;
-
-        py_bin_data(obj, &base, &size);
-
-        ENSURE_SPACE(5 + size);
-        
-        write_bin_metadata(b, size);
-        
-        memcpy(b->base + b->offset, base, size);
-        b->offset += size;
-
-        return true;
+        return write_bin(b, obj);
     }
 
     ENSURE_SPACE(9);
 
     if (tp == &PyLong_Type)
     {
-        uint64_t num;
-        bool neg;
-
-        if (_UNLIKELY(!py_int_data(obj, &num, &neg)))
-            return false;
-
-        write_int_metadata_and_data(b, num, neg);
+        return write_int(b, obj);
     }
     else if (tp == &PyFloat_Type)
     {
-        double num;
-        py_float_data(obj, &num);
-
-        INCBYTE = DT_FLOAT_BIT64;
-
-        memcpy(b->base + b->offset, &num, 8);
-        b->offset += 8;
+        return write_float(b, obj);
     }
     else if (tp == &PyBool_Type)
     {
-        // Write a typemask based on if the value is true or false
-        INCBYTE = obj == Py_True ? DT_TRUE : DT_FALSE;
+        return write_bool(b, obj);
     }
-    else if (tp == Py_TYPE(Py_None)) // No explicit PyNone_Type available
+    else if (tp == Py_TYPE(Py_None)) // No explicit PyNone_Type available, so get it using Py_TYPE
     {
-        INCBYTE = DT_NIL;
+        return write_nil(b);
     }
     else if (tp == &PyList_Type)
     {
-        // Get the number of items in the list
-        const size_t nitems = PyList_GET_SIZE(obj);
-
-        // Write metadata of the array
-        write_array_metadata(b, nitems);
-
-        return iterate_over_arr(b, obj, nitems);
+        return write_arr(b, obj);
     }
     else if (tp == &PyDict_Type)
     {
-        // Get the number of pairs in the dict
-        const size_t npairs = PyDict_GET_SIZE(obj);
-
-        write_map_metadata(b, npairs);
-
-        return iterate_over_map(b, obj, npairs);
+        return write_map(b, obj);
     }
     else
     {
-        int8_t id;
-        char *ptr;
-        size_t size;
-
-        PyObject *result = any_to_ext(b, obj, &id, &ptr, &size);
-
-        if (result == NULL)
-        {
-            // Error might not be set, so default to unsupported type error
-            if (!PyErr_Occurred())
-                error_unsupported_type(obj);
-            
-            return false;
-        }
-
-        ENSURE_SPACE(6 + size);
-
-        write_ext_metadata(b, size, id);
-
-        memcpy(b->base + b->offset, ptr, size);
-        b->offset += size;
-
-        Py_DECREF(result);
+        return write_ext(b, obj);
     }
-
-    return true;
 }
 
 
@@ -1804,17 +1899,20 @@ static PyObject *encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
     PyObject *obj = args[0];
     encbuffer_t b;
 
+    b.ext = NULL;
+    b.strict_keys = false;
+
     if (kwargs != NULL)
     {
         PARSE_KWARGS_START
         
-        PARSE_KWARG(b.ext, ext_types, &ExtTypesEncodeObj, NULL);
+        PARSE_KWARG(b.ext, ext_types, &ExtTypesEncodeObj);
+
+        PyObject *_strict_keys;
+        PARSE_KWARG(_strict_keys, strict_keys, &PyBool_Type);
+        b.strict_keys = _strict_keys == Py_True;
 
         PARSE_KWARGS_END
-    }
-    else
-    {
-        b.ext = NULL;
     }
 
     size_t nitems;
@@ -1870,12 +1968,17 @@ static PyObject *decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs,
     decbuffer_t b;
 
     b.ext = NULL;
+    b.strict_keys = false;
 
     if (kwargs != NULL)
     {
         PARSE_KWARGS_START
         
-        PARSE_KWARG(b.ext, ext_types, &ExtTypesDecodeObj, NULL);
+        PARSE_KWARG(b.ext, ext_types, &ExtTypesDecodeObj);
+
+        PyObject *_strict_keys;
+        PARSE_KWARG(_strict_keys, strict_keys, &PyBool_Type);
+        b.strict_keys = _strict_keys == Py_True;
 
         PARSE_KWARGS_END
     }
@@ -1939,11 +2042,18 @@ static PyObject *Encoder(PyObject *self, PyObject *const *args, Py_ssize_t nargs
     enc->data.base = PyBytes_AS_STRING(enc->data.obj);
     enc->data.allocated = ENCODER_BUFFERSIZE;
 
+    enc->data.ext = NULL;
+    enc->data.strict_keys = false;
+
     if (kwargs != NULL)
     {
         PARSE_KWARGS_START
         
-        PARSE_KWARG(enc->data.ext, ext_types, &ExtTypesEncodeObj, NULL);
+        PARSE_KWARG(enc->data.ext, ext_types, &ExtTypesEncodeObj);
+
+        PyObject *strict_keys;
+        PARSE_KWARG(strict_keys, strict_keys, &PyBool_Type);
+        enc->data.strict_keys = strict_keys == Py_True;
 
         PARSE_KWARGS_END
     }
@@ -1960,11 +2070,18 @@ static PyObject *Decoder(PyObject *self, PyObject *const *args, Py_ssize_t nargs
         return NULL;
     }
 
+    dec->data.ext = NULL;
+    dec->data.strict_keys = false;
+
     if (kwargs != NULL)
     {
         PARSE_KWARGS_START
         
-        PARSE_KWARG(dec->data.ext, ext_types, &ExtTypesDecodeObj, NULL);
+        PARSE_KWARG(dec->data.ext, ext_types, &ExtTypesDecodeObj);
+
+        PyObject *strict_keys;
+        PARSE_KWARG(strict_keys, strict_keys, &PyBool_Type);
+        dec->data.strict_keys = strict_keys == Py_True;
 
         PARSE_KWARGS_END
     }
@@ -2130,7 +2247,7 @@ PyMODINIT_FUNC PyInit_cmsgpack(void) {
     if (PyType_Ready(&DecoderObj))
         return NULL;
 
-    if (setup_common_caches() == false)
+    if (!setup_common_caches())
     {
         error_no_memory();
         return NULL;
@@ -2138,7 +2255,7 @@ PyMODINIT_FUNC PyInit_cmsgpack(void) {
 
     PyObject *m = PyModule_Create(&cmsgpack);
     
-    if (setup_gstates((gstates *)PyModule_GetState(m)) == false)
+    if (!setup_gstates((gstates *)PyModule_GetState(m)))
     {
         Py_DECREF(m);
         return NULL;

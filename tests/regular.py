@@ -24,6 +24,8 @@ test_values = [
     {"this": {"is": {"a": {"nested": [1, "value"]}}}},
 ]
 
+# Regular testing
+
 encoded = cmsgpack.encode(test_values)
 decoded = cmsgpack.decode(encoded)
 
@@ -39,6 +41,11 @@ for i in range(len(test_values)):
     if (val != decoded):
         print(f"----\nShould be: ({type(val).__name__})'{str(val)[:100]}'\n\nGot: ({type(decoded).__name__})'{str(decoded)[:100]}'\n----\n")
 
+# Test encoder/decoder validity
 
+enc = cmsgpack.Encoder()
+dec = cmsgpack.Decoder()
 
+if dec.decode(enc.encode(test_values)) != test_values:
+    print("Encoder and Decoder failed")
 
