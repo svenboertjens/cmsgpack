@@ -5,7 +5,18 @@
 //     MASKS     //
 ///////////////////
 
-// The smallest non-fixlen masks are used for identifying types during decoding (such as DT_STR_SMALL for strings)
+// Small is 1 byte
+#define LIMIT_SMALL 0xFF
+
+// Medium is 2 bytes
+#define LIMIT_MEDIUM 0xFFFF
+
+// Large is 4 bytes
+#define LIMIT_LARGE 0xFFFFFFFF
+
+// Limits of ints and uints as strings
+#define LIMIT_UINT_STR "18446744073709551615" // Max positive integer (unsigned)
+#define LIMIT_INT_STR  "-9223372036854775808" // Min negative integer (signed)
 
 // Integers
 #define DT_UINT_FIXED 0x00ULL
@@ -14,11 +25,11 @@
 #define DT_UINT_BIT32 0xCEULL
 #define DT_UINT_BIT64 0xCFULL
 
-#define UINT_FIXED_MAXVAL 0x7FLL
-#define UINT_BIT8_MAXVAL 0xFFULL
-#define UINT_BIT16_MAXVAL 0xFFFFULL
-#define UINT_BIT32_MAXVAL 0xFFFFFFFFULL
-#define UINT_BIT64_MAXVAL 0xFFFFFFFFFFFFFFFFULL
+#define LIMIT_UINT_FIXED 0x7FLL
+#define LIMIT_UINT_BIT8  0xFFULL
+#define LIMIT_UINT_BIT16 0xFFFFULL
+#define LIMIT_UINT_BIT32 0xFFFFFFFFULL
+#define LIMIT_UINT_BIT64 0xFFFFFFFFFFFFFFFFULL
 
 #define DT_INT_FIXED 0xE0ULL
 #define DT_INT_BIT8 0xD0ULL
@@ -26,11 +37,11 @@
 #define DT_INT_BIT32 0xD2ULL
 #define DT_INT_BIT64 0xD3ULL
 
-#define INT_FIXED_MAXVAL -32LL
-#define INT_BIT8_MAXVAL -128LL
-#define INT_BIT16_MAXVAL -32768LL
-#define INT_BIT32_MAXVAL -2147483648LL
-#define INT_BIT64_MAXVAL -9223372036854775808LL
+#define LIMIT_INT_FIXED -32LL
+#define LIMIT_INT_BIT8  -128LL
+#define LIMIT_INT_BIT16 -32768LL
+#define LIMIT_INT_BIT32 -2147483648LL
+#define LIMIT_INT_BIT64 -9223372036854775808LL
 
 // Floats
 #define DT_FLOAT_BIT32 0xCAULL
@@ -42,41 +53,21 @@
 #define DT_STR_MEDIUM 0xDAULL
 #define DT_STR_LARGE 0xDBULL
 
-/**
- * stat: 000
- * bin:  001 (ext_s)
- * flt:  010 (ext_m, ext_l)
- * uint: 011
- * 
- * int:  100
- * ext:  101 (fix1, fix2, fix4 fix8)
- * str:  110 (fix16)
- * arr:  111 (also map)
- * 
- */
-
-#define STR_FIXED_MAXSIZE 0x1FULL
-#define STR_SMALL_MAXSIZE 0xFFULL
-#define STR_MEDIUM_MAXSIZE 0xFFFFULL
-#define STR_LARGE_MAXSIZE 0xFFFFFFFFULL
+#define LIMIT_STR_FIXED 0x1FULL
 
 // Arrays
 #define DT_ARR_FIXED 0x90ULL
 #define DT_ARR_MEDIUM 0xDCULL
 #define DT_ARR_LARGE 0xDDULL
 
-#define ARR_FIXED_MAXITEMS 0x0FULL
-#define ARR_MEDIUM_MAXITEMS 0xFFFFULL
-#define ARR_LARGE_MAXITEMS 0xFFFFFFFFULL
+#define LIMIT_ARR_FIXED 0x0FULL
 
 // Maps
 #define DT_MAP_FIXED 0x80ULL
 #define DT_MAP_MEDIUM 0xDEULL
 #define DT_MAP_LARGE 0xDFULL
 
-#define MAP_FIXED_MAXPAIRS 0x0FULL
-#define MAP_MEDIUM_MAXPAIRS 0xFFFFULL
-#define MAP_LARGE_MAXPAIRS 0xFFFFFFFFULL
+#define LIMIT_MAP_FIXED 0x0FULL
 
 // States
 #define DT_NIL   0xC0ULL
@@ -88,10 +79,6 @@
 #define DT_BIN_MEDIUM 0xC5ULL
 #define DT_BIN_LARGE 0xC6ULL
 
-#define BIN_SMALL_MAXSIZE 0x0FULL
-#define BIN_MEDIUM_MAXSIZE 0xFFFFULL
-#define BIN_LARGE_MAXSIZE 0xFFFFFFFFULL
-
 // Extension Types
 #define DT_EXT_FIX1 0xD4ULL
 #define DT_EXT_FIX2 0xD5ULL
@@ -102,9 +89,5 @@
 #define DT_EXT_SMALL 0xC7ULL
 #define DT_EXT_MEDIUM 0xC8ULL
 #define DT_EXT_LARGE 0xC9ULL
-
-#define EXT_SMALL_MAXSIZE 0xFFULL
-#define EXT_MEDIUM_MAXSIZE 0xFFFFULL
-#define EXT_LARGE_MAXSIZE 0xFFFFFFFFULL
 
 #endif // MASKS_H

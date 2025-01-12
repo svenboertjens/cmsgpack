@@ -9,19 +9,16 @@
 #ifdef IS_BIG_ENDIAN
 
     #define BIG_64(x) (x)
-
     #define BIG_DOUBLE(x) (x)
 
 #else
 
-    // GCC and CLANG intrinsics
     #if defined(__GNUC__) || defined(__clang__)
 
         #define BIG_64(x) (__builtin_bswap64((uint64_t)(x)))
         #define BIG_32(x) (__builtin_bswap32((uint32_t)(x)))
         #define BIG_16(x) (__builtin_bswap16((uint16_t)(x)))
 
-    // MSCV intrinsics
     #elif defined(_MSC_VER)
 
         #include <intrin.h>
@@ -66,19 +63,7 @@
 #endif
 
 
-#if (defined(__GNUC__) || defined(__clang__))
-
-    #define _always_inline __always_inline
-
-#elif defined(_MSC_VER)
-
-    #define _always_inline __forceinline
-
-#else
-
-    #define _always_inline inline
-
-#endif
+#define _always_inline Py_ALWAYS_INLINE
 
 #if (defined(__GNUC__) || defined(__clang__)) 
 
@@ -90,6 +75,66 @@
     #define _LIKELY(cond) (cond)
     #define _UNLIKELY(cond) (cond)
 
+#endif
+
+
+#if defined(_WIN32) || defined(_WIN64)
+    #include <io.h>
+
+    static int _ftruncate_and_close(FILE *file, const size_t size, const char *fname)
+    {
+        int state = _chsize_s(_fileno(fileobj), size) != 0;
+        fclose(file);
+        return state;
+    }
+#elif defined(_POSIX_VERSION)
+    #include <unistd.h>
+
+    static int _ftruncate_and_close(FILE *file, const size_t size, const char *fname)
+    {
+        int state = ftruncate(fileno(file), size) != 0;
+        fclose(file);
+        return state;
+    }
+#else
+    static int _ftruncate_and_close(FILE *file, const size_t size, const char *fname)
+    {
+        file = freopen(fname, "r+b", file);
+
+        if (_UNLIKELY(file == NULL))
+            return -1;
+        
+        char *tmp = (char *)malloc(size);
+
+        if (_UNLIKELY(tmp == NULL))
+        {
+            fclose(file);
+            return -1;
+        }
+        
+        if (_UNLIKELY(fread(tmp, 1, size, file) != size))
+        {
+            fclose(file);
+            free(tmp);
+            return -1;
+        }
+
+        file = freopen(fname, "wb", file);
+
+        if (_UNLIKELY(file == NULL))
+        {
+            free(tmp);
+            return -1;
+        }
+
+        setvbuf(file, NULL, _IONBF, 0);
+
+        const size_t written = fwrite(tmp, 1, size, file);
+
+        free(tmp);
+
+        return written == size ? 0 : -1;
+    }
 #endif
 
 #endif // INTERNALS_H
