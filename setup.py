@@ -8,7 +8,7 @@ ext_modules = [
         ],
         include_dirs=[
             'cmsgpack/'
-        ]
+        ],
     )
 ]
 
