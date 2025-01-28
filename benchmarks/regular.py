@@ -68,8 +68,6 @@ v = {
     },
 }
 
-v = [n for n in range(1000)]
-
 """
 On a small number of iterations, the benchmark times can appear
 as a few seconds. This is due to the integer being converted to

@@ -1242,10 +1242,6 @@ static _always_inline bool write_nil(encbuffer_t *b)
     return true;
 }
 
-#define STR_LITERAL(name, s)            \
-    char name[sizeof(s)];               \
-    sprintf(name, "%s", s);
-
 static _always_inline bool write_ext(encbuffer_t *b, PyObject *obj)
 {
     int8_t id;
@@ -1261,12 +1257,6 @@ static _always_inline bool write_ext(encbuffer_t *b, PyObject *obj)
             PyErr_Format(PyExc_ValueError, "Received unsupported type: '%s'", Py_TYPE(obj)->tp_name);
         
         return false;
-    }
-
-    if (id == 17)
-    {
-        STR_LITERAL(test123, "Hello, world! This is a test string.");
-        printf(test123);
     }
 
     ENSURE_SPACE(6 + size);
@@ -1741,10 +1731,12 @@ static PyObject *decode_bytes(decbuffer_t *b)
 // Prepare the encoding buffer struct
 static _always_inline bool encbuffer_prepare(encbuffer_t *b, mstates_t *states, PyObject *obj)
 {
+    // Initialize the new size with the extra average and set NITEMS to 0 in advance
+    size_t new_size = states->encoding.extra_avg;
+    b->nitems = 0;
+
     // Attempt to allocate appropriate memory for the buffer based on OBJ's type
     PyTypeObject *tp = Py_TYPE(obj);
-    size_t new_size = 0;
-
     if (_LIKELY(tp == &PyList_Type || tp == &PyDict_Type))
     {
         // Get the number of items in the container
@@ -1753,17 +1745,10 @@ static _always_inline bool encbuffer_prepare(encbuffer_t *b, mstates_t *states, 
         // Add allocation size based on the number of items
         new_size += b->nitems * states->encoding.item_avg;
     }
-    else
-    {
-        // NITEMS is 0 with non-container objects
-        b->nitems = 0;
 
-        // Use just the average alloc size
-        new_size = states->encoding.extra_avg;
-    }
-
-    // Check if the size estimated to be required doesn't exceed the size of the existing buffer, and re-use that if possible
-    if (Py_REFCNT(states->encoding.obj) == 1 && states->encoding.size >= new_size)
+    // Reuse buffer if it has a single reference and its size is within a reasonable range.
+    const size_t normalized = states->encoding.size - (new_size / 2); // Underflows to a large value if out of range
+    if (Py_REFCNT(states->encoding.obj) == 1 && normalized < (new_size * 4))
     {
         // NITEMS is -1 when we can't update allocation data
         b->nitems = -1;
@@ -1781,8 +1766,14 @@ static _always_inline bool encbuffer_prepare(encbuffer_t *b, mstates_t *states, 
 
         if (_UNLIKELY(states->encoding.obj == NULL))
         {
-            PyErr_NoMemory();
-            return false;
+            // Attempt to create an object with the default buffer size
+            states->encoding.obj = (PyBytesObject *)PyBytes_FromStringAndSize(NULL, ENCBUFFER_DEFAULTSIZE);
+
+            if (_UNLIKELY(states->encoding.obj == NULL))
+            {
+                PyErr_NoMemory();
+                return false;
+            }
         }
     }
 
@@ -1806,9 +1797,18 @@ static _always_inline size_t encbuffer_size(encbuffer_t *b)
 #define EXTRA_ALLOC_MIN 64
 #define ITEM_ALLOC_MIN 6
 
+static _always_inline size_t biased_average(size_t curr, size_t new)
+{
+    // Safety against growing too quickly by limiting growth size to a factor of 4
+    if (_UNLIKELY((curr * 4) < new))
+        return (curr * 4);
+    
+    // Return a biased average leaning more towards the current value
+    return ((curr * 2) + new) / 3;
+}
+
 static void update_adaptive_allocation(encbuffer_t *b)
 {
-    const size_t allocated = b->states->encoding.size;
     const size_t needed = encbuffer_size(b);
     const Py_ssize_t nitems = b->nitems;
 
@@ -1817,11 +1817,7 @@ static void update_adaptive_allocation(encbuffer_t *b)
         return;
 
     // Take the average between how much we needed and the currently set value
-    const size_t extra_avg_val = (b->states->encoding.extra_avg + needed) / 2;
-
-    // Set the size to how much we used plus a bit of what was allocated extra
-    // to avoid under-allocating in the next round
-    b->states->encoding.extra_avg = extra_avg_val + ((allocated - needed) / 4);
+    b->states->encoding.extra_avg = biased_average(b->states->encoding.extra_avg, needed);
 
     // Enforce a minimum size for safety. Check if the threshold is crossed by subtracting
     // it from the value, casting to a signed value, and checking if we're below 0 (overflow happened)
@@ -1835,14 +1831,10 @@ static void update_adaptive_allocation(encbuffer_t *b)
     // We use multiplication by reciprocal instead of division for speed below
 
     // Size allocated per item and required per item
-    const size_t used_per_item = allocated / nitems;
     const size_t needed_per_item = needed / nitems;
 
     // Take the average between the currently set per-item value and that of this round
-    const size_t item_avg_val = (b->states->encoding.item_avg + needed_per_item) / 2;
-
-    // Set the new size to the average, and add a bit based on what was allocated extra
-    b->states->encoding.item_avg = item_avg_val + ((used_per_item - needed_per_item) / 2);
+    b->states->encoding.item_avg = biased_average(b->states->encoding.item_avg, needed_per_item);
 
     // Enforce a value threshold as we did with the `extra_avg` value
     if (_UNLIKELY((Py_ssize_t)(b->states->encoding.item_avg - ITEM_ALLOC_MIN) < 0))
@@ -2039,7 +2031,7 @@ static PyObject *encoder_encode(encoder_t *enc, PyObject *obj)
     NULLCHECK(encbuffer_prepare(&enc->data, get_mstates(NULL), obj));
 
     // Encode the object
-    NULLCHECK(encode_object(obj, &enc->data) == false);
+    NULLCHECK(encode_object(obj, &enc->data));
     
     return encbuffer_return(&enc->data);
 }
@@ -2505,6 +2497,7 @@ static void cleanup_module(PyObject *m)
     if (PyType_Ready(&type)) return NULL;
 
 PyMODINIT_FUNC PyInit_cmsgpack(void) {
+    // See if we can find the module in the state already
     PyObject *m = PyState_FindModule(&cmsgpack);
     if (m != NULL)
     {
@@ -2512,6 +2505,7 @@ PyMODINIT_FUNC PyInit_cmsgpack(void) {
         return m;
     }
     
+    // Prepare custom types
     PYTYPE_READY(EncoderObj);
     PYTYPE_READY(DecoderObj);
 
@@ -2521,9 +2515,17 @@ PyMODINIT_FUNC PyInit_cmsgpack(void) {
     PYTYPE_READY(ExtTypesEncodeObj);
     PYTYPE_READY(ExtTypesDecodeObj);
 
+    // Create main module
     m = PyModule_Create(&cmsgpack);
     NULLCHECK(m);
+
+    // Add the module to the state
+    if (PyState_AddModule(m, &cmsgpack) != 0) {
+        Py_DECREF(m);
+        return NULL;
+    }
     
+    // Setup the module states
     if (!setup_mstates((mstates_t *)PyModule_GetState(m)))
     {
         Py_DECREF(m);
