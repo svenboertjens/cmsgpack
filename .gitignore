@@ -1,6 +1,9 @@
-.vscode
 build
-**.egg-info
 dist
-__pycache__
 local
+
+.vscode
+.obsidian
+**.egg-info
+
+test.bin

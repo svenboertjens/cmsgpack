@@ -16,15 +16,11 @@
     #if defined(__GNUC__) || defined(__clang__)
 
         #define BIG_64(x) (__builtin_bswap64((uint64_t)(x)))
-        #define BIG_32(x) (__builtin_bswap32((uint32_t)(x)))
-        #define BIG_16(x) (__builtin_bswap16((uint16_t)(x)))
 
     #elif defined(_MSC_VER)
 
         #include <intrin.h>
         #define BIG_64(x) (_byteswap_uint64((uint64_t)(x)))
-        #define BIG_32(x) (_byteswap_uint32((uint32_t)(x)))
-        #define BIG_16(x) (_byteswap_uint16((uint16_t)(x)))
 
     #else
 
@@ -37,18 +33,6 @@
             (((x) << 24) & 0x0000FF0000000000) | \
             (((x) << 40) & 0x00FF000000000000) | \
             (((x) << 56) & 0xFF00000000000000)   \
-        )
-
-        #define BIG_32(x) ( \
-            (((x) >> 24) & 0x000000FF) | \
-            (((x) >>  8) & 0x0000FF00) | \
-            (((x) <<  8) & 0x00FF0000) | \
-            (((x) << 24) & 0xFF000000)   \
-        )
-
-        #define BIG_16(x) ( \
-            (((x) >> 8) & 0x00FF) | \
-            (((x) << 8) & 0xFF00)   \
         )
 
     #endif
@@ -83,7 +67,7 @@
 
     static int _ftruncate_and_close(FILE *file, const size_t size, const char *fname)
     {
-        int state = _chsize_s(_fileno(fileobj), size) != 0;
+        int state = _chsize_s(_fileno(file), size) != 0;
         fclose(file);
         return state;
     }

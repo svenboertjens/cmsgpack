@@ -42,5 +42,5 @@ setup(
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: OS Independent",
     ],
-    license='Apache License 2.0',
+    license='MIT',
 )
