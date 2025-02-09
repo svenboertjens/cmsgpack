@@ -13,7 +13,7 @@
 
 // Python versions
 #define PYVER12 (PY_VERSION_HEX >= 0x030C0000)
-#define PYVER13 (PY_VERSION_HEX >= 0x030d0000)
+#define PYVER13 (PY_VERSION_HEX >= 0x030D0000)
 
 
 ///////////////////////////
@@ -171,7 +171,7 @@ static _always_inline PyObject *fixstr_to_py(char *ptr, size_t size, atomic_uint
 
 static _always_inline PyObject *str_to_py(char *ptr, size_t size)
 {
-    return PyUnicode_DecodeUTF8(ptr, size, NULL);;
+    return PyUnicode_DecodeUTF8(ptr, size, NULL);
 }
 
 #define INTEGER_CACHE_SLOTS 1024
@@ -676,7 +676,7 @@ static PyObject *ext_to_any(buffer_t *b, const int8_t id, const size_t size)
 //  BYTES TO CONTAINER  //
 //////////////////////////
 
-static _always_inline PyObject *anyarr_to_py(buffer_t *b, const size_t nitems)
+static _always_inline PyObject *arr_to_py(buffer_t *b, const size_t nitems)
 {
     PyObject *list = PyList_New(nitems);
 
@@ -699,7 +699,7 @@ static _always_inline PyObject *anyarr_to_py(buffer_t *b, const size_t nitems)
     return list;
 }
 
-static _always_inline PyObject *anymap_to_py(buffer_t *b, const size_t npairs)
+static _always_inline PyObject *map_to_py(buffer_t *b, const size_t npairs)
 {
     PyObject *dict = _PyDict_NewPresized(npairs);
 
@@ -1375,7 +1375,7 @@ static bool encode_object(buffer_t *b, PyObject *obj)
     {
         return write_list(b, obj);
     }
-    if (PyTuple_Check(obj)) // Same as with lists, no exact check
+    if (PyTuple_Check(obj)) // Same as with lists, no exact check to support subclasses
     {
         return write_tuple(b, obj);
     }
@@ -1470,11 +1470,11 @@ static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, const unsigned
     }
     else if ((mask & 0b11110000) == DT_ARR_FIXED) // Bit 5 is also set on ARR and MAP
     {
-        return anyarr_to_py(b, n & 0x0F);
+        return arr_to_py(b, n & 0x0F);
     }
     else if ((mask & 0b11110000) == DT_MAP_FIXED)
     {
-        return anymap_to_py(b, n & 0x0F);
+        return map_to_py(b, n & 0x0F);
     }
     else
     {
@@ -1495,15 +1495,18 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
     {
     case VARLEN_DT(DT_STR_LARGE):
     {
+        OVERREAD_CHECK(4);
         n |= SIZEBYTE << 24;
         n |= SIZEBYTE << 16;
     }
     case VARLEN_DT(DT_STR_MEDIUM):
     {
+        OVERREAD_CHECK(2);
         n |= SIZEBYTE << 8;
     }
     case VARLEN_DT(DT_STR_SMALL):
     {
+        OVERREAD_CHECK(1);
         n |= SIZEBYTE;
 
         OVERREAD_CHECK(n);
@@ -1608,7 +1611,7 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
         n |= SIZEBYTE << 8;
         n |= SIZEBYTE;
 
-        return anyarr_to_py(b, n);
+        return arr_to_py(b, n);
     }
 
     case VARLEN_DT(DT_MAP_LARGE):
@@ -1623,7 +1626,7 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
         n |= SIZEBYTE << 8;
         n |= SIZEBYTE;
 
-        return anymap_to_py(b, n);
+        return map_to_py(b, n);
     }
 
     case VARLEN_DT(DT_NIL):
@@ -1680,6 +1683,8 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
     {
         OVERREAD_CHECK(1);
         n |= SIZEBYTE;
+
+        OVERREAD_CHECK(n);
 
         PyObject *obj = bin_to_py(b->offset, n);
         b->offset += n;
@@ -2210,10 +2215,6 @@ static PyObject *encoder_encode(bufconfig_obj_t *enc, PyObject *obj)
         return (PyObject *)result;
     
     // Otherwise stream the data to a file
-    
-    // Decref the result as we won't return it.
-    // We hold an extra reference, so this won't free the buffer
-    Py_DECREF(result);
 
     const size_t size = PyBytes_GET_SIZE(result);
 
@@ -2255,8 +2256,6 @@ static _always_inline bool nowrite_check(buffer_t *b, const size_t read)
             const int err = errno;
             PyErr_Format(PyExc_OSError, "Unable to read data from file '%s', received errno %i: '%s'", b->config.fdata->name, err, strerror(err));
         }
-
-        // Don't close file, that happens when the object is destroyed
 
         return false;
     }
@@ -2309,14 +2308,14 @@ static PyObject *decoder_decode(bufconfig_obj_t *dec, PyObject **args, Py_ssize_
     // Decode the data
     PyObject *result = decode_bytes(&b);
 
-    // Free the internal buffer
-    free(b.base);
-
     // Calculate up to where we used file data
-    const size_t end_offset = ftell(b.config.fdata->file) - (b.maxoffset - b.base) + (b.offset - b.base);
+    const size_t end_offset = ftell(b.config.fdata->file) - (b.maxoffset - b.offset);
 
     // Set the file offset at the end of the data we needed, so that it starts at the new data
     fseek(b.config.fdata->file, end_offset, SEEK_SET);
+
+    // Free the internal buffer
+    free(b.base);
 
     return result;
 }
@@ -2324,13 +2323,19 @@ static PyObject *decoder_decode(bufconfig_obj_t *dec, PyObject **args, Py_ssize_
 // Refresh the streaming buffer
 static bool decoder_streaming_refresh(buffer_t *b, const size_t requested)
 {
+    // How much we have to reread from the file
+    const size_t reread = (size_t)(b->maxoffset - b->offset);
+
+    // Set the file cursor back to where we have to reread from
+    fseek(b->config.fdata->file, -reread, SEEK_CUR);
+
     // Check if the requested size is larger than the entire buffer
     if (_UNLIKELY(requested > (size_t)(b->maxoffset - b->base)))
     {
         // Allocate a new object to fit the requested size
         const size_t newsize = requested * 1.2;
 
-        char *newptr = (char *)malloc(newsize);
+        char *newptr = (char *)realloc(b->base, newsize);
 
         if (_UNLIKELY(newptr == NULL))
         {
@@ -2338,16 +2343,13 @@ static bool decoder_streaming_refresh(buffer_t *b, const size_t requested)
             return false;
         }
 
-        // Update the file offsets
-        b->offset = newptr + (size_t)(b->offset - b->base);
+        // Update the max offset for the reading part
         b->maxoffset = newptr + newsize;
-
-        // Update the base pointer
         b->base = newptr;
     }
 
-    // Read extra data into the buffer
-    const size_t to_read = (b->maxoffset - b->base);
+    // Read new data into the buffer
+    const size_t to_read = b->maxoffset - b->base;
     const size_t read = fread(b->base, 1, to_read, b->config.fdata->file);
 
     NULLCHECK(nowrite_check(b, read));

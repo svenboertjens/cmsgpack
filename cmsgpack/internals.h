@@ -87,6 +87,7 @@
         return state;
     }
 #else
+    // Fallback by copying the correct file contents and rewriting it to the file
     static int _ftruncate_and_close(FILE *file, const size_t size, const char *fname)
     {
         file = freopen(fname, "r+b", file);

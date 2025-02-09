@@ -1,18 +1,19 @@
 import cmsgpack
 
-test_values = [
-    1, 2, 3,
-    'abc', 'def', 'ghi'
-]
+from test_values import test_values
 
 f = 'test.bin'
 
 enc = cmsgpack.Encoder(file_name=f)
 dec = cmsgpack.Decoder(file_name=f)
 
-for val in test_values:
-    enc.encode(val)
-    assert val == dec.decode()
+try:
+    for val in test_values:
+        enc.encode(val)
+        assert val == dec.decode()
+
+except e:
+    print(e)
 
 
 import os

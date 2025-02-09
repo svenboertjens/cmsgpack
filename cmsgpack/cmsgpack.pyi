@@ -71,4 +71,3 @@ class Decoder:
     def decode(self, encoded: Buffer=None) -> any:
         " Decode any MessagePack-encoded data using the class's stored arguments. "
         ...
-
