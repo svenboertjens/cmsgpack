@@ -24,6 +24,8 @@ test_values = [
     {"this": {"is": {"a": {"nested": [1, "value"]}}}},
 ]
 
+import msgpack
+
 def test(enc, dec):
     encoded = enc(test_values)
     decoded = dec(encoded)

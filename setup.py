@@ -39,7 +39,7 @@ setup(
     },
     
     classifiers=[
-        "License :: OSI Approved :: Apache Software License",
+        "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
     license='MIT',

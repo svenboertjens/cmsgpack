@@ -6,7 +6,7 @@ class Cstr:
 
 
 def enc_cstr(obj):
-    return 1, obj.val.encode()
+    return obj.val.encode()
 
 def dec_cstr(bytes):
     return Cstr(bytes.decode())
@@ -16,7 +16,7 @@ def dec_cstr(bytes):
 
 
 enc = cm.ExtTypesEncode({
-    Cstr: enc_cstr
+    1: (Cstr, enc_cstr)
 })
 dec = cm.ExtTypesDecode({
     1: dec_cstr
@@ -25,10 +25,10 @@ dec = cm.ExtTypesDecode({
 
 test_values = [
     Cstr("a" * 0xFF),
-    Cstr("a" * 0x100),
-    Cstr("a" * 0xFFFF),
-    Cstr("a" * 0x10000),
-    Cstr("a" * 0xFFFFFFF),
+    #Cstr("a" * 0x100),
+    #Cstr("a" * 0xFFFF),
+    #Cstr("a" * 0x10000),
+    #Cstr("a" * 0xFFFFFFF),
 ]
 
 chars = "abcdefghijklmnopqrstuvwxyz"

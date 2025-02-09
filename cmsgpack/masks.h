@@ -1,5 +1,5 @@
-#ifndef MASKS_H
-#define MASKS_H
+#ifndef CMSGPACK_MASKS_H
+#define CMSGPACK_MASKS_H
 
 ///////////////////
 //     MASKS     //
@@ -13,10 +13,6 @@
 
 // Large is 4 bytes
 #define LIMIT_LARGE 0xFFFFFFFF
-
-// Limits of ints and uints as strings
-#define LIMIT_UINT_STR "18446744073709551615" // Max positive integer (unsigned)
-#define LIMIT_INT_STR  "-9223372036854775808" // Min negative integer (signed)
 
 // Integers
 #define DT_UINT_FIXED 0x00ULL
@@ -90,4 +86,4 @@
 #define DT_EXT_MEDIUM 0xC8ULL
 #define DT_EXT_LARGE 0xC9ULL
 
-#endif // MASKS_H
+#endif // CMSGPACK_MASKS_H

@@ -1,10 +1,16 @@
-#ifndef INTERNALS_H
-#define INTERNALS_H
+#ifndef CMSGPACK_INTERNALS_H
+#define CMSGPACK_INTERNALS_H
 
 
 ///////////////////
 //   INTERNALS   //
 ///////////////////
+
+#include <Python.h>
+
+#if Py_BIG_ENDIAN == 1
+#define IS_BIG_ENDIAN
+#endif
 
 #ifdef IS_BIG_ENDIAN
 
@@ -121,4 +127,4 @@
     }
 #endif
 
-#endif // INTERNALS_H
+#endif // CMSGPACK_INTERNALS_H
