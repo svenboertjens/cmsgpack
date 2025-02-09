@@ -16,15 +16,28 @@
 #define PYVER13 (PY_VERSION_HEX >= 0x030D0000)
 
 
-///////////////////////////
-//  TYPEDEFS & FORWARDS  //
-///////////////////////////
+///////////////////
+//   CONSTANTS   //
+///////////////////
 
 // Number of slots in ext type hash tables
 #define EXT_TABLE_SLOTS 256
 
-// Default buffer size
+// Default (regular) buffer size
 #define BUFFER_DEFAULTSIZE 256
+
+// The number of slots to use in caches
+#define STRING_CACHE_SLOTS 1024
+#define INTEGER_CACHE_SLOTS 1024
+
+// Minimum sizes for the 'extra' and 'item' adaptive allocation weights
+#define EXTRA_ALLOC_MIN 64
+#define ITEM_ALLOC_MIN 6
+
+
+///////////////////////////
+//  TYPEDEFS & FORWARDS  //
+///////////////////////////
 
 // Usertypes encode object struct
 typedef struct {
@@ -43,6 +56,12 @@ static PyTypeObject ExtTypesEncodeObj;
 static PyTypeObject ExtTypesDecodeObj;
 
 
+// String cache struct with a lock per object
+typedef struct {
+    PyASCIIObject *strings[STRING_CACHE_SLOTS];
+    atomic_flag locks[STRING_CACHE_SLOTS];
+} strcache_t;
+
 // Module states
 typedef struct {
     // Interned strings
@@ -56,12 +75,10 @@ typedef struct {
 
     // Caches
     struct {
-        PyLongObject *integers;
-        atomic_uintptr_t *strings; // Use atomics as it's written to dynamically
+        PyLongObject integers[INTEGER_CACHE_SLOTS];
+        strcache_t strings;
     } caches;
 } mstates_t;
-
-static _always_inline mstates_t *get_mstates(PyObject *m);
 
 
 // File data
@@ -87,9 +104,8 @@ typedef struct {
     bufconfig_t config; // Configurations
 } buffer_t;
 
-static bool encbuffer_expand(buffer_t *b, size_t needed);
 
-
+// Object for persistent configs (encoder/decoder)
 typedef struct {
     PyObject_HEAD
     bufconfig_t config;
@@ -98,8 +114,13 @@ typedef struct {
 static PyTypeObject EncoderObj;
 static PyTypeObject DecoderObj;
 
+
+static _always_inline mstates_t *get_mstates(PyObject *m);
+
 static bool encode_object(buffer_t *b, PyObject *obj);
 static PyObject *decode_bytes(buffer_t *b);
+
+static bool encbuffer_expand(buffer_t *b, size_t needed);
 static bool decoder_streaming_refresh(buffer_t *b, const size_t requested);
 
 
@@ -124,29 +145,44 @@ static struct PyModuleDef cmsgpack;
 //  BYTES TO PY  //
 ///////////////////
 
-// The number of slots for the string cache
-#define STRING_CACHE_SLOTS 1024
-
-static _always_inline PyObject *fixstr_to_py(char *ptr, size_t size, atomic_uintptr_t *cache)
+// Acquire a lock
+static _always_inline void cache_acquire_lock(atomic_flag *lock)
 {
+    while (atomic_flag_test_and_set_explicit(lock, memory_order_acquire)) { }
+}
+
+// Release a lock
+static inline void cache_release_lock(atomic_flag *lock)
+{
+    atomic_flag_clear_explicit(lock, memory_order_release);
+}
+
+// Version for small strings to be cached
+static _always_inline PyObject *fixstr_to_py(char *ptr, size_t size, strcache_t *cache)
+{
+    // Calculate the hash of the string
     const size_t hash = fnv1a(ptr, size) & (STRING_CACHE_SLOTS - 1);
 
+    // Wait on the lock of the hash
+    cache_acquire_lock(&cache->locks[hash]);
+
     // Load the match stored at the hash index
-    PyASCIIObject *match = (PyASCIIObject *)atomic_load_explicit(&cache[hash], memory_order_acquire);
+    PyASCIIObject *match = cache->strings[hash];
 
     if (match != NULL)
     {
-        // Ensure match is still valid by incrementing reference count
-        Py_INCREF(match); // Prevents another thread from destroying it
-
         const char *cbase = (const char *)(match + 1);
         const size_t csize = match->length;
 
         if (_LIKELY(csize == size && memcmp(cbase, ptr, size) == 0))
-            return (PyObject *)match;
+        {
+            Py_INCREF(match);
 
-        // Release the safety reference
-        Py_DECREF(match);
+            // Release the lock
+            cache_release_lock(&cache->locks[hash]);
+
+            return (PyObject *)match;
+        }
     }
 
     // No common value, create a new one
@@ -155,15 +191,16 @@ static _always_inline PyObject *fixstr_to_py(char *ptr, size_t size, atomic_uint
     // Add to the cache if ascii
     if (PyUnicode_IS_COMPACT_ASCII(obj))
     {
-        // Keep a reference for the cache
+        // Keep reference to the new object and lose reference to the old object
         Py_INCREF(obj);
+        Py_XDECREF(match);
 
-        // Store the new object atomically
-        PyObject *old = (PyObject *)atomic_exchange_explicit(&cache[hash], (uintptr_t)obj, memory_order_acq_rel);
-
-        // Now safely decrease the reference to the previous object
-        Py_XDECREF(old);
+        // Set the new object into the cache
+        cache->strings[hash] = (PyASCIIObject *)obj;
     }
+
+    // Release the lock
+    cache_release_lock(&cache->locks[hash]);
 
     return obj;
 }
@@ -173,8 +210,6 @@ static _always_inline PyObject *str_to_py(char *ptr, size_t size)
 {
     return PyUnicode_DecodeUTF8(ptr, size, NULL);
 }
-
-#define INTEGER_CACHE_SLOTS 1024
 
 static PyObject *int_to_py(uint64_t num, bool is_uint, PyLongObject *cache)
 {
@@ -718,7 +753,7 @@ static _always_inline PyObject *map_to_py(buffer_t *b, const size_t npairs)
 
             const size_t size = mask & 0b11111;
 
-            key = fixstr_to_py(b->offset, size, b->config.states->caches.strings);
+            key = fixstr_to_py(b->offset, size, &b->config.states->caches.strings);
             b->offset += size;
         }
         else
@@ -1448,7 +1483,7 @@ static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, const unsigned
         n &= 0x1F;
         OVERREAD_CHECK(n);
 
-        PyObject *obj = fixstr_to_py(b->offset, n, b->config.states->caches.strings);
+        PyObject *obj = fixstr_to_py(b->offset, n, &b->config.states->caches.strings);
         b->offset += n;
         return obj;
     }
@@ -1795,9 +1830,6 @@ static PyObject *decode_bytes(buffer_t *b)
 //////////////////////
 //  ENC/DEC BUFFER  //
 //////////////////////
-
-#define EXTRA_ALLOC_MIN 64
-#define ITEM_ALLOC_MIN 6
 
 // Use thread-local variables instead of atomic variables to keep
 // the averages more local, and to prevent counterintuitive scaling
@@ -2421,20 +2453,12 @@ static bool setup_mstates(PyObject *m)
     GET_ISTR(file_name)
     GET_ISTR(keep_open)
 
-    // Set up the string cache (calloc to initialize as NULLs)
-    s->caches.strings = (atomic_uintptr_t *)calloc(sizeof(PyASCIIObject *), STRING_CACHE_SLOTS);
+    // NULL-initialize the string cache
+    memset(s->caches.strings.strings, 0, sizeof(s->caches.strings.strings));
 
-    if (s->caches.strings == NULL)
-        return false;
-
-    // Set up the integer cache
-    s->caches.integers = (PyLongObject *)malloc(sizeof(PyLongObject) * INTEGER_CACHE_SLOTS);
-
-    if (s->caches.integers == NULL)
-    {
-        free(s->caches.strings);
-        return false;
-    }
+    // Initialize the string cache's locks to a clear state
+    for (size_t i = 0; i < STRING_CACHE_SLOTS; ++i)
+        atomic_flag_clear(&s->caches.strings.locks[i]);
     
     // Dummy object to copy into the cache
     PyObject *dummylong = PyLong_FromLong(1);
@@ -2464,13 +2488,9 @@ static void cleanup_mstates(PyObject *m)
 
     // Remove references from the string cache
     for (size_t i = 0; i < STRING_CACHE_SLOTS; ++i)
-        Py_XDECREF(s->caches.strings[i]); // No atomicity needed here
+        Py_XDECREF(s->caches.strings.strings[i]);
     
-    // The integer cache doesn't have to be freed, its objects aren't allocated
-
-    // Free the cache buffers
-    free(s->caches.strings);
-    free(s->caches.integers);
+    // The integer cache doesn't need decrefs, its objects aren't allocated
 }
 
 
