@@ -6,7 +6,6 @@
 #include "internals.h"
 
 
-// Pairs with direct comparisons to KEY
 typedef struct {
     void *key;   // Pointer to the data
     void *val;   // Value corresponding to the key

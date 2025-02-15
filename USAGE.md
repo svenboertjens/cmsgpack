@@ -2,6 +2,8 @@
 
 This file explains how to use the `cmsgpack` module in Python.
 
+!! THIS FILE IS NOT FINISHED AND MAY HAVE OUTDATED INFORMATION !!
+
 
 ## Introduction
 

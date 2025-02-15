@@ -34,6 +34,9 @@
 #define EXTRA_ALLOC_MIN 64
 #define ITEM_ALLOC_MIN 6
 
+// Name for the schema object capsule
+#define SCHEMA_CAPSULE_NAME "cmsgpack.Schema"
+
 
 ///////////////////////////
 //  TYPEDEFS & FORWARDS  //
@@ -68,9 +71,7 @@ typedef struct {
     struct {
         PyObject *obj;
         PyObject *ext_types;
-        PyObject *strict_keys;
         PyObject *file_name;
-        PyObject *keep_open;
     } interned;
 
     // Caches
@@ -78,6 +79,15 @@ typedef struct {
         PyLongObject integers[INTEGER_CACHE_SLOTS];
         strcache_t strings;
     } caches;
+
+    // Typing objects
+    struct {
+        PyObject *module; // Typing module
+        PyObject *origin; // Get origin function
+        PyObject *args;   // Get args function
+        PyObject *Any;    // The Any singleton
+        PyObject *Union;  // Union objects
+    } typing;
 } mstates_t;
 
 
@@ -92,7 +102,6 @@ typedef struct {
     mstates_t *states; // The module state
     filedata_t *fdata; // File data pointer, NULL if not used
     void *ext;         // Extension types, NULL if not used
-    bool strict_keys;  // If we have to ensure strict map keys
 } bufconfig_t;
 
 // Struct holding buffer data for encoding
@@ -104,15 +113,146 @@ typedef struct {
     bufconfig_t config; // Configurations
 } buffer_t;
 
-
-// Object for persistent configs (encoder/decoder)
+// For encoder/decoder objects
 typedef struct {
     PyObject_HEAD
     bufconfig_t config;
-} bufconfig_obj_t;
+} hookobj_t;
 
 static PyTypeObject EncoderObj;
 static PyTypeObject DecoderObj;
+
+
+typedef enum {
+    SC_DIRECT,
+    SC_UNION,
+    SC_LIST,
+    SC_TUPLE,
+    SC_DICT,
+    SC_ANY,
+    SC_SCHEMA,
+    SC_SELF,
+} sc_flag_t;
+
+typedef bool (*encode_func)(buffer_t *b, PyObject *obj);
+typedef PyObject *(*decode_func)(buffer_t *b);
+
+typedef struct {
+    encode_func enc;
+    decode_func dec;
+} encdec_funcs_t;
+
+typedef struct {
+    uintptr_t flag;
+    PyTypeObject *tp;
+    encdec_funcs_t funcs;
+} sc_direct_t;
+
+typedef struct {
+    uintptr_t flag;
+} sc_any_t;
+
+typedef struct {
+    uintptr_t flag;
+    size_t nfields;
+    size_t offset_after;
+} sc_union_t;
+
+typedef struct {
+    uintptr_t flag;
+    size_t nfields;
+} sc_tuple_t;
+
+typedef struct {
+    uintptr_t flag;
+} sc_list_t;
+
+typedef struct {
+    uintptr_t flag;
+} sc_dict_t;
+
+typedef struct {
+    uintptr_t flag;
+    PyTypeObject *tp;
+} sc_schema_t;
+
+typedef struct {
+    uintptr_t flag;
+} sc_self_t;
+
+/* # Schema structure
+ * 
+ * The schema is structured without any pointers, and
+ * works directly based on offsetting and ordering. After
+ * offsetting past the last field, you're immediately located
+ * at the next field.
+ * 
+ * Below is the structure per flag, where each field takes
+ * up `sizeof(uintptr_t)` space, except for HEAD fields which
+ * always occupy 8 bytes.
+ * 
+ * 
+ * # Structure per flag
+ * 
+ *  Direct:
+ * - SC_DIRECT flag
+ * - TypeObject pointer
+ * 
+ *  Any:
+ * - SC_ANY flag
+ * 
+ *  Union:
+ * - SC_UNION flag
+ * - NFIELDS count
+ * - Offset of after the fields
+ * - Field (of item types, times NFIELDS)
+ * 
+ *  Tuple:
+ * - SC_TUPLE flag
+ * - NFIELDS count
+ * - Field (of item types, times NFIELDS)
+ * 
+ *  List/Dict:
+ * - SC_LIST/SC_DICT flag
+ * - Field (of item/val type)
+ * 
+ *  Schema: (nested schema)
+ * - SC_SCHEMA flag
+ * - TypeObject pointer
+ * - Schema pointer
+ * 
+ *  Self:
+ * - SC_SELF flag
+ * 
+ */
+
+typedef struct {
+    size_t len;
+    char *str;
+} schema_name_t;
+
+typedef struct {
+    size_t nattrs; // Number of "static" attributes (the annotated variables)
+
+    schema_name_t *names; // Array of pointers to the static attributes' names
+
+    char *schema; // Serialization schema
+} struct_ptrs_t;
+
+typedef struct {
+    PyHeapTypeObject base; // Base for heap type objects
+    struct_ptrs_t ptrs;    // Pointers to buffers located after this struct
+    char *buffer;          // Buffer that holds the data from all pointer fields
+} schema_meta_t;
+
+typedef struct {
+    PyObject_HEAD
+    struct_ptrs_t ptrs; // Pointers to data fields
+    PyObject *attrs[]; // Array with the static attribute values
+} schema_obj_t;
+
+static PyTypeObject SchemaMetaObj;
+static PyTypeObject SchemaObj;
 
 
 static _always_inline mstates_t *get_mstates(PyObject *m);
@@ -122,6 +262,8 @@ static PyObject *decode_bytes(buffer_t *b);
 
 static bool encbuffer_expand(buffer_t *b, size_t needed);
 static bool decoder_streaming_refresh(buffer_t *b, const size_t requested);
+
+static bool encode_schema(buffer_t *b, PyObject *obj);
 
 
 static struct PyModuleDef cmsgpack;
@@ -134,8 +276,10 @@ static struct PyModuleDef cmsgpack;
 // Error for when LIMIT_LARGE is exceeded
 #define error_size_limit(name, size) (PyErr_Format(PyExc_ValueError, #name " values can only hold up to 4294967295 bytes (2^32-1, 4 bytes), got a size of %zu", size))
 
+#define error_unexpected_type(expected, received) (PyErr_Format(PyExc_TypeError, "Expected an object of type '%s', but got an object of type '%s'", expected, received))
+
 // Error for when we get an unexpected type at an argument
-#define error_unexpected_type(argname, correct_tpname, received_tpname) (PyErr_Format(PyExc_TypeError, "Expected argument '%s' to be of type '%s', but got an object of type '%s'", argname, correct_tpname, received_tpname))
+#define error_unexpected_argtype(argname, correct_tpname, received_tpname) (PyErr_Format(PyExc_TypeError, "Expected argument '%s' to be of type '%s', but got an object of type '%s'", argname, correct_tpname, received_tpname))
 
 // Error for when a file couldn't be opened
 #define error_cannot_open_file(filename, err) (PyErr_Format(PyExc_OSError, "Unable to open file '%s', received errno %i: '%s'", filename, err, strerror(err)))
@@ -305,7 +449,7 @@ static _always_inline PyObject *parse_positional(PyObject **args, size_t nth, Py
 
     if (type && _UNLIKELY(!Py_IS_TYPE(obj, type)))
     {
-        error_unexpected_type(argname, type->tp_name, Py_TYPE(obj)->tp_name);
+        error_unexpected_argtype(argname, type->tp_name, Py_TYPE(obj)->tp_name);
         return NULL;
     }
 
@@ -325,7 +469,7 @@ static _always_inline bool _parse_kwarg(PyObject *kwname, PyObject *val, Py_ssiz
         {
             if (dest.tp != NULL && _UNLIKELY(!Py_IS_TYPE(val, dest.tp)))
             {
-                error_unexpected_type((const char *)((PyASCIIObject *)dest.interned + 1), dest.tp->tp_name, Py_TYPE(val)->tp_name);
+                error_unexpected_argtype((const char *)((PyASCIIObject *)dest.interned + 1), dest.tp->tp_name, Py_TYPE(val)->tp_name);
                 return false;
             }
 
@@ -342,7 +486,7 @@ static _always_inline bool _parse_kwarg(PyObject *kwname, PyObject *val, Py_ssiz
         {
             if (dest.tp != NULL && _UNLIKELY(!Py_IS_TYPE(*dest.dest, dest.tp)))
             {
-                error_unexpected_type((const char *)((PyASCIIObject *)dest.interned + 1), dest.tp->tp_name, Py_TYPE(val)->tp_name);
+                error_unexpected_argtype((const char *)((PyASCIIObject *)dest.interned + 1), dest.tp->tp_name, Py_TYPE(val)->tp_name);
                 return false;
             }
 
@@ -368,7 +512,7 @@ static _always_inline bool parse_keywords(Py_ssize_t npos, PyObject **args, Py_s
 
     if (_UNLIKELY(nargs > nkey))
     {
-        PyErr_Format(PyExc_TypeError, "Expected at max %zi optional positional arguments, but received %zi", nkey, nargs);
+        PyErr_Format(PyExc_TypeError, "Expected at max %zi positional arguments, but received %zi", nkey, nargs);
         return false;
     }
 
@@ -381,7 +525,7 @@ static _always_inline bool parse_keywords(Py_ssize_t npos, PyObject **args, Py_s
         if (keyarg.tp && _UNLIKELY(!Py_IS_TYPE(obj, keyarg.tp)))
         {
             // Use the interned string's value for the argument name
-            error_unexpected_type(PyUnicode_AsUTF8(obj), keyarg.tp->tp_name, Py_TYPE(obj)->tp_name);
+            error_unexpected_argtype(PyUnicode_AsUTF8(obj), keyarg.tp->tp_name, Py_TYPE(obj)->tp_name);
             return false;
         }
 
@@ -421,7 +565,7 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *pairsdict)
 {
     if (_UNLIKELY(!Py_IS_TYPE(pairsdict, &PyDict_Type)))
     {
-        error_unexpected_type("pairs", PyDict_Type.tp_name, Py_TYPE(pairsdict)->tp_name);
+        error_unexpected_argtype("pairs", PyDict_Type.tp_name, Py_TYPE(pairsdict)->tp_name);
         return NULL;
     }
 
@@ -765,13 +909,6 @@ static _always_inline PyObject *map_to_py(buffer_t *b, const size_t npairs)
                 Py_DECREF(dict);
                 return NULL;
             }
-
-            if (b->config.strict_keys && _UNLIKELY(!PyUnicode_Check(key)))
-            {
-                Py_DECREF(dict);
-                PyErr_Format(PyExc_KeyError, "Only string types are supported as map keys in strict mode, received a key of type '%s'", Py_TYPE(key)->tp_name);
-                return NULL;
-            }
         }
 
         PyObject *val = decode_bytes(b);
@@ -884,39 +1021,16 @@ static _always_inline void py_str_data(PyObject *obj, char **base, size_t *size)
     }
 }
 
-static _always_inline bool write_string(buffer_t *b, PyObject *obj)
+// Write string without the data fetching part
+static _always_inline bool _write_string(buffer_t *b, char *base, size_t size)
 {
-    char *base;
-    size_t size;
-    py_str_data(obj, &base, &size);
-
-    if (_UNLIKELY(base == NULL))
-        return false;
+    ENSURE_SPACE(size + 5);
 
     if (size <= LIMIT_STR_FIXED)
     {
-        // Python allocates more than 32 bytes for unicode objects, so copy in chunks for efficiency
-
-        // Ensure space of 33, which is 1 for the mask and 32 for the 2 chunks case
-        ENSURE_SPACE(33);
-
         write_mask(b, DT_STR_FIXED, size, 0);
-
-        // Always copy the first chunk
-        memcpy(b->offset, base, 16);
-
-        // Check if we also need to copy a second chunk
-        if (size > 16)
-            memcpy(b->offset + 16, base + 16, 16);
-
-        b->offset += size;
-
-        return true;
     }
-
-    ENSURE_SPACE(size + 5);
-
-    if (size <= LIMIT_SMALL)
+    else if (size <= LIMIT_SMALL)
     {
         write_mask(b, DT_STR_SMALL, size, 1);
     }
@@ -938,6 +1052,42 @@ static _always_inline bool write_string(buffer_t *b, PyObject *obj)
     b->offset += size;
 
     return true;
+}
+
+static _always_inline bool write_string(buffer_t *b, PyObject *obj)
+{
+    // Fast path for common cases
+    if (PyUnicode_IS_COMPACT_ASCII(obj) && ((PyASCIIObject *)obj)->length <= (Py_ssize_t)LIMIT_STR_FIXED)
+    {
+        char *base = (char *)(((PyASCIIObject *)obj) + 1);
+        size_t size = ((PyASCIIObject *)obj)->length;
+
+        ENSURE_SPACE(33);
+
+        write_mask(b, DT_STR_FIXED, size, 0);
+
+        /* Python allocates more than 32 bytes for unicode objects, so copy in chunks for efficiency */
+
+        // Always copy the first chunk
+        memcpy(b->offset, base, 16);
+
+        // Check if we also need to copy a second chunk
+        if (size > 16)
+            memcpy(b->offset + 16, base + 16, 16);
+
+        b->offset += size;
+
+        return true;
+    }
+
+    char *base;
+    size_t size;
+    py_str_data(obj, &base, &size);
+
+    if (_UNLIKELY(base == NULL))
+        return false;
+
+    return _write_string(b, base, size);
 }
 
 // Separate for writing binary
@@ -1215,15 +1365,14 @@ static _always_inline bool write_bool(buffer_t *b, PyObject *obj)
     return true;
 }
 
-static _always_inline bool write_nil(buffer_t *b)
+static _always_inline bool write_nil(buffer_t *b, PyObject *obj)
 {
     ENSURE_SPACE(1);
     INCBYTE = DT_NIL;
     return true;
 }
 
-// Used for writing array types
-static bool write_array(buffer_t *b, PyObject **items, size_t nitems)
+static _always_inline bool write_array_header(buffer_t *b, size_t nitems)
 {
     ENSURE_SPACE(5);
 
@@ -1244,6 +1393,14 @@ static bool write_array(buffer_t *b, PyObject **items, size_t nitems)
         error_size_limit(Array, nitems);
         return false;
     }
+
+    return true;
+}
+
+// Used for writing array types
+static bool write_array(buffer_t *b, PyObject **items, size_t nitems)
+{
+    NULLCHECK(write_array_header(b, nitems));
 
     for (size_t i = 0; i < nitems; ++i)
     {
@@ -1270,10 +1427,8 @@ static _always_inline bool write_tuple(buffer_t *b, PyObject *obj)
     return write_array(b, items, nitems);
 }
 
-static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
+static _always_inline bool write_map_header(buffer_t *b, size_t npairs)
 {
-    const size_t npairs = PyDict_GET_SIZE(obj);
-
     ENSURE_SPACE(5);
     
     if (npairs <= LIMIT_MAP_FIXED)
@@ -1294,24 +1449,32 @@ static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
         return false;
     }
 
+    return true;
+}
+
+static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
+{
+    const size_t npairs = PyDict_GET_SIZE(obj);
+
+    NULLCHECK(write_map_header(b, npairs));
+
     Py_ssize_t pos = 0;
     for (size_t i = 0; i < npairs; ++i)
     {
         PyObject *key;
         PyObject *val;
-
         PyDict_Next(obj, &pos, &key, &val);
 
-        if (b->config.strict_keys && _UNLIKELY(!PyUnicode_Check(key)))
+        if ((PyUnicode_CheckExact(key)))
         {
-            PyErr_Format(PyExc_KeyError, "Only string types are supported as map keys in strict mode, received a key of type '%s'", Py_TYPE(key)->tp_name);
-            return false;
+            NULLCHECK(write_string(b, key));
+        }
+        else
+        {
+            NULLCHECK(encode_object(b, key));
         }
 
-        if (_UNLIKELY(
-            !encode_object(b, key) ||
-            !encode_object(b, val)
-        )) return false;
+        NULLCHECK(encode_object(b, val));
     }
 
     return true;
@@ -1381,6 +1544,243 @@ static _always_inline bool write_extension(buffer_t *b, PyObject *obj)
 }
 
 
+///////////////////////
+//  SCHEMA ENCODING  //
+///////////////////////
+
+// Round a value up to be aligned
+#define ROUND_TO_ALIGNMENT(n) \
+    ((n) + ((sizeof(uintptr_t) - 1)) & ~(sizeof(uintptr_t) - 1))
+
+static _always_inline bool encode_schema_field(buffer_t *b, schema_obj_t *obj, PyObject *val, size_t *offset)
+{
+    // Get the field flag
+    char *field = obj->ptrs.schema + *offset;
+    sc_flag_t flag = *(sc_flag_t *)field;
+
+    switch (flag)
+    {
+    case SC_DIRECT:
+    {
+        sc_direct_t *sc = (sc_direct_t *)field;
+
+        if (_UNLIKELY(Py_TYPE(val) != sc->tp))
+        {
+            PyErr_Format(PyExc_TypeError, "Got an object with incorrect schema type: expected '%s', got '%s'", sc->tp->tp_name, Py_TYPE(val)->tp_name);
+            return false;
+        }
+
+        *offset += sizeof(sc_direct_t);
+
+        return sc->funcs.enc(b, val);
+    }
+    case SC_ANY:
+    {
+        *offset += sizeof(sc_any_t);
+        return encode_object(b, val);
+    }
+    case SC_UNION:
+    {
+        sc_union_t *sc = (sc_union_t *)field;
+
+        bool success = false;
+
+        // Iterate over the fields until we get a true
+        for (size_t i = 0; i < sc->nfields; ++i)
+        {
+            if (encode_schema_field(b, obj, val, offset))
+            {
+                success = true;
+                break;
+            }
+        }
+
+        // Check if we didn't have success
+        if (_UNLIKELY(!success))
+        {
+            PyErr_SetString(PyExc_TypeError, "Received an unexpected type that could not be matched against any of the union types");
+            return false;
+        }
+
+        // Jump to the offset after all options
+        *offset = sc->offset_after;
+
+        // Clear the error from failed attempts
+        PyErr_Clear();
+
+        return true;
+    }
+    case SC_TUPLE:
+    {
+        if (_UNLIKELY(!PyTuple_Check(val)))
+        {
+            error_unexpected_type("tuple", Py_TYPE(val)->tp_name);
+            return false;
+        }
+
+        sc_tuple_t *sc = (sc_tuple_t *)field;
+
+        if (_UNLIKELY(sc->nfields != (size_t)PyTuple_GET_SIZE(val)))
+        {
+            PyErr_Format(PyExc_TypeError, "Expected a tuple with %zu items, but got one with %zu items", sc->nfields, PyTuple_GET_SIZE(val));
+            return false;
+        }
+        
+        NULLCHECK(write_array_header(b, sc->nfields));
+
+        *offset += sizeof(sc_tuple_t);
+
+        for (size_t i = 0; i < sc->nfields; ++i)
+        {
+            if (_UNLIKELY(!encode_schema_field(b, obj, PyTuple_GET_ITEM(val, i), offset)))
+                return false;
+        }
+
+        return true;
+    }
+    case SC_LIST:
+    {
+        if (_UNLIKELY(!PyList_Check(val)))
+        {
+            error_unexpected_type("list", Py_TYPE(val)->tp_name);
+            return false;
+        }
+
+        // Write the list header
+        size_t nitems = PyList_GET_SIZE(val);
+        NULLCHECK(write_array_header(b, nitems));
+
+        *offset += sizeof(sc_list_t);
+
+        // Remember the start offset to reset it for each item
+        size_t start_offset = *offset;
+
+        for (size_t i = 0; i < nitems; ++i)
+        {
+            // Reset the offset to the type field
+            *offset = start_offset;
+
+            if (_UNLIKELY(!encode_schema_field(b, obj, PyList_GET_ITEM(val, i), offset)))
+                return false;
+        }
+
+        return true;
+    }
+    case SC_DICT:
+    {
+        if (_UNLIKELY(!PyDict_Check(val)))
+        {
+            error_unexpected_type("dict", Py_TYPE(val)->tp_name);
+            return false;
+        }
+
+        size_t npairs = PyDict_GET_SIZE(val);
+
+        // Write the dict header
+        NULLCHECK(write_map_header(b, npairs));
+
+        *offset += sizeof(sc_dict_t);
+
+        // Remember the start offset to reset it for each val
+        size_t start_offset = *offset;
+
+        Py_ssize_t pos = 0;
+        for (size_t i = 0; i < npairs; ++i)
+        {
+            PyObject *key;
+            PyObject *_val;
+            PyDict_Next(val, &pos, &key, &_val);
+
+            // Reset the offset to the type field
+            *offset = start_offset;
+
+            // The key must be a string
+            if (_UNLIKELY(!PyUnicode_CheckExact(key)))
+            {
+                error_unexpected_type("str", Py_TYPE(_val)->tp_name);
+                return false;
+            }
+
+            // Encode the key as a string
+            write_string(b, key);
+
+            // Encode the value
+            if (_UNLIKELY(!encode_schema_field(b, obj, _val, offset)))
+                return false;
+        }
+
+        return true;
+    }
+    case SC_SCHEMA:
+    {
+        sc_schema_t *sc = (sc_schema_t *)field;
+
+        if (_UNLIKELY(Py_TYPE(val) != sc->tp))
+        {
+            error_unexpected_type(sc->tp->tp_name, Py_TYPE(val)->tp_name);
+            return false;
+        }
+
+        *offset += sizeof(sc_schema_t);
+
+        return encode_schema(b, val);
+    }
+    case SC_SELF:
+    {
+        if (_UNLIKELY(Py_TYPE(val) != (PyTypeObject *)obj))
+        {
+            error_unexpected_type("haven't figured this out yet, whoops", Py_TYPE(val)->tp_name);
+            return false;
+        }
+
+        *offset += sizeof(sc_self_t);
+
+        return encode_schema(b, val);;
+    }
+    default:
+    {
+        PyErr_SetString(PyExc_ValueError, "Matched with an invalid schema flag, this should not be reached");
+        return false;
+    }
+    }
+}
+
+static bool encode_schema(buffer_t *b, PyObject *_obj)
+{
+    // Get the schema object
+    schema_obj_t *obj = (schema_obj_t *)_obj;
+
+    // Initialize offset with zero
+    size_t offset = 0;
+
+    // Write the header
+    NULLCHECK(write_map_header(b, obj->ptrs.nattrs));
+
+    for (size_t i = 0; i < obj->ptrs.nattrs; ++i)
+    {
+        // Get the value name
+        schema_name_t name = obj->ptrs.names[i];
+
+        // Write the name's string data
+        _write_string(b, name.str, name.len);
+
+        // Get the value from the schema object
+        PyObject *val = obj->attrs[i];
+
+        if (_UNLIKELY(val == NULL))
+        {
+            PyErr_Format(PyExc_ValueError, "No value is set on attribute '%s'", name.str);
+            return false;
+        }
+
+        if (_UNLIKELY(!encode_schema_field(b, obj, val, &offset)))
+            return false;
+    }
+
+    return true;
+}
+
+
 ////////////////////
 //    ENCODING    //
 ////////////////////
@@ -1402,6 +1802,14 @@ static bool encode_object(buffer_t *b, PyObject *obj)
     {
         return write_double(b, obj);
     }
+    else if (PyDict_Check(obj)) // Same as with lists and tuples
+    {
+        return write_dict(b, obj);
+    }
+    else if (Py_TYPE(obj) == &SchemaObj) // Checks if it's a schema object
+    {
+        return encode_schema(b, obj);
+    }
     else if (tp == &PyBool_Type)
     {
         return write_bool(b, obj);
@@ -1410,17 +1818,13 @@ static bool encode_object(buffer_t *b, PyObject *obj)
     {
         return write_list(b, obj);
     }
-    if (PyTuple_Check(obj)) // Same as with lists, no exact check to support subclasses
+    else if (PyTuple_Check(obj)) // Same as with lists, no exact check to support subclasses
     {
         return write_tuple(b, obj);
     }
-    else if (PyDict_Check(obj)) // Same as with lists and tuples
-    {
-        return write_dict(b, obj);
-    }
     else if (tp == Py_TYPE(Py_None)) // No explicit PyNone_Type available
     {
-        return write_nil(b);
+        return write_nil(b, obj);
     }
     else if (tp == &PyBytes_Type)
     {
@@ -1837,7 +2241,7 @@ _Thread_local size_t extra_avg = (EXTRA_ALLOC_MIN * 2);
 _Thread_local size_t item_avg = (ITEM_ALLOC_MIN * 2);
 
 // Prepare the encoding buffer struct
-static _always_inline bool encbuffer_prepare(buffer_t *b, bufconfig_t config, PyObject *obj, size_t *nitems)
+static _always_inline bool encbuffer_prepare(buffer_t *b, PyObject *obj, size_t *nitems)
 {
     // Initialize the new size with the extra average and set NITEMS to 0 in advance
     size_t allocsize = extra_avg;
@@ -1872,9 +2276,6 @@ static _always_inline bool encbuffer_prepare(buffer_t *b, bufconfig_t config, Py
     // Set up the offset and max offset based on the buffer
     b->offset = PyBytes_AS_STRING(b->base);
     b->maxoffset = PyBytes_AS_STRING(b->base) + allocsize;
-
-    // Set the buffer configurations
-    b->config = config;
 
     return true;
 }
@@ -1927,8 +2328,11 @@ static PyObject *encbuffer_start(bufconfig_t config, PyObject *obj)
     buffer_t b;
     size_t nitems;
 
+    // Assign the config and schema fields
+    b.config = config;
+
     // Prepare the encode buffer
-    NULLCHECK(encbuffer_prepare(&b, config, obj, &nitems));
+    NULLCHECK(encbuffer_prepare(&b, obj, &nitems));
 
     // Encode the object
     NULLCHECK(encode_object(&b, obj));
@@ -2019,19 +2423,13 @@ static PyObject *encode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     config.states = get_mstates(self);
     config.fdata = NULL;
     config.ext = NULL;
-    config.strict_keys = false;
-
-    PyObject *strict_keys = NULL;
 
     keyarg_t keyargs[] = {
         KEYARG(&config.ext, &ExtTypesEncodeObj, config.states->interned.ext_types),
-        KEYARG(&strict_keys, &PyBool_Type, config.states->interned.strict_keys)
     };
 
     if (_UNLIKELY(!parse_keywords(npos, args, nargs, kwargs, keyargs, NKEYARGS(keyargs))))
         return NULL;
-
-    config.strict_keys = strict_keys == Py_True;
 
     return encbuffer_start(config, obj);
 }
@@ -2050,19 +2448,13 @@ static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     config.states = get_mstates(self);
     config.fdata = NULL;
     config.ext = NULL;
-    config.strict_keys = false;
-
-    PyObject *strict_keys;
 
     keyarg_t keyargs[] = {
         KEYARG(&config.ext, &ExtTypesDecodeObj, config.states->interned.ext_types),
-        KEYARG(&strict_keys, &PyBool_Type, config.states->interned.strict_keys),
     };
 
     if (_UNLIKELY(!parse_keywords(npos, args, nargs, kwargs, keyargs, NKEYARGS(keyargs))))
         return NULL;
-    
-    config.strict_keys = strict_keys == Py_True;
 
     return decbuffer_start(config, encoded);
 }
@@ -2076,21 +2468,19 @@ static PyObject *Encoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
 {
     PyObject *filename = NULL;
     PyObject *ext = NULL;
-    PyObject *strict_keys = NULL;
 
     mstates_t *states = get_mstates(self);
 
     keyarg_t keyargs[] = {
         KEYARG(&filename, &PyUnicode_Type, states->interned.file_name),
         KEYARG(&ext, &ExtTypesEncodeObj, states->interned.ext_types),
-        KEYARG(&strict_keys, &PyBool_Type, states->interned.strict_keys),
     };
 
     NULLCHECK(parse_keywords(0, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
 
 
     // Create the Encoder
-    bufconfig_obj_t *enc = PyObject_New(bufconfig_obj_t, &EncoderObj);
+    hookobj_t *enc = PyObject_New(hookobj_t, &EncoderObj);
     if (enc == NULL)
         return PyErr_NoMemory();
     
@@ -2098,7 +2488,6 @@ static PyObject *Encoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
     enc->config.ext = ext;
     enc->config.fdata = NULL;
     enc->config.states = get_mstates(self);
-    enc->config.strict_keys = strict_keys == Py_True;
 
     // Check if we got a filename
     if (filename != NULL)
@@ -2152,21 +2541,19 @@ static PyObject *Decoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
 {
     PyObject *filename = NULL;
     PyObject *ext = NULL;
-    PyObject *strict_keys = NULL;
 
     mstates_t *states = get_mstates(self);
 
     keyarg_t keyargs[] = {
         KEYARG(&filename, &PyUnicode_Type, states->interned.file_name),
         KEYARG(&ext, &ExtTypesDecodeObj, states->interned.ext_types),
-        KEYARG(&strict_keys, &PyBool_Type, states->interned.strict_keys),
     };
 
     NULLCHECK(parse_keywords(0, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
 
 
     // Create the Decoder
-    bufconfig_obj_t *dec = PyObject_New(bufconfig_obj_t, &DecoderObj);
+    hookobj_t *dec = PyObject_New(hookobj_t, &DecoderObj);
     if (dec == NULL)
         return PyErr_NoMemory();
     
@@ -2174,7 +2561,6 @@ static PyObject *Decoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
     dec->config.ext = ext;
     dec->config.fdata = NULL;
     dec->config.states = get_mstates(self);
-    dec->config.strict_keys = strict_keys == Py_True;
 
     // Check if we received a filename
     if (filename != NULL)
@@ -2225,7 +2611,7 @@ static PyObject *Decoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
     return (PyObject *)dec;
 }
 
-static PyObject *encoder_encode(bufconfig_obj_t *enc, PyObject *obj)
+static PyObject *encoder_encode(hookobj_t *enc, PyObject *obj)
 {
     // Check if the file is closed when streaming
     if (_UNLIKELY(enc->config.fdata != NULL && enc->config.fdata->file == NULL))
@@ -2297,7 +2683,7 @@ static _always_inline bool nowrite_check(buffer_t *b, const size_t read)
 
 #define DECBUFFER_DEFAULTSIZE 4096
 
-static PyObject *decoder_decode(bufconfig_obj_t *dec, PyObject **args, Py_ssize_t nargs)
+static PyObject *decoder_decode(hookobj_t *dec, PyObject **args, Py_ssize_t nargs)
 {
     // Separate case for no streaming
     if (dec->config.fdata == NULL)
@@ -2393,7 +2779,7 @@ static bool decoder_streaming_refresh(buffer_t *b, const size_t requested)
     return true;
 }
 
-static void encoder_dealloc(bufconfig_obj_t *enc)
+static void encoder_dealloc(hookobj_t *enc)
 {
     Py_XDECREF(enc->config.ext);
 
@@ -2410,7 +2796,7 @@ static void encoder_dealloc(bufconfig_obj_t *enc)
     PyObject_Del(enc);
 }
 
-static void decoder_dealloc(bufconfig_obj_t *dec)
+static void decoder_dealloc(hookobj_t *dec)
 {
     Py_XDECREF(dec->config.ext);
 
@@ -2425,6 +2811,510 @@ static void decoder_dealloc(bufconfig_obj_t *dec)
     }
 
     PyObject_Del(dec);
+}
+
+
+//////////////////////
+//  SCHEMA OBJECTS  //
+//////////////////////
+
+static PyObject *schema_getattro(schema_obj_t *obj, PyObject *name)
+{
+    // Get the string data of the attribute
+    char *str;
+    size_t strlen;
+    py_str_data(name, &str, &strlen);
+
+    NULLCHECK(str);
+
+    for (size_t i = 0; i < obj->ptrs.nattrs; ++i)
+    {
+        schema_name_t name = obj->ptrs.names[i];
+
+        if (strlen != name.len)
+            continue;
+        
+        if (memcmp(str, name.str, strlen) != 0)
+            continue;
+        
+        PyObject *match = obj->attrs[i];
+
+        if (match == NULL)
+        {
+            PyErr_Format(PyExc_ValueError, "No value set on attribute '%s", str);
+            return NULL;
+        }
+
+        Py_INCREF(match);
+        return match;
+    }
+
+    PyErr_Format(PyExc_KeyError, "Could not find attribute '%s'", str);
+    return NULL;
+}
+
+static int schema_setattro(schema_obj_t *obj, PyObject *name, PyObject *val)
+{
+    // Get the string data of the attribute
+    char *str;
+    size_t strlen;
+    py_str_data(name, &str, &strlen);
+
+    if (_UNLIKELY(str == NULL))
+        return -1;
+
+    for (size_t i = 0; i < obj->ptrs.nattrs; ++i)
+    {
+        schema_name_t name = obj->ptrs.names[i];
+
+        if (strlen != name.len)
+            continue;
+        
+        if (memcmp(str, name.str, strlen) != 0)
+            continue;
+        
+        Py_XDECREF(obj->attrs[i]);
+        Py_XINCREF(val);
+
+        obj->attrs[i] = val;
+
+        return 0;
+    }
+
+    PyErr_Format(PyExc_KeyError, "Could not find attribute '%s'", str);
+    return -1;
+}
+
+static void schema_encdec_funcs_setup(encdec_funcs_t *funcs, PyTypeObject *tp)
+{
+    if (tp == &PyUnicode_Type)
+    {
+        funcs->enc = write_string;
+    }
+    else if (tp == &PyLong_Type)
+    {
+        funcs->enc = write_integer;
+    }
+    else if (tp == &PyFloat_Type)
+    {
+        funcs->enc = write_double;
+    }
+    else if (tp == &PyBool_Type)
+    {
+        funcs->enc = write_bool;
+    }
+    else if (PyType_IsSubtype(tp, &PyList_Type)) // No exact check to support subclasses
+    {
+        funcs->enc = write_list;
+    }
+    else if (PyType_IsSubtype(tp, &PyTuple_Type)) // Same as with lists, no exact check to support subclasses
+    {
+        funcs->enc = write_tuple;
+    }
+    else if (PyType_IsSubtype(tp, &PyDict_Type)) // Same as with lists and tuples
+    {
+        funcs->enc = write_dict;;
+    }
+    else if (tp == Py_TYPE(Py_None)) // No explicit PyNone_Type available
+    {
+        funcs->enc = write_nil;
+    }
+    else if (tp == &PyBytes_Type)
+    {
+        funcs->enc = write_bytes;
+    }
+    else if (tp == &PyByteArray_Type)
+    {
+        funcs->enc = write_bytearray;
+    }
+    else if (tp == &PyMemoryView_Type)
+    {
+        funcs->enc = write_memoryview;
+    }
+    else
+    {
+        funcs->enc = write_extension;
+    }
+}
+
+static bool schema_field_setup(mstates_t *states, char **buf, size_t *offset, PyObject *tp, PyObject *class_tp)
+{
+    // Allocate for 4x the word size to have enough for all cases
+    char *new = (char *)PyObject_Realloc(*buf, *offset + (sizeof(void *) * 4));
+
+    if (_UNLIKELY(new == NULL))
+    {
+        PyErr_NoMemory();
+        return false;
+    }
+
+    *buf = new;
+
+    // Check if the type is Any, Union, or the class itself
+    if (tp == states->typing.Any)
+    {
+        sc_any_t *sc = (sc_any_t *)(*buf + *offset);
+        
+        sc->flag = SC_ANY;
+
+        *offset += sizeof(sc_any_t);
+
+        return true;
+    }
+    else if (tp == states->typing.Union)
+    {
+        sc_union_t *sc = (sc_union_t *)(*buf + *offset);
+
+        // Get the args of the union
+        PyObject *args = PyObject_CallOneArg(states->typing.args, tp);
+        NULLCHECK(args);
+
+        size_t nargs = PyTuple_GET_SIZE(args);
+
+        sc->flag = SC_UNION;
+        sc->nfields = nargs;
+
+        // Remember this offset for the offset field and jump over it for now
+        size_t off_field_offset = *offset;
+        *offset += sizeof(uintptr_t);
+
+        // Set up the union items
+        for (size_t i = 0; i < nargs; ++i)
+        {
+            PyObject *item_tp = PyTuple_GET_ITEM(args, i);
+
+            if (_UNLIKELY(!schema_field_setup(states, buf, offset, item_tp, class_tp)))
+            {
+                Py_DECREF(args);
+                return false;
+            }
+        }
+
+        // Store the offset field
+        *(uintptr_t *)(*buf + off_field_offset) = (uintptr_t)*offset;
+
+        return true;
+    }
+    else if (tp == class_tp)
+    {
+        sc_self_t *sc = (sc_self_t *)(*buf + *offset);
+
+        sc->flag = SC_SELF;
+
+        *offset += sizeof(sc_self_t);
+
+        return true;
+    }
+
+    // Try to get the origin of the type
+    PyTypeObject *origin = (PyTypeObject *)PyObject_CallOneArg(states->typing.origin, tp);
+    NULLCHECK(origin);
+
+    // If we get None, it's not a typing object
+    if ((PyObject *)origin == Py_None)
+    {
+        // Check if the type is a subclass of SchemaObj
+        if (Py_TYPE(tp) == &SchemaObj)
+        {
+            sc_schema_t *sc = (sc_schema_t *)(*buf + *offset);
+
+            sc->flag = SC_SCHEMA;
+            sc->tp = (PyTypeObject *)tp;
+
+            *offset += sizeof(sc_schema_t);
+
+            return true;
+        }
+        else
+        {
+            sc_direct_t *sc = (sc_direct_t *)(*buf + *offset);
+
+            sc->flag = SC_DIRECT;
+            sc->tp = (PyTypeObject *)tp;
+
+            schema_encdec_funcs_setup(&sc->funcs, (PyTypeObject *)tp);
+
+            *offset += sizeof(sc_direct_t);
+        }
+        
+        return true;
+    }
+
+    // Get the args of the typing object
+    PyObject *args = PyObject_CallOneArg(states->typing.args, tp);
+    if (_UNLIKELY(args == NULL))
+    {
+        Py_DECREF(origin);
+        return false;
+    }
+
+    // Check the origin type
+    if (origin == &PyList_Type)
+    {
+        sc_list_t *sc = (sc_list_t *)(*buf + *offset);
+
+        sc->flag = SC_LIST;
+
+        *offset += sizeof(sc_list_t);
+
+        // We support just 1 type specifier
+        size_t nargs = PyTuple_GET_SIZE(args);
+        if (_UNLIKELY(nargs != 1))
+        {
+            PyErr_Format(PyExc_TypeError, "List type annotations support exactly one subtype, got %zu", nargs);
+            return false;
+        }
+
+        if (_UNLIKELY(!schema_field_setup(states, buf, offset, PyTuple_GET_ITEM(args, 0), class_tp)))
+        {
+            Py_DECREF(origin);
+            Py_DECREF(args);
+
+            return false;
+        }
+    }
+    else if (origin == &PyTuple_Type)
+    {
+        sc_tuple_t *sc = (sc_tuple_t *)(*buf + *offset);
+        size_t nargs = PyTuple_GET_SIZE(args);
+
+        sc->flag = SC_TUPLE;
+        sc->nfields = nargs;
+
+        *offset += sizeof(sc_tuple_t);
+
+        for (size_t i = 0; i < nargs; ++i)
+        {
+            if (_UNLIKELY(!schema_field_setup(states, buf, offset, PyTuple_GET_ITEM(args, i), class_tp)))
+            {
+                Py_DECREF(origin);
+                Py_DECREF(args);
+
+                return false;
+            }
+        }
+    }
+    else if (origin == &PyDict_Type)
+    {
+        sc_dict_t *sc = (sc_dict_t *)(*buf + *offset);
+
+        sc->flag = SC_DICT;
+
+        *offset += sizeof(sc_dict_t);
+
+        if (_UNLIKELY(!schema_field_setup(states, buf, offset, PyTuple_GET_ITEM(args, 1), class_tp))) // Val type object is located on index 1
+        {
+            Py_DECREF(origin);
+            Py_DECREF(args);
+
+            return false;
+        }
+    }
+    else
+    {
+        Py_DECREF(origin);
+        Py_DECREF(args);
+
+        PyErr_Format(PyExc_TypeError, "Received an unsupported typing object of type '%s'", origin->tp_name);
+        return false;
+    }
+
+    Py_DECREF(origin);
+    Py_DECREF(args);
+
+    return true;
+}
+
+static _always_inline bool schema_meta_setup(schema_meta_t *meta, PyObject *class, mstates_t *states, PyObject *annotations)
+{
+    // This will accumulate to be the total size to allocate
+    size_t total_size = 0;
+
+    // Get the number of annotations
+    meta->ptrs.nattrs = PyDict_GET_SIZE(annotations);
+
+    // Size of the name objects array
+    size_t names_size = sizeof(schema_name_t) * meta->ptrs.nattrs;
+    total_size += names_size;
+
+    // Calculate the number of slots for the attribute offsets array
+    //meta->ptrs.attr_offsets_slots = next_power_of_2(meta->ptrs.nattrs * SLOT_MULTIPLIER);
+
+    //size_t attr_offsets_size = sizeof(uint16_t) * meta->ptrs.attr_offsets_slots;
+    //total_size += attr_offsets_size;
+
+    /* The schema will dynamically re-allocate the buffer when it needs space */
+
+    // Allocate the buffer that will hold all fields
+    meta->buffer = (char *)PyObject_Malloc(total_size);
+
+    if (_UNLIKELY(meta->buffer == NULL))
+    {
+        PyErr_NoMemory();
+        return false;
+    }
+
+    // The offset for the schema field, located at the end of the buffer
+    size_t offset = total_size;
+
+    Py_ssize_t pos = 0;
+    for (size_t i = 0; i < meta->ptrs.nattrs; ++i)
+    {
+        PyObject *key, *val;
+        PyDict_Next(annotations, &pos, &key, &val);
+
+        // Ensure that the key is unicode
+        if (_UNLIKELY(!PyUnicode_CheckExact(key)))
+        {
+            PyErr_Format(PyExc_TypeError, "Annotation keys must be of type 'str', got an object of type '%s'", Py_TYPE(key)->tp_name);
+            return false;
+        }
+
+        // Get the string data of the key
+        char *str;
+        size_t strlen;
+        py_str_data(key, &str, &strlen);
+
+        // Assign the key to the names array (located at the start of the buffer)
+        schema_name_t *names = (schema_name_t *)meta->buffer;
+        names[i].str = str;
+        names[i].len = strlen;
+
+        // Set up the value type
+        if (_UNLIKELY(!schema_field_setup(states, &meta->buffer, &offset, val, class)))
+            return false;
+    }
+
+    // Assign the pointers based on the field sizes
+    meta->ptrs.names = (schema_name_t *)(meta->buffer);
+    //meta->ptrs.attr_offsets = meta->buffer + names_size;
+    meta->ptrs.schema = (char *)(meta->buffer + names_size); // + attr_offsets_size;
+
+    return true;
+}
+
+static PyObject *schema_meta_new(schema_meta_t *meta, PyObject *args, PyObject *kwargs)
+{
+    // Create the class object
+    PyTypeObject *class = (PyTypeObject *)PyType_Type.tp_new((PyTypeObject *)meta, args, kwargs);
+    NULLCHECK(class);
+
+    // Get the module states
+    mstates_t *states = get_mstates(PyState_FindModule(&cmsgpack));
+
+    // Get the annotations attribute
+    PyObject *annotations = PyObject_GetAttrString((PyObject *)class, "__annotations__");
+
+    // Ensure the annotations object is a dictionary
+    if (_UNLIKELY(annotations == NULL || !PyDict_CheckExact(annotations)))
+    {
+        if (annotations != NULL)
+        {
+            PyErr_Format(PyExc_TypeError, "Expected to get an annotations object of type 'dict', got an object of type '%s'", Py_TYPE(annotations)->tp_name);
+            Py_DECREF(annotations);
+        }
+        else
+        {
+            PyErr_SetString(PyExc_ValueError, "A schema object must have an '__annotations__' attribute");
+        }
+
+        return NULL;
+    }
+
+    // Set up the attribute fields
+    if (_UNLIKELY(!schema_meta_setup(meta, (PyObject *)class, states, annotations)))
+    {
+        Py_DECREF(annotations);
+        PyObject_Free(meta->buffer);
+
+        return NULL;
+    }
+
+    Py_DECREF(annotations);
+
+    return (PyObject *)class;
+}
+
+static _always_inline bool schema_parse_arguments(schema_obj_t *obj, PyObject *args, PyObject *kwargs)
+{
+    size_t max = obj->ptrs.nattrs;
+
+    size_t nargs = PyTuple_GET_SIZE(args);
+
+    if (_UNLIKELY(nargs > max))
+        return false;
+    
+    for (size_t i = 0; i < nargs; ++i)
+    {
+        PyObject *arg = PyTuple_GET_ITEM(args, i);
+
+        Py_INCREF(arg);
+        obj->attrs[i] = arg;
+    }
+
+    if (kwargs != NULL)
+    {
+        size_t nkwargs = PyDict_GET_SIZE(kwargs);
+
+        Py_ssize_t pos = 0;
+        for (size_t i = 0; i < nkwargs; ++i)
+        {
+            PyObject *key;
+            PyObject *val;
+            PyDict_Next(kwargs, &pos, &key, &val);
+
+            if (_UNLIKELY(schema_setattro(obj, key, val) < 0))
+                return false;
+        }
+    }
+
+    return true;
+}
+
+static PyObject *schema_new(PyTypeObject *tp, PyObject *args, PyObject *kwargs)
+{
+    // Get the meta object
+    schema_meta_t *meta = (schema_meta_t *)Py_TYPE(tp);
+
+    // Allocate the instance with the number of attributes to store
+    size_t attrs_size = sizeof(PyObject *) * meta->ptrs.nattrs;
+    schema_obj_t *obj = PyObject_Malloc(sizeof(schema_obj_t) + attrs_size);
+    
+    if (_UNLIKELY(obj == NULL))
+        return PyErr_NoMemory();
+    
+    // Initialize the object's Python data
+    Py_SET_TYPE(obj, &SchemaObj);
+    Py_SET_REFCNT(obj, 1);
+    
+    // Set the pointers
+    obj->ptrs = meta->ptrs;
+
+    // Initialize the attributes array with NULLs
+    memset(obj->attrs, 0, attrs_size);
+
+    if (_UNLIKELY(!schema_parse_arguments(obj, args, kwargs)))
+    {
+        Py_DECREF(obj);
+        return NULL;
+    }
+
+    return (PyObject *)obj;
+}
+
+static void schema_meta_dealloc(schema_meta_t *meta)
+{
+    PyObject_Free(meta->buffer);
+    Py_TYPE(meta)->tp_free(meta);
+}
+
+static void schema_dealloc(schema_obj_t *obj)
+{
+    // Remove reference to all attributes
+    for (size_t i = 0; i < obj->ptrs.nattrs; ++i)
+        Py_XDECREF(obj->attrs[i]);
+    
+    PyObject_Del(obj);
 }
 
 
@@ -2449,9 +3339,53 @@ static bool setup_mstates(PyObject *m)
     // Create interned strings
     GET_ISTR(obj)
     GET_ISTR(ext_types)
-    GET_ISTR(strict_keys)
     GET_ISTR(file_name)
-    GET_ISTR(keep_open)
+
+    // Get the typing module
+    s->typing.module = PyImport_ImportModule("typing");
+    NULLCHECK(s->typing.module);
+
+    // Get the origin function
+    s->typing.origin = PyObject_GetAttrString(s->typing.module, "get_origin");
+
+    if (_UNLIKELY(s->typing.origin == NULL))
+    {
+        Py_DECREF(s->typing.module);
+        return false;
+    }
+
+    // Get the args function
+    s->typing.args = PyObject_GetAttrString(s->typing.module, "get_args");
+
+    if (_UNLIKELY(s->typing.args == NULL))
+    {
+        Py_DECREF(s->typing.origin);
+        Py_DECREF(s->typing.module);
+        return false;
+    }
+
+    // Get the Any singleton
+    s->typing.Any = PyObject_GetAttrString(s->typing.module, "Any");
+
+    if (_UNLIKELY(s->typing.Any == NULL))
+    {
+        Py_DECREF(s->typing.args);
+        Py_DECREF(s->typing.origin);
+        Py_DECREF(s->typing.module);
+        return false;
+    }
+
+    // Get the Union object
+    s->typing.Union = PyObject_GetAttrString(s->typing.module, "Union");
+
+    if (_UNLIKELY(s->typing.Union == NULL))
+    {
+        Py_DECREF(s->typing.Any);
+        Py_DECREF(s->typing.args);
+        Py_DECREF(s->typing.origin);
+        Py_DECREF(s->typing.module);
+        return false;
+    }
 
     // NULL-initialize the string cache
     memset(s->caches.strings.strings, 0, sizeof(s->caches.strings.strings));
@@ -2490,7 +3424,12 @@ static void cleanup_mstates(PyObject *m)
     for (size_t i = 0; i < STRING_CACHE_SLOTS; ++i)
         Py_XDECREF(s->caches.strings.strings[i]);
     
-    // The integer cache doesn't need decrefs, its objects aren't allocated
+    // Remove typing references
+    Py_DECREF(s->typing.Any);
+    Py_DECREF(s->typing.Union);
+    Py_DECREF(s->typing.args);
+    Py_DECREF(s->typing.origin);
+    Py_DECREF(s->typing.module);
 }
 
 
@@ -2526,7 +3465,7 @@ static PyMethodDef CmsgpackMethods[] = {
 
 static PyTypeObject ExtTypesEncodeObj = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "ExtTypesEncode",
+    .tp_name = "cmsgpack.ExtTypesEncode",
     .tp_basicsize = sizeof(ext_types_encode_t),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_dealloc = (destructor)ext_types_encode_dealloc,
@@ -2534,7 +3473,7 @@ static PyTypeObject ExtTypesEncodeObj = {
 
 static PyTypeObject ExtTypesDecodeObj = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "ExtTypesDecode",
+    .tp_name = "cmsgpack.ExtTypesDecode",
     .tp_basicsize = sizeof(ext_types_decode_t),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_dealloc = (destructor)ext_types_decode_dealloc,
@@ -2542,8 +3481,8 @@ static PyTypeObject ExtTypesDecodeObj = {
 
 static PyTypeObject EncoderObj = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "Encoder",
-    .tp_basicsize = sizeof(bufconfig_obj_t),
+    .tp_name = "cmsgpack.Encoder",
+    .tp_basicsize = sizeof(hookobj_t),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_methods = EncoderMethods,
     .tp_dealloc = (destructor)encoder_dealloc,
@@ -2551,11 +3490,32 @@ static PyTypeObject EncoderObj = {
 
 static PyTypeObject DecoderObj = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "Decoder",
-    .tp_basicsize = sizeof(bufconfig_obj_t),
+    .tp_name = "cmsgpack.Decoder",
+    .tp_basicsize = sizeof(hookobj_t),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_methods = DecoderMethods,
     .tp_dealloc = (destructor)decoder_dealloc,
+};
+
+static PyTypeObject SchemaMetaObj = {
+    PyVarObject_HEAD_INIT(&PyType_Type, 0)
+    .tp_name = "cmsgpack.SchemaMeta",
+    .tp_basicsize = sizeof(schema_meta_t),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_dealloc = (destructor)schema_meta_dealloc,
+    .tp_new = (newfunc)schema_meta_new,
+    .tp_base = &PyType_Type,
+};
+
+static PyTypeObject SchemaObj = {
+    PyVarObject_HEAD_INIT(&SchemaMetaObj, 0)
+    .tp_name = "cmsgpack.Schema",
+    .tp_basicsize = sizeof(schema_obj_t),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_dealloc = (destructor)schema_dealloc,
+    .tp_new = (newfunc)schema_new,
+    .tp_getattro = (getattrofunc)schema_getattro,
+    .tp_setattro = (setattrofunc)schema_setattro,
 };
 
 static void cleanup(PyObject *module);
@@ -2583,7 +3543,7 @@ static void cleanup(PyObject *module)
     if (PyType_Ready(&type)) return NULL;
 
 PyMODINIT_FUNC PyInit_cmsgpack(void) {
-    // See if we can find the module in the state already
+    // See if the module is already in the state
     PyObject *m = PyState_FindModule(&cmsgpack);
     if (m != NULL)
     {
@@ -2598,6 +3558,9 @@ PyMODINIT_FUNC PyInit_cmsgpack(void) {
     PYTYPE_READY(ExtTypesEncodeObj);
     PYTYPE_READY(ExtTypesDecodeObj);
 
+    PYTYPE_READY(SchemaMetaObj);
+    PYTYPE_READY(SchemaObj);
+
     // Create main module
     m = PyModule_Create(&cmsgpack);
     NULLCHECK(m);
@@ -2605,6 +3568,14 @@ PyMODINIT_FUNC PyInit_cmsgpack(void) {
     // Add the module to the state
     if (PyState_AddModule(m, &cmsgpack) != 0) {
         Py_DECREF(m);
+        return NULL;
+    }
+
+    // Add the schema object to the module
+    Py_INCREF(&SchemaObj);
+    if (PyModule_AddObject(m, "Schema", (PyObject *)&SchemaObj) < 0)
+    {
+        Py_DECREF(&SchemaObj);
         return NULL;
     }
     
