@@ -407,17 +407,23 @@ static _always_inline bool parse_keywords(Py_ssize_t npos, PyObject **args, Py_s
 
 static PyObject *ExtTypesEncode(PyObject *self, PyObject *pairsdict)
 {
-    if (!Py_IS_TYPE(pairsdict, &PyDict_Type))
+    if (!PyDict_Check(pairsdict))
     {
         error_unexpected_argtype("pairs", PyDict_Type.tp_name, Py_TYPE(pairsdict)->tp_name);
+        return NULL;
+    }
+
+    const size_t npairs = PyDict_GET_SIZE(pairsdict);
+
+    if (npairs == 0)
+    {
+        PyErr_SetString(PyExc_ValueError, "Expected at least one custom type in the dict, got zero");
         return NULL;
     }
 
     ext_types_encode_t *obj = PyObject_New(ext_types_encode_t, &ExtTypesEncodeObj);
     if (obj == NULL)
         return PyErr_NoMemory();
-    
-    const size_t npairs = PyDict_GET_SIZE(pairsdict);
 
     // Pairs buffer for the hash table
     pair_t *pairs = (pair_t *)PyObject_Malloc(npairs * sizeof(pair_t));
@@ -535,6 +541,12 @@ static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_
 
             return NULL;
         }
+    }
+
+    if (PyDict_GET_SIZE(pairsdict) == 0)
+    {
+        PyErr_SetString(PyExc_ValueError, "Expected at least one custom type in the dict, got zero");
+        return NULL;
     }
 
     ext_types_decode_t *obj = PyObject_New(ext_types_decode_t, &ExtTypesDecodeObj);
@@ -1370,7 +1382,7 @@ static _always_inline bool write_extension(buffer_t *b, PyObject *obj)
     {
         // Error might not be set, so default to unsupported type error
         if (!PyErr_Occurred())
-            PyErr_Format(PyExc_ValueError, "Received unsupported type: '%s'", Py_TYPE(obj)->tp_name);
+            PyErr_Format(PyExc_TypeError, "Received unsupported type: '%s'", Py_TYPE(obj)->tp_name);
         
         return false;
     }
