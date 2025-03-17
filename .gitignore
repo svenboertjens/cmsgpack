@@ -5,3 +5,5 @@ local
 .vscode
 .obsidian
 **.egg-info
+
+__pycache__

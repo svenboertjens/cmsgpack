@@ -7,14 +7,22 @@
 ///////////////////
 
 #include <Python.h>
+#include <stdbool.h>
 
 #if Py_BIG_ENDIAN == 1
 #define IS_BIG_ENDIAN
 #endif
 
+#define _always_inline Py_ALWAYS_INLINE inline
+
+#ifdef PY_NO_GIL
+#define _need_threadsafe
+#endif
+
 #ifdef IS_BIG_ENDIAN
 
     #define BIG_64(x) (x)
+    #define BIG_32(x) (x)
     #define BIG_DOUBLE(x) (x)
 
 #else
@@ -22,11 +30,13 @@
     #if defined(__GNUC__) || defined(__clang__)
 
         #define BIG_64(x) (__builtin_bswap64((uint64_t)(x)))
+        #define BIG_32(x) (__builtin_bswap32((uint32_t)(x)))
 
     #elif defined(_MSC_VER)
 
         #include <intrin.h>
         #define BIG_64(x) (_byteswap_uint64((uint64_t)(x)))
+        #define BIG_32(x) (_byteswap_uint32((uint32_t)(x)))
 
     #else
 
@@ -41,6 +51,13 @@
             (((x) << 56) & 0xFF00000000000000)   \
         )
 
+        #define BIG_32(x) ( \
+            (((x) >> 24) & 0x000000FF) | \
+            (((x) >>  8) & 0x0000FF00) | \
+            (((x) <<  8) & 0x00FF0000) | \
+            (((x) << 24) & 0xFF000000)   \
+        )
+
     #endif
 
     #define BIG_DOUBLE(x) do { \
@@ -49,21 +66,6 @@
         __temp = BIG_64(__temp); \
         memcpy(&(x), &__temp, 8); \
     } while (0)
-
-#endif
-
-
-#define _always_inline Py_ALWAYS_INLINE
-
-#if (defined(__GNUC__) || defined(__clang__)) 
-
-    #define _LIKELY(cond) __builtin_expect(!!(cond), 1)
-    #define _UNLIKELY(cond) __builtin_expect(!!(cond), 0)
-
-#else
-
-    #define _LIKELY(cond) (cond)
-    #define _UNLIKELY(cond) (cond)
 
 #endif
 
@@ -127,5 +129,46 @@
         return written == size ? 0 : -1;
     }
 #endif
+
+
+static inline bool memcmp_small(const void *s1, const void *s2, size_t size)
+{
+    if (size == 0)
+        return true;
+
+    const char *p1 = s1;
+    const char *p2 = s2;
+
+    while (size >= sizeof(uint64_t)) {
+        uint64_t v1, v2;
+        memcpy(&v1, p1, sizeof(v1));
+        memcpy(&v2, p2, sizeof(v2));
+        if (v1 != v2)
+            return false;
+        p1 += sizeof(v1);
+        p2 += sizeof(v2);
+        size -= sizeof(v1);
+    }
+
+    while (size >= sizeof(uint32_t)) {
+        uint32_t v1, v2;
+        memcpy(&v1, p1, sizeof(v1));
+        memcpy(&v2, p2, sizeof(v2));
+        if (v1 != v2)
+            return false;
+        p1 += sizeof(v1);
+        p2 += sizeof(v2);
+        size -= sizeof(v1);
+    }
+
+    while (size--) {
+        if (*p1++ != *p2++)
+            return false;
+    }
+
+    return true;
+}
+
+
 
 #endif // CMSGPACK_INTERNALS_H

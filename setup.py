@@ -9,6 +9,7 @@ ext_modules = [
         include_dirs=[
             'cmsgpack/'
         ],
+        #extra_compile_args=['-fsanitize=address']
     )
 ]
 

@@ -2,13 +2,16 @@
 
 #define PY_SSIZE_T_CLEAN
 
-#include <Python.h>
-#include <stdbool.h>
-#include <stdatomic.h>
-
 #include "masks.h"
 #include "internals.h"
 #include "hashtable.h"
+
+#include <Python.h>
+#include <stdbool.h>
+
+#ifdef _need_threadsafe
+#include <stdatomic.h>
+#endif
 
 
 // Python versions
@@ -28,14 +31,14 @@
 
 // The number of slots to use in caches
 #define STRING_CACHE_SLOTS 1024
-#define INTEGER_CACHE_SLOTS 1024
+#define INTEGER_CACHE_SLOTS (1024 + 128) // 1024 unsigned, 128 signed
 
 // Minimum sizes for the 'extra' and 'item' adaptive allocation weights
 #define EXTRA_ALLOC_MIN 64
 #define ITEM_ALLOC_MIN 6
 
-// Name for the schema object capsule
-#define SCHEMA_CAPSULE_NAME "cmsgpack.Schema"
+// Recursion limit
+#define RECURSION_LIMIT 1000
 
 
 ///////////////////////////
@@ -62,7 +65,11 @@ static PyTypeObject ExtTypesDecodeObj;
 // String cache struct with a lock per object
 typedef struct {
     PyASCIIObject *strings[STRING_CACHE_SLOTS];
+    uint8_t match_strength[STRING_CACHE_SLOTS];
+
+    #ifdef _need_threadsafe
     atomic_flag locks[STRING_CACHE_SLOTS];
+    #endif
 } strcache_t;
 
 // Module states
@@ -79,15 +86,6 @@ typedef struct {
         PyLongObject integers[INTEGER_CACHE_SLOTS];
         strcache_t strings;
     } caches;
-
-    // Typing objects
-    struct {
-        PyObject *module; // Typing module
-        PyObject *origin; // Get origin function
-        PyObject *args;   // Get args function
-        PyObject *Any;    // The Any singleton
-        PyObject *Union;  // Union objects
-    } typing;
 } mstates_t;
 
 
@@ -110,6 +108,8 @@ typedef struct {
     char *offset;       // Offset to write to
     char *maxoffset;    // Maximum offset value before reallocation is needed
 
+    size_t recursion;   // Recursion depth against circular references
+
     bufconfig_t config; // Configurations
 } buffer_t;
 
@@ -123,138 +123,6 @@ static PyTypeObject EncoderObj;
 static PyTypeObject DecoderObj;
 
 
-typedef enum {
-    SC_DIRECT,
-    SC_UNION,
-    SC_LIST,
-    SC_TUPLE,
-    SC_DICT,
-    SC_ANY,
-    SC_SCHEMA,
-    SC_SELF,
-} sc_flag_t;
-
-typedef bool (*encode_func)(buffer_t *b, PyObject *obj);
-typedef PyObject *(*decode_func)(buffer_t *b);
-
-typedef struct {
-    encode_func enc;
-    decode_func dec;
-} encdec_funcs_t;
-
-typedef struct {
-    uintptr_t flag;
-    PyTypeObject *tp;
-    encdec_funcs_t funcs;
-} sc_direct_t;
-
-typedef struct {
-    uintptr_t flag;
-} sc_any_t;
-
-typedef struct {
-    uintptr_t flag;
-    size_t nfields;
-    size_t offset_after;
-} sc_union_t;
-
-typedef struct {
-    uintptr_t flag;
-    size_t nfields;
-} sc_tuple_t;
-
-typedef struct {
-    uintptr_t flag;
-} sc_list_t;
-
-typedef struct {
-    uintptr_t flag;
-} sc_dict_t;
-
-typedef struct {
-    uintptr_t flag;
-    PyTypeObject *tp;
-} sc_schema_t;
-
-typedef struct {
-    uintptr_t flag;
-} sc_self_t;
-
-/* # Schema structure
- * 
- * The schema is structured without any pointers, and
- * works directly based on offsetting and ordering. After
- * offsetting past the last field, you're immediately located
- * at the next field.
- * 
- * Below is the structure per flag, where each field takes
- * up `sizeof(uintptr_t)` space, except for HEAD fields which
- * always occupy 8 bytes.
- * 
- * 
- * # Structure per flag
- * 
- *  Direct:
- * - SC_DIRECT flag
- * - TypeObject pointer
- * 
- *  Any:
- * - SC_ANY flag
- * 
- *  Union:
- * - SC_UNION flag
- * - NFIELDS count
- * - Offset of after the fields
- * - Field (of item types, times NFIELDS)
- * 
- *  Tuple:
- * - SC_TUPLE flag
- * - NFIELDS count
- * - Field (of item types, times NFIELDS)
- * 
- *  List/Dict:
- * - SC_LIST/SC_DICT flag
- * - Field (of item/val type)
- * 
- *  Schema: (nested schema)
- * - SC_SCHEMA flag
- * - TypeObject pointer
- * - Schema pointer
- * 
- *  Self:
- * - SC_SELF flag
- * 
- */
-
-typedef struct {
-    size_t len;
-    char *str;
-} schema_name_t;
-
-typedef struct {
-    size_t nattrs; // Number of "static" attributes (the annotated variables)
-
-    schema_name_t *names; // Array of pointers to the static attributes' names
-
-    char *schema; // Serialization schema
-} struct_ptrs_t;
-
-typedef struct {
-    PyHeapTypeObject base; // Base for heap type objects
-    struct_ptrs_t ptrs;    // Pointers to buffers located after this struct
-    char *buffer;          // Buffer that holds the data from all pointer fields
-} schema_meta_t;
-
-typedef struct {
-    PyObject_HEAD
-    struct_ptrs_t ptrs; // Pointers to data fields
-    PyObject *attrs[]; // Array with the static attribute values
-} schema_obj_t;
-
-static PyTypeObject SchemaMetaObj;
-static PyTypeObject SchemaObj;
-
-
 static _always_inline mstates_t *get_mstates(PyObject *m);
 
 static bool encode_object(buffer_t *b, PyObject *obj);
@@ -262,8 +130,6 @@ static PyObject *decode_bytes(buffer_t *b);
 
 static bool encbuffer_expand(buffer_t *b, size_t needed);
 static bool decoder_streaming_refresh(buffer_t *b, const size_t requested);
-
-static bool encode_schema(buffer_t *b, PyObject *obj);
 
 
 static struct PyModuleDef cmsgpack;
@@ -276,10 +142,14 @@ static struct PyModuleDef cmsgpack;
 // Error for when LIMIT_LARGE is exceeded
 #define error_size_limit(name, size) (PyErr_Format(PyExc_ValueError, #name " values can only hold up to 4294967295 bytes (2^32-1, 4 bytes), got a size of %zu", size))
 
+// Error for when we get an unexpected tyoe
 #define error_unexpected_type(expected, received) (PyErr_Format(PyExc_TypeError, "Expected an object of type '%s', but got an object of type '%s'", expected, received))
 
 // Error for when we get an unexpected type at an argument
-#define error_unexpected_argtype(argname, correct_tpname, received_tpname) (PyErr_Format(PyExc_TypeError, "Expected argument '%s' to be of type '%s', but got an object of type '%s'", argname, correct_tpname, received_tpname))
+#define error_unexpected_argtype(argname, expected, received) (PyErr_Format(PyExc_TypeError, "Expected argument '%s' to be of type '%s', but got an object of type '%s'", argname, expected, received))
+
+// Error for when we get an unexpected header
+#define error_unexpected_header(expected_tpname, received_header) (PyErr_Format(PyExc_TypeError, "Expected a header of type '%s', but got header byte '0x%02X'", expected_tpname, received_header))
 
 // Error for when a file couldn't be opened
 #define error_cannot_open_file(filename, err) (PyErr_Format(PyExc_OSError, "Unable to open file '%s', received errno %i: '%s'", filename, err, strerror(err)))
@@ -289,41 +159,68 @@ static struct PyModuleDef cmsgpack;
 //  BYTES TO PY  //
 ///////////////////
 
+#ifdef _need_threadsafe
+
 // Acquire a lock
-static _always_inline void cache_acquire_lock(atomic_flag *lock)
+static _always_inline void cache_acquire_lock(strcache_t *cache, size_t idx)
 {
+    atomic_flag *lock = &cache->locks[idx];
     while (atomic_flag_test_and_set_explicit(lock, memory_order_acquire)) { }
 }
 
 // Release a lock
-static inline void cache_release_lock(atomic_flag *lock)
+static inline void cache_release_lock(strcache_t *cache, size_t idx)
 {
+    atomic_flag *lock = &cache->locks[idx];
     atomic_flag_clear_explicit(lock, memory_order_release);
+}
+
+#else
+
+// Dummies
+#define cache_acquire_lock(cache, idx) (NULL)
+#define cache_release_lock(cache, idx) (NULL)
+
+#endif
+
+static _always_inline uint32_t fnv1a_32(const char *data, size_t size)
+{
+    uint32_t hash = 0x811c9dc5;
+
+    for (size_t i = 0; i < size; i++)
+    {
+        hash ^= data[i];
+        hash *= 0x01000193;
+    }
+
+    return hash;
 }
 
 // Version for small strings to be cached
 static _always_inline PyObject *fixstr_to_py(char *ptr, size_t size, strcache_t *cache)
 {
     // Calculate the hash of the string
-    const size_t hash = fnv1a(ptr, size) & (STRING_CACHE_SLOTS - 1);
+    const size_t hash = fnv1a_32(ptr, size) & (STRING_CACHE_SLOTS - 1);
 
     // Wait on the lock of the hash
-    cache_acquire_lock(&cache->locks[hash]);
+    cache_acquire_lock(cache, hash);
 
     // Load the match stored at the hash index
     PyASCIIObject *match = cache->strings[hash];
 
-    if (match != NULL)
+    if (match)
     {
         const char *cbase = (const char *)(match + 1);
         const size_t csize = match->length;
 
-        if (_LIKELY(csize == size && memcmp(cbase, ptr, size) == 0))
+        if (csize == size && memcmp_small(cbase, ptr, size))
         {
             Py_INCREF(match);
 
+            cache->match_strength[hash]++;
+
             // Release the lock
-            cache_release_lock(&cache->locks[hash]);
+            cache_release_lock(cache, hash);
 
             return (PyObject *)match;
         }
@@ -332,79 +229,26 @@ static _always_inline PyObject *fixstr_to_py(char *ptr, size_t size, strcache_t 
     // No common value, create a new one
     PyObject *obj = PyUnicode_DecodeUTF8(ptr, size, NULL);
 
-    // Add to the cache if ascii
+    // If ASCII, it can be cached
     if (PyUnicode_IS_COMPACT_ASCII(obj))
     {
-        // Keep reference to the new object and lose reference to the old object
-        Py_INCREF(obj);
-        Py_XDECREF(match);
+        cache->match_strength[hash]--;
 
-        // Set the new object into the cache
-        cache->strings[hash] = (PyASCIIObject *)obj;
+        // Replace the match if the strength reached zero
+        if (cache->match_strength[hash] == 0)
+        {
+            Py_XDECREF(match);
+            Py_INCREF(obj);
+
+            cache->strings[hash] = (PyASCIIObject *)obj;
+            cache->match_strength[hash] = 3;
+        }
     }
 
     // Release the lock
-    cache_release_lock(&cache->locks[hash]);
+    cache_release_lock(cache, hash);
 
     return obj;
-}
-
-
-static _always_inline PyObject *str_to_py(char *ptr, size_t size)
-{
-    return PyUnicode_DecodeUTF8(ptr, size, NULL);
-}
-
-static PyObject *int_to_py(uint64_t num, bool is_uint, PyLongObject *cache)
-{
-    if (_LIKELY(num < INTEGER_CACHE_SLOTS && is_uint))
-    {
-        PyLongObject *obj = &cache[num];
-
-        Py_INCREF(obj);
-        return (PyObject *)obj;
-    }
-
-    // Most cases can use the LongLong function, prefer that path
-    if (_LIKELY(num < 0x8000000000000000 || !is_uint))
-        return PyLong_FromLongLong((long long)num);
-    
-    // This is reached by unsigned integers that'd be interpreted as signed by PyLong_FromLongLong
-    return PyLong_FromUnsignedLongLong((unsigned long long)num);
-}
-
-static _always_inline PyObject *float_to_py(double num)
-{
-    // Manually create a float object, Python's approach is slower
-    PyFloatObject *obj = PyObject_New(PyFloatObject, &PyFloat_Type);
-
-    // Convert the double to native endianness
-    BIG_DOUBLE(num);
-
-    // Set the double to the object
-    obj->ob_fval = num;
-
-    return (PyObject *)obj;
-}
-
-static _always_inline PyObject *bin_to_py(char *ptr, size_t size)
-{
-    return PyBytes_FromStringAndSize(ptr, size);
-}
-
-static _always_inline PyObject *true_to_py(void)
-{
-    Py_RETURN_TRUE;
-}
-
-static _always_inline PyObject *false_to_py(void)
-{
-    Py_RETURN_FALSE;
-}
-
-static _always_inline PyObject *nil_to_py(void)
-{
-    Py_RETURN_NONE;
 }
 
 
@@ -428,7 +272,7 @@ typedef struct {
     {.dest = (PyObject **)_dest, .tp = (PyTypeObject *)_type, .interned = (PyObject *)_interned}
 
 #define min_positional(nargs, min) do { \
-    if (_UNLIKELY(nargs < min)) \
+    if (nargs < min) \
     { \
         PyErr_Format(PyExc_TypeError, "Expected at least %zi positional arguments, but received only %zi", min, nargs); \
         return NULL; \
@@ -436,7 +280,7 @@ typedef struct {
 } while (0)
 
 #define fixed_positional(nargs, required) do { \
-    if (_UNLIKELY(nargs != required)) \
+    if (nargs != required) \
     { \
         PyErr_Format(PyExc_TypeError, "Expected exactly %zi positional arguments, but received %zi", required, nargs); \
         return NULL; \
@@ -447,7 +291,7 @@ static _always_inline PyObject *parse_positional(PyObject **args, size_t nth, Py
 {
     PyObject *obj = args[nth];
 
-    if (type && _UNLIKELY(!Py_IS_TYPE(obj, type)))
+    if (type && !Py_IS_TYPE(obj, type))
     {
         error_unexpected_argtype(argname, type->tp_name, Py_TYPE(obj)->tp_name);
         return NULL;
@@ -457,7 +301,7 @@ static _always_inline PyObject *parse_positional(PyObject **args, size_t nth, Py
 }
 
 #define NULLCHECK(obj) \
-    if (_UNLIKELY(!obj)) return NULL;
+    if (!obj) return NULL;
 
 static _always_inline bool _parse_kwarg(PyObject *kwname, PyObject *val, Py_ssize_t nkey, keyarg_t *keyargs)
 {
@@ -467,7 +311,7 @@ static _always_inline bool _parse_kwarg(PyObject *kwname, PyObject *val, Py_ssiz
 
         if (dest.interned == kwname)
         {
-            if (dest.tp != NULL && _UNLIKELY(!Py_IS_TYPE(val, dest.tp)))
+            if (dest.tp != NULL && !Py_IS_TYPE(val, dest.tp))
             {
                 error_unexpected_argtype((const char *)((PyASCIIObject *)dest.interned + 1), dest.tp->tp_name, Py_TYPE(val)->tp_name);
                 return false;
@@ -484,7 +328,7 @@ static _always_inline bool _parse_kwarg(PyObject *kwname, PyObject *val, Py_ssiz
 
         if (_unicode_equal(dest.interned, kwname))
         {
-            if (dest.tp != NULL && _UNLIKELY(!Py_IS_TYPE(*dest.dest, dest.tp)))
+            if (dest.tp != NULL && !Py_IS_TYPE(*dest.dest, dest.tp))
             {
                 error_unexpected_argtype((const char *)((PyASCIIObject *)dest.interned + 1), dest.tp->tp_name, Py_TYPE(val)->tp_name);
                 return false;
@@ -510,7 +354,7 @@ static _always_inline bool parse_keywords(Py_ssize_t npos, PyObject **args, Py_s
     nargs -= npos;
     args += npos;
 
-    if (_UNLIKELY(nargs > nkey))
+    if (nargs > nkey)
     {
         PyErr_Format(PyExc_TypeError, "Expected at max %zi positional arguments, but received %zi", nkey, nargs);
         return false;
@@ -522,7 +366,7 @@ static _always_inline bool parse_keywords(Py_ssize_t npos, PyObject **args, Py_s
         keyarg_t keyarg = keyargs[i];
         PyObject *obj = args[i];
 
-        if (keyarg.tp && _UNLIKELY(!Py_IS_TYPE(obj, keyarg.tp)))
+        if (keyarg.tp && !Py_IS_TYPE(obj, keyarg.tp))
         {
             // Use the interned string's value for the argument name
             error_unexpected_argtype(PyUnicode_AsUTF8(obj), keyarg.tp->tp_name, Py_TYPE(obj)->tp_name);
@@ -543,7 +387,7 @@ static _always_inline bool parse_keywords(Py_ssize_t npos, PyObject **args, Py_s
 
         for (Py_ssize_t i = 0; i < nkwargs; ++i)
         {
-            if (_UNLIKELY(!_parse_kwarg(PyTuple_GET_ITEM(kwargs, i), args[nargs + i], nkey, keyargs)))
+            if (!_parse_kwarg(PyTuple_GET_ITEM(kwargs, i), args[nargs + i], nkey, keyargs))
                 return false;
         }
     }
@@ -563,21 +407,21 @@ static _always_inline bool parse_keywords(Py_ssize_t npos, PyObject **args, Py_s
 
 static PyObject *ExtTypesEncode(PyObject *self, PyObject *pairsdict)
 {
-    if (_UNLIKELY(!Py_IS_TYPE(pairsdict, &PyDict_Type)))
+    if (!Py_IS_TYPE(pairsdict, &PyDict_Type))
     {
         error_unexpected_argtype("pairs", PyDict_Type.tp_name, Py_TYPE(pairsdict)->tp_name);
         return NULL;
     }
 
     ext_types_encode_t *obj = PyObject_New(ext_types_encode_t, &ExtTypesEncodeObj);
-    if (_UNLIKELY(obj == NULL))
+    if (obj == NULL)
         return PyErr_NoMemory();
     
     const size_t npairs = PyDict_GET_SIZE(pairsdict);
 
     // Pairs buffer for the hash table
     pair_t *pairs = (pair_t *)PyObject_Malloc(npairs * sizeof(pair_t));
-    if (_UNLIKELY(pairs == NULL))
+    if (pairs == NULL)
     {
         PyObject_Del(obj);
 
@@ -594,7 +438,7 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *pairsdict)
 
         PyDict_Next(pairsdict, &pos, &key, &val);
 
-        if (_UNLIKELY(!PyLong_CheckExact(key) || !PyTuple_CheckExact(val)))
+        if (!PyLong_CheckExact(key) || !PyTuple_CheckExact(val))
         {
             PyObject_Del(obj);
             PyObject_Free(pairs);
@@ -603,7 +447,7 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *pairsdict)
             return NULL;
         }
 
-        if (_UNLIKELY(PyTuple_GET_SIZE(val) != 2))
+        if (PyTuple_GET_SIZE(val) != 2)
         {
             PyObject_Del(obj);
             PyObject_Free(pairs);
@@ -615,7 +459,7 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *pairsdict)
         PyObject *type = PyTuple_GET_ITEM(val, 0);
         PyObject *callable = PyTuple_GET_ITEM(val, 1);
 
-        if (_UNLIKELY(!PyType_CheckExact(type) || !PyCallable_Check(callable)))
+        if (!PyType_CheckExact(type) || !PyCallable_Check(callable))
         {
             PyObject_Del(obj);
             PyObject_Free(pairs);
@@ -626,7 +470,7 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *pairsdict)
 
         long id = PyLong_AS_LONG(key);
 
-        if (_UNLIKELY((int8_t)id != id))
+        if ((int8_t)id != id)
         {
             PyObject_Del(obj);
             PyObject_Free(pairs);
@@ -647,7 +491,7 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *pairsdict)
 
     PyObject_Free(pairs);
 
-    if (_UNLIKELY(obj->table == NULL))
+    if (obj->table == NULL)
     {
         PyObject_Del(obj);
 
@@ -660,12 +504,12 @@ static PyObject *ExtTypesEncode(PyObject *self, PyObject *pairsdict)
 
 static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
 {
-    if (_UNLIKELY(nargs < 0))
+    if (nargs < 0)
     {
         PyErr_SetString(PyExc_TypeError, "Expected at least the positional 'pairs' argument");
         return NULL;
     }
-    if (_UNLIKELY(nargs > 2))
+    if (nargs > 2)
     {
         PyErr_Format(PyExc_TypeError, "Expected 2 positional arguments at max, got %zi", nargs);
         return NULL;
@@ -678,7 +522,7 @@ static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_
     {
         argtype = (PyTypeObject *)args[1];
 
-        if (_UNLIKELY(argtype != &PyBytes_Type && argtype != &PyMemoryView_Type))
+        if (argtype != &PyBytes_Type && argtype != &PyMemoryView_Type)
         {
             if (!PyType_CheckExact(argtype))
             {
@@ -694,7 +538,7 @@ static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_
     }
 
     ext_types_decode_t *obj = PyObject_New(ext_types_decode_t, &ExtTypesDecodeObj);
-    if (_UNLIKELY(obj == NULL))
+    if (obj == NULL)
         return PyErr_NoMemory();
 
     // Zero-initialize the reads field to set unused slots to NULL
@@ -706,7 +550,7 @@ static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_
     Py_ssize_t pos = 0;
     while (PyDict_Next(pairsdict, &pos, &key, &val))
     {
-        if (_UNLIKELY(!PyLong_CheckExact(key) || !PyCallable_Check(val)))
+        if (!PyLong_CheckExact(key) || !PyCallable_Check(val))
         {
             Py_DECREF(obj);
             PyErr_Format(PyExc_TypeError, "Expected keys of type 'int' and values of type 'callable', got a key of type '%s' with a value of type '%s'", Py_TYPE(key)->tp_name, Py_TYPE(val)->tp_name);
@@ -715,7 +559,7 @@ static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_
 
         const long id = PyLong_AS_LONG(key);
 
-        if (_UNLIKELY(id < -128 || id > 127))
+        if (id < -128 || id > 127)
         {
             Py_DECREF(obj);
             PyErr_Format(PyExc_ValueError, "IDs are only allowed to range between -128 and 127, got %i", id);
@@ -778,13 +622,13 @@ static PyObject *any_to_ext(buffer_t *b, PyObject *obj, int8_t *id, char **ptr, 
     
     // Attempt to find the encoding function assigned to this type
     pair_t *pair = hashtable_pull(((ext_types_encode_t *)b->config.ext)->table, Py_TYPE(obj));
-    if (_UNLIKELY(pair == NULL))
+    if (pair == NULL)
     {
         // Attempt to match the parent type
         pair = hashtable_pull(((ext_types_encode_t *)b->config.ext)->table, Py_TYPE(obj)->tp_base);
 
         // No match against parent type either
-        if (_UNLIKELY(pair == NULL))
+        if (pair == NULL)
             return PyErr_Format(PyExc_ValueError, "Received unsupported type: '%s'", Py_TYPE(obj)->tp_name);
     }
     
@@ -792,7 +636,7 @@ static PyObject *any_to_ext(buffer_t *b, PyObject *obj, int8_t *id, char **ptr, 
     PyObject *result = PyObject_CallOneArg((PyObject *)pair->val, obj);
     NULLCHECK(result);
     
-    if (_UNLIKELY(!PyBytes_CheckExact(result)))
+    if (!PyBytes_CheckExact(result))
     {
         Py_DECREF(result);
 
@@ -804,7 +648,7 @@ static PyObject *any_to_ext(buffer_t *b, PyObject *obj, int8_t *id, char **ptr, 
     *size = PyBytes_GET_SIZE(result);
     *ptr = PyBytes_AS_STRING(result);
 
-    if (_UNLIKELY(*size == 0))
+    if (*size == 0)
     {
         Py_DECREF(result);
         PyErr_SetString(PyExc_ValueError, "Ext types do not support zero-length data");
@@ -821,7 +665,7 @@ static PyObject *ext_to_any(buffer_t *b, const int8_t id, const size_t size)
 
     PyObject *func = ext_decode_pull(b->config.ext, id);
 
-    if (_UNLIKELY(func == NULL))
+    if (func == NULL)
     {
         PyErr_Format(PyExc_ValueError, "Could not match an ext function for decoding on id %i", id);
         return NULL;
@@ -859,7 +703,7 @@ static _always_inline PyObject *arr_to_py(buffer_t *b, const size_t nitems)
 {
     PyObject *list = PyList_New(nitems);
 
-    if (_UNLIKELY(list == NULL))
+    if (list == NULL)
         return NULL;
 
     for (size_t i = 0; i < nitems; ++i)
@@ -882,7 +726,7 @@ static _always_inline PyObject *map_to_py(buffer_t *b, const size_t npairs)
 {
     PyObject *dict = _PyDict_NewPresized(npairs);
 
-    if (_UNLIKELY(dict == NULL))
+    if (dict == NULL)
         return PyErr_NoMemory();
 
     for (size_t i = 0; i < npairs; ++i)
@@ -904,7 +748,7 @@ static _always_inline PyObject *map_to_py(buffer_t *b, const size_t npairs)
         {
             key = decode_bytes(b);
 
-            if (_UNLIKELY(key == NULL))
+            if (key == NULL)
             {
                 Py_DECREF(dict);
                 return NULL;
@@ -913,7 +757,7 @@ static _always_inline PyObject *map_to_py(buffer_t *b, const size_t npairs)
 
         PyObject *val = decode_bytes(b);
 
-        if (_UNLIKELY(val == NULL))
+        if (val == NULL)
         {
             Py_DECREF(key);
             Py_DECREF(dict);
@@ -935,12 +779,38 @@ static _always_inline PyObject *map_to_py(buffer_t *b, const size_t npairs)
 ////////////////////
 
 #define ENSURE_SPACE(extra) do { \
-    if (_UNLIKELY(b->offset + (extra) >= b->maxoffset)) \
+    if (b->offset + (extra) >= b->maxoffset) \
         NULLCHECK(encbuffer_expand(b, (extra))); \
 } while (0)
 
 // Get the current offset's byte and increment afterwards
 #define INCBYTE ((b->offset++)[0])
+
+// INCBYTE but masked to ensure we operate with a single byte
+#define SIZEBYTE ((unsigned char)(b->offset++)[0])
+
+// Typemask for fixsize and varlen switch case
+#define FIXSIZE_DT(mask) (mask & 0b11100000)
+#define VARLEN_DT(mask) (mask & 0b11111)
+
+// Prefix error message for invalid encoded data
+#define INVALID_MSG "Received invalid encoded data"
+
+// Check if the buffer won't be overread
+#define OVERREAD_CHECK(to_add) do { \
+    if (b->offset + to_add > b->maxoffset) \
+    { \
+        if (b->config.fdata != NULL) \
+        { \
+            NULLCHECK(decoder_streaming_refresh(b, to_add)); \
+        } \
+        else \
+        { \
+            PyErr_SetString(PyExc_ValueError, INVALID_MSG " (overread the encoded data)"); \
+            return NULL; \
+        } \
+    } \
+} while (0)
 
 // Write a header's typemask and its size based on the number of bytes the size should take up
 static _always_inline void write_mask(buffer_t *b, const unsigned char mask, const size_t size, const size_t nbytes)
@@ -951,28 +821,28 @@ static _always_inline void write_mask(buffer_t *b, const unsigned char mask, con
     }
     else if (nbytes == 1) // SMALL
     {
-        char buf[2] = {
+        char _buf[2] = {
             mask,
             size
         };
 
-        memcpy(b->offset, buf, 2);
+        memcpy(b->offset, _buf, 2);
         b->offset += 2;
     }
     else if (nbytes == 2) // MEDIUM
     {
-        char buf[3] = {
+        char _buf[3] = {
             mask,
             size >> 8,
             size
         };
 
-        memcpy(b->offset, buf, 3);
+        memcpy(b->offset, _buf, 3);
         b->offset += 3;
     }
     else if (nbytes == 4) // LARGE
     {
-        char buf[5] = {
+        char _buf[5] = {
             mask,
             size >> 24,
             size >> 16,
@@ -980,12 +850,12 @@ static _always_inline void write_mask(buffer_t *b, const unsigned char mask, con
             size,
         };
 
-        memcpy(b->offset, buf, 5);
+        memcpy(b->offset, _buf, 5);
         b->offset += 5;
     }
     else if (nbytes == 8) // For specific cases
     {
-        char buf[9] = {
+        char _buf[9] = {
             mask,
             size >> 56,
             size >> 48,
@@ -997,7 +867,7 @@ static _always_inline void write_mask(buffer_t *b, const unsigned char mask, con
             size
         };
 
-        memcpy(b->offset, buf, 9);
+        memcpy(b->offset, _buf, 9);
         b->offset += 9;
     }
 }
@@ -1016,7 +886,7 @@ static _always_inline void py_str_data(PyObject *obj, char **base, size_t *size)
         // Otherwise simply get data through this
         *base = (char *)PyUnicode_AsUTF8AndSize(obj, (Py_ssize_t *)size);
 
-        if (_UNLIKELY(base == NULL))
+        if (base == NULL)
             PyErr_SetString(PyExc_BufferError, "Unable to get the internal buffer of a string");
     }
 }
@@ -1038,7 +908,7 @@ static _always_inline bool _write_string(buffer_t *b, char *base, size_t size)
     {
         write_mask(b, DT_STR_MEDIUM, size, 2);
     }
-    else if (_LIKELY(size <= LIMIT_LARGE))
+    else if (size <= LIMIT_LARGE)
     {
         write_mask(b, DT_STR_LARGE, size, 4);
     }
@@ -1062,19 +932,11 @@ static _always_inline bool write_string(buffer_t *b, PyObject *obj)
         char *base = (char *)(((PyASCIIObject *)obj) + 1);
         size_t size = ((PyASCIIObject *)obj)->length;
 
-        ENSURE_SPACE(33);
+        ENSURE_SPACE(1 + LIMIT_STR_FIXED);
 
         write_mask(b, DT_STR_FIXED, size, 0);
 
-        /* Python allocates more than 32 bytes for unicode objects, so copy in chunks for efficiency */
-
-        // Always copy the first chunk
-        memcpy(b->offset, base, 16);
-
-        // Check if we also need to copy a second chunk
-        if (size > 16)
-            memcpy(b->offset + 16, base + 16, 16);
-
+        memcpy(b->offset, base, size);
         b->offset += size;
 
         return true;
@@ -1084,7 +946,7 @@ static _always_inline bool write_string(buffer_t *b, PyObject *obj)
     size_t size;
     py_str_data(obj, &base, &size);
 
-    if (_UNLIKELY(base == NULL))
+    if (base == NULL)
         return false;
 
     return _write_string(b, base, size);
@@ -1103,7 +965,7 @@ static _always_inline bool write_binary(buffer_t *b, char *base, size_t size)
     {
         write_mask(b, DT_BIN_MEDIUM, size, 2);
     }
-    else if (_LIKELY(size <= LIMIT_LARGE))
+    else if (size <= LIMIT_LARGE)
     {
         write_mask(b, DT_BIN_LARGE, size, 4);
     }
@@ -1300,11 +1162,11 @@ static _always_inline bool write_integer(buffer_t *b, PyObject *obj)
         }
 
         // Check if the value exceeds the size limit when negative
-        if (_UNLIKELY(neg && num > (1ull << 63)))
+        if (neg && num > (1ull << 63))
             return false;
     }
 
-    if (_LIKELY(!neg))
+    if (!neg)
     {
         if (num <= LIMIT_UINT_FIXED)
         {
@@ -1384,7 +1246,7 @@ static _always_inline bool write_array_header(buffer_t *b, size_t nitems)
     {
         write_mask(b, DT_ARR_MEDIUM, nitems, 2);
     }
-    else if (_LIKELY(nitems <= LIMIT_LARGE))
+    else if (nitems <= LIMIT_LARGE)
     {
         write_mask(b, DT_ARR_LARGE, nitems, 4);
     }
@@ -1400,13 +1262,21 @@ static _always_inline bool write_array_header(buffer_t *b, size_t nitems)
 // Used for writing array types
 static bool write_array(buffer_t *b, PyObject **items, size_t nitems)
 {
+    if (++(b->recursion) > RECURSION_LIMIT)
+    {
+        PyErr_SetString(PyExc_RecursionError, "Exceeded the maximum recursion depth");
+        return false;
+    }
+
     NULLCHECK(write_array_header(b, nitems));
 
     for (size_t i = 0; i < nitems; ++i)
     {
-        if (_UNLIKELY(!encode_object(b, items[i])))
+        if (!encode_object(b, items[i]))
             return false;
     }
+
+    b->recursion--;
 
     return true;
 }
@@ -1439,7 +1309,7 @@ static _always_inline bool write_map_header(buffer_t *b, size_t npairs)
     {
         write_mask(b, DT_MAP_MEDIUM, npairs, 2);
     }
-    else if (_LIKELY(npairs <= LIMIT_LARGE))
+    else if (npairs <= LIMIT_LARGE)
     {
         write_mask(b, DT_MAP_LARGE, npairs, 4);
     }
@@ -1454,6 +1324,12 @@ static _always_inline bool write_map_header(buffer_t *b, size_t npairs)
 
 static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
 {
+    if (++(b->recursion) > RECURSION_LIMIT)
+    {
+        PyErr_SetString(PyExc_RecursionError, "Exceeded the maximum recursion depth");
+        return false;
+    }
+
     const size_t npairs = PyDict_GET_SIZE(obj);
 
     NULLCHECK(write_map_header(b, npairs));
@@ -1476,6 +1352,8 @@ static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
 
         NULLCHECK(encode_object(b, val));
     }
+
+    b->recursion--;
 
     return true;
 }
@@ -1521,7 +1399,7 @@ static _always_inline bool write_extension(buffer_t *b, PyObject *obj)
     {
         write_mask(b, DT_EXT_MEDIUM, size, 2);
     }
-    else if (_LIKELY(size <= LIMIT_LARGE))
+    else if (size <= LIMIT_LARGE)
     {
         write_mask(b, DT_EXT_LARGE, size, 4);
     }
@@ -1539,243 +1417,6 @@ static _always_inline bool write_extension(buffer_t *b, PyObject *obj)
     b->offset += size;
 
     Py_DECREF(result);
-
-    return true;
-}
-
-
-///////////////////////
-//  SCHEMA ENCODING  //
-///////////////////////
-
-// Round a value up to be aligned
-#define ROUND_TO_ALIGNMENT(n) \
-    ((n) + ((sizeof(uintptr_t) - 1)) & ~(sizeof(uintptr_t) - 1))
-
-static _always_inline bool encode_schema_field(buffer_t *b, schema_obj_t *obj, PyObject *val, size_t *offset)
-{
-    // Get the field flag
-    char *field = obj->ptrs.schema + *offset;
-    sc_flag_t flag = *(sc_flag_t *)field;
-
-    switch (flag)
-    {
-    case SC_DIRECT:
-    {
-        sc_direct_t *sc = (sc_direct_t *)field;
-
-        if (_UNLIKELY(Py_TYPE(val) != sc->tp))
-        {
-            PyErr_Format(PyExc_TypeError, "Got an object with incorrect schema type: expected '%s', got '%s'", sc->tp->tp_name, Py_TYPE(val)->tp_name);
-            return false;
-        }
-
-        *offset += sizeof(sc_direct_t);
-
-        return sc->funcs.enc(b, val);
-    }
-    case SC_ANY:
-    {
-        *offset += sizeof(sc_any_t);
-        return encode_object(b, val);
-    }
-    case SC_UNION:
-    {
-        sc_union_t *sc = (sc_union_t *)field;
-
-        bool success = false;
-
-        // Iterate over the fields until we get a true
-        for (size_t i = 0; i < sc->nfields; ++i)
-        {
-            if (encode_schema_field(b, obj, val, offset))
-            {
-                success = true;
-                break;
-            }
-        }
-
-        // Check if we didn't have success
-        if (_UNLIKELY(!success))
-        {
-            PyErr_SetString(PyExc_TypeError, "Received an unexpected type that could not be matched against any of the union types");
-            return false;
-        }
-
-        // Jump to the offset after all options
-        *offset = sc->offset_after;
-
-        // Clear the error from failed attempts
-        PyErr_Clear();
-
-        return true;
-    }
-    case SC_TUPLE:
-    {
-        if (_UNLIKELY(!PyTuple_Check(val)))
-        {
-            error_unexpected_type("tuple", Py_TYPE(val)->tp_name);
-            return false;
-        }
-
-        sc_tuple_t *sc = (sc_tuple_t *)field;
-
-        if (_UNLIKELY(sc->nfields != (size_t)PyTuple_GET_SIZE(val)))
-        {
-            PyErr_Format(PyExc_TypeError, "Expected a tuple with %zu items, but got one with %zu items", sc->nfields, PyTuple_GET_SIZE(val));
-            return false;
-        }
-        
-        NULLCHECK(write_array_header(b, sc->nfields));
-
-        *offset += sizeof(sc_tuple_t);
-
-        for (size_t i = 0; i < sc->nfields; ++i)
-        {
-            if (_UNLIKELY(!encode_schema_field(b, obj, PyTuple_GET_ITEM(val, i), offset)))
-                return false;
-        }
-
-        return true;
-    }
-    case SC_LIST:
-    {
-        if (_UNLIKELY(!PyList_Check(val)))
-        {
-            error_unexpected_type("list", Py_TYPE(val)->tp_name);
-            return false;
-        }
-
-        // Write the list header
-        size_t nitems = PyList_GET_SIZE(val);
-        NULLCHECK(write_array_header(b, nitems));
-
-        *offset += sizeof(sc_list_t);
-
-        // Remember the start offset to reset it for each item
-        size_t start_offset = *offset;
-
-        for (size_t i = 0; i < nitems; ++i)
-        {
-            // Reset the offset to the type field
-            *offset = start_offset;
-
-            if (_UNLIKELY(!encode_schema_field(b, obj, PyList_GET_ITEM(val, i), offset)))
-                return false;
-        }
-
-        return true;
-    }
-    case SC_DICT:
-    {
-        if (_UNLIKELY(!PyDict_Check(val)))
-        {
-            error_unexpected_type("dict", Py_TYPE(val)->tp_name);
-            return false;
-        }
-
-        size_t npairs = PyDict_GET_SIZE(val);
-
-        // Write the dict header
-        NULLCHECK(write_map_header(b, npairs));
-
-        *offset += sizeof(sc_dict_t);
-
-        // Remember the start offset to reset it for each val
-        size_t start_offset = *offset;
-
-        Py_ssize_t pos = 0;
-        for (size_t i = 0; i < npairs; ++i)
-        {
-            PyObject *key;
-            PyObject *_val;
-            PyDict_Next(val, &pos, &key, &_val);
-
-            // Reset the offset to the type field
-            *offset = start_offset;
-
-            // The key must be a string
-            if (_UNLIKELY(!PyUnicode_CheckExact(key)))
-            {
-                error_unexpected_type("str", Py_TYPE(_val)->tp_name);
-                return false;
-            }
-
-            // Encode the key as a string
-            write_string(b, key);
-
-            // Encode the value
-            if (_UNLIKELY(!encode_schema_field(b, obj, _val, offset)))
-                return false;
-        }
-
-        return true;
-    }
-    case SC_SCHEMA:
-    {
-        sc_schema_t *sc = (sc_schema_t *)field;
-
-        if (_UNLIKELY(Py_TYPE(val) != sc->tp))
-        {
-            error_unexpected_type(sc->tp->tp_name, Py_TYPE(val)->tp_name);
-            return false;
-        }
-
-        *offset += sizeof(sc_schema_t);
-
-        return encode_schema(b, val);
-    }
-    case SC_SELF:
-    {
-        if (_UNLIKELY(Py_TYPE(val) != (PyTypeObject *)obj))
-        {
-            error_unexpected_type("haven't figured this out yet, whoops", Py_TYPE(val)->tp_name);
-            return false;
-        }
-
-        *offset += sizeof(sc_self_t);
-
-        return encode_schema(b, val);;
-    }
-    default:
-    {
-        PyErr_SetString(PyExc_ValueError, "Matched with an invalid schema flag, this should not be reached");
-        return false;
-    }
-    }
-}
-
-static bool encode_schema(buffer_t *b, PyObject *_obj)
-{
-    // Get the schema object
-    schema_obj_t *obj = (schema_obj_t *)_obj;
-
-    // Initialize offset with zero
-    size_t offset = 0;
-
-    // Write the header
-    NULLCHECK(write_map_header(b, obj->ptrs.nattrs));
-
-    for (size_t i = 0; i < obj->ptrs.nattrs; ++i)
-    {
-        // Get the value name
-        schema_name_t name = obj->ptrs.names[i];
-
-        // Write the name's string data
-        _write_string(b, name.str, name.len);
-
-        // Get the value from the schema object
-        PyObject *val = obj->attrs[i];
-
-        if (_UNLIKELY(val == NULL))
-        {
-            PyErr_Format(PyExc_ValueError, "No value is set on attribute '%s'", name.str);
-            return false;
-        }
-
-        if (_UNLIKELY(!encode_schema_field(b, obj, val, &offset)))
-            return false;
-    }
 
     return true;
 }
@@ -1805,10 +1446,6 @@ static bool encode_object(buffer_t *b, PyObject *obj)
     else if (PyDict_Check(obj)) // Same as with lists and tuples
     {
         return write_dict(b, obj);
-    }
-    else if (Py_TYPE(obj) == &SchemaObj) // Checks if it's a schema object
-    {
-        return encode_schema(b, obj);
     }
     else if (tp == &PyBool_Type)
     {
@@ -1849,71 +1486,41 @@ static bool encode_object(buffer_t *b, PyObject *obj)
 //    DECODING    //
 ////////////////////
 
-// Prefix error message for invalid encoded data
-#define INVALID_MSG "Received invalid encoded data"
-
-// Typemask for varlen switch case
-#define VARLEN_DT(mask) (mask & 0b11111)
-
-// INCBYTE but masked to ensure we operate with a single byte
-#define SIZEBYTE ((unsigned char)(b->offset++)[0])
-
-// Check if the buffer won't be overread
-#define OVERREAD_CHECK(to_add) do { \
-    if (_UNLIKELY(b->offset + to_add > b->maxoffset)) \
-    { \
-        if (_LIKELY(b->config.fdata != NULL)) \
-        { \
-            NULLCHECK(decoder_streaming_refresh(b, to_add)); \
-        } \
-        else \
-        { \
-            PyErr_SetString(PyExc_ValueError, INVALID_MSG " (overread the encoded data)"); \
-            return NULL; \
-        } \
-    } \
-} while (0)
-
 // Decoding of fixsize objects
-static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, const unsigned char mask)
+static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char mask)
 {
-    // Size inside of the fixed mask
-    size_t n = (size_t)mask; // N has to be masked before use
-
     // Check which fixmask we got
-    const unsigned char fixmask = mask & 0b11100000;
+    const unsigned char fixmask = FIXSIZE_DT(mask);
     if (fixmask == DT_STR_FIXED)
     {
-        n &= 0x1F;
-        OVERREAD_CHECK(n);
+        mask &= 0x1F;
+        OVERREAD_CHECK(mask);
 
-        PyObject *obj = fixstr_to_py(b->offset, n, &b->config.states->caches.strings);
-        b->offset += n;
+        PyObject *obj = fixstr_to_py(b->offset, mask, &b->config.states->caches.strings);
+        b->offset += mask;
+
         return obj;
     }
-    else if ((mask & 0x80) == 0) // uint only has upper bit set to 0
+    else if ((mask & 0x80) == DT_UINT_FIXED) // uint only has upper bit set to 0
     {
-        return int_to_py(n, true, b->config.states->caches.integers);
+        return (PyObject *)&b->config.states->caches.integers[mask + 128];
     }
     else if (fixmask == DT_INT_FIXED)
     {
-        long num = (long)n;
+        int8_t num = mask & 0b11111;
 
-        num &= 0x1F;
+        if ((num & 0b10000) == 0b10000)
+            num |= ~0b11111;
 
-        // Sign-extend the integer
-        if (num & 0x10)
-            num |= ~0x1F;
-
-        return int_to_py(num, false, b->config.states->caches.integers);
+        return (PyObject *)&b->config.states->caches.integers[num + 128];
     }
     else if ((mask & 0b11110000) == DT_ARR_FIXED) // Bit 5 is also set on ARR and MAP
     {
-        return arr_to_py(b, n & 0x0F);
+        return arr_to_py(b, mask & 0x0F);
     }
     else if ((mask & 0b11110000) == DT_MAP_FIXED)
     {
-        return map_to_py(b, n & 0x0F);
+        return map_to_py(b, mask & 0x0F);
     }
     else
     {
@@ -1950,92 +1557,97 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
 
         OVERREAD_CHECK(n);
 
-        PyObject *obj = str_to_py(b->offset, n);
+        PyObject *obj = PyUnicode_DecodeUTF8(b->offset, n, NULL);
         b->offset += n;
+
         return obj;
     }
 
     case VARLEN_DT(DT_UINT_BIT8):
     {
         OVERREAD_CHECK(1);
-        n = SIZEBYTE;
-        
-        return int_to_py(n, true, b->config.states->caches.integers);
+
+        uint8_t num = SIZEBYTE;
+
+        return (PyObject *)&b->config.states->caches.integers[num + 128];
     }
     case VARLEN_DT(DT_UINT_BIT16):
     {
         OVERREAD_CHECK(2);
-        n |= SIZEBYTE << 8;
-        n |= SIZEBYTE;
+
+        uint16_t num = SIZEBYTE << 8;
+        num |= SIZEBYTE;
+
+        if (num <= 1023)
+            return (PyObject *)&b->config.states->caches.integers[num + 128];
         
-        return int_to_py(n, true, b->config.states->caches.integers);
+        return PyLong_FromUnsignedLongLong(num);
     }
     case VARLEN_DT(DT_UINT_BIT32):
     {
         OVERREAD_CHECK(4);
-        n |= SIZEBYTE << 24;
-        n |= SIZEBYTE << 16;
-        n |= SIZEBYTE <<  8;
-        n |= SIZEBYTE;
+
+        uint32_t num;
+        memcpy(&num, b->offset, 4);
+        b->offset += 4;
+
+        num = BIG_32(num);
         
-        return int_to_py(n, true, b->config.states->caches.integers);
+        return PyLong_FromUnsignedLongLong(num);
     }
     case VARLEN_DT(DT_UINT_BIT64):
     {
         OVERREAD_CHECK(8);
 
-        memcpy(&n, b->offset, 8);
+        uint64_t num;
+        memcpy(&num, b->offset, 8);
         b->offset += 8;
 
-        n = BIG_64(n);
-
-        return int_to_py(n, true, b->config.states->caches.integers);
+        num = BIG_64(num);
+        
+        return PyLong_FromUnsignedLongLong(num);
     }
 
     case VARLEN_DT(DT_INT_BIT8):
     {
         OVERREAD_CHECK(1);
-        n |= SIZEBYTE;
 
-        // Sign-extend
-        if (_LIKELY(n & 0x80))
-            n |= ~0xFF;
-        
-        return int_to_py(n, false, b->config.states->caches.integers);
+        int8_t num = SIZEBYTE;
+
+        return (PyObject *)&b->config.states->caches.integers[num + 128];
     }
     case VARLEN_DT(DT_INT_BIT16):
     {
         OVERREAD_CHECK(2);
-        n |= SIZEBYTE << 8;
-        n |= SIZEBYTE;
 
-        if (_LIKELY(n & 0x8000))
-            n |= ~0xFFFF;
+        int16_t num = (int16_t)SIZEBYTE << 8;
+        num |= SIZEBYTE;
         
-        return int_to_py(n, false, b->config.states->caches.integers);
+        return PyLong_FromLongLong(num);
     }
     case VARLEN_DT(DT_INT_BIT32):
     {
         OVERREAD_CHECK(4);
-        n |= SIZEBYTE << 24;
-        n |= SIZEBYTE << 16;
-        n |= SIZEBYTE <<  8;
-        n |= SIZEBYTE;
 
-        if (_LIKELY(n & 0x80000000))
-            n |= ~0xFFFFFFFF;
+        int32_t num;
+        memcpy(&num, b->offset, 4);
+        b->offset += 4;
+
+        num = BIG_32(num);
         
-        return int_to_py(n, false, b->config.states->caches.integers);
+        return PyLong_FromLongLong(num);
     }
     case VARLEN_DT(DT_INT_BIT64):
     {
         OVERREAD_CHECK(8);
 
-        memcpy(&n, b->offset, 8);
+        int64_t num;
+        memcpy(&num, b->offset, 8);
         b->offset += 8;
-        n = BIG_64(n);
 
-        return int_to_py(n, false, b->config.states->caches.integers);
+        num = BIG_64(num);
+
+        return PyLong_FromLongLong(num);
     }
 
     case VARLEN_DT(DT_ARR_LARGE):
@@ -2070,41 +1682,39 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
 
     case VARLEN_DT(DT_NIL):
     {
-        return nil_to_py();
+        return Py_None;
     }
     case VARLEN_DT(DT_TRUE):
     {
-        return true_to_py();
+        return Py_True;
     }
     case VARLEN_DT(DT_FALSE):
     {
-        return false_to_py();
+        return Py_False;
     }
 
     case VARLEN_DT(DT_FLOAT_BIT32):
+    {
+        float num_float;
+        memcpy(&num_float, b->offset, 4);
+        b->offset += 4;
+        
+        // Use type promotion to convert to double
+        double num = (double)num_float;
+
+        BIG_DOUBLE(num);
+
+        return PyFloat_FromDouble(num);
+    }
     case VARLEN_DT(DT_FLOAT_BIT64):
     {
         double num;
+        memcpy(&num, b->offset, 8);
+        b->offset += 8;
 
-        if (_LIKELY(mask == DT_FLOAT_BIT64))
-        {
-            OVERREAD_CHECK(8);
+        BIG_DOUBLE(num);
 
-            memcpy(&num, b->offset, 8);
-            b->offset += 8;
-        }
-        else
-        {
-            OVERREAD_CHECK(4);
-
-            float _num;
-            memcpy(&_num, b->offset, 4);
-            num = (double)_num;
-
-            b->offset += 4;
-        }
-
-        return float_to_py(num);
+        return PyFloat_FromDouble(num);
     }
 
     case VARLEN_DT(DT_BIN_LARGE):
@@ -2125,8 +1735,9 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
 
         OVERREAD_CHECK(n);
 
-        PyObject *obj = bin_to_py(b->offset, n);
+        PyObject *obj = PyBytes_FromStringAndSize(b->offset, n);
         b->offset += n;
+
         return obj;
     }
 
@@ -2249,7 +1860,7 @@ static _always_inline bool encbuffer_prepare(buffer_t *b, PyObject *obj, size_t 
 
     // Attempt to allocate appropriate memory for the buffer based on OBJ's type
     PyTypeObject *tp = Py_TYPE(obj);
-    if (_LIKELY(tp == &PyList_Type || tp == &PyDict_Type))
+    if (tp == &PyList_Type || tp == &PyDict_Type)
     {
         // Get the number of items in the container
         *nitems = Py_SIZE(obj);
@@ -2261,12 +1872,12 @@ static _always_inline bool encbuffer_prepare(buffer_t *b, PyObject *obj, size_t 
     // Create the new buffer object
     b->base = (char *)PyBytes_FromStringAndSize(NULL, allocsize);
 
-    if (_UNLIKELY(b->base == NULL))
+    if (b->base == NULL)
     {
         // Attempt to create an object with the default buffer size
         b->base = (char *)PyBytes_FromStringAndSize(NULL, BUFFER_DEFAULTSIZE);
 
-        if (_UNLIKELY(b->base == NULL))
+        if (b->base == NULL)
         {
             PyErr_NoMemory();
             return false;
@@ -2285,7 +1896,7 @@ static _always_inline size_t biased_average(size_t curr, size_t new)
     const size_t curr_doubled = curr * 2;
 
     // Safety against growing too quickly by limiting growth size to a factor of 2
-    if (_UNLIKELY(curr_doubled < new))
+    if (curr_doubled < new)
         return curr_doubled;
     
     // Return a biased average leaning more towards the current value
@@ -2325,11 +1936,11 @@ static _always_inline void update_adaptive_allocation(buffer_t *b, size_t nitems
 // Start encoding with an encbuffer
 static PyObject *encbuffer_start(bufconfig_t config, PyObject *obj)
 {
-    buffer_t b;
     size_t nitems;
+    buffer_t b;
 
-    // Assign the config and schema fields
     b.config = config;
+    b.recursion = 0;
 
     // Prepare the encode buffer
     NULLCHECK(encbuffer_prepare(&b, obj, &nitems));
@@ -2356,7 +1967,7 @@ static bool encbuffer_expand(buffer_t *b, size_t extra)
     // Reallocate the object (also allocate space for the bytes object itself)
     char *reallocd = PyObject_Realloc(b->base, allocsize + sizeof(PyBytesObject));
 
-    if (_UNLIKELY(reallocd == NULL))
+    if (reallocd == NULL)
     {
         PyErr_NoMemory();
         return false;
@@ -2395,7 +2006,7 @@ static _always_inline PyObject *decbuffer_start(bufconfig_t config, PyObject *en
     PyBuffer_Release(&buffer);
 
     // Check if we reached the end of the buffer
-    if (_UNLIKELY(result != NULL && b.offset != b.maxoffset))
+    if (result != NULL && b.offset != b.maxoffset)
     {
         PyErr_SetString(PyExc_ValueError, INVALID_MSG " (encoded message ended early)");
         return NULL;
@@ -2428,7 +2039,7 @@ static PyObject *encode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
         KEYARG(&config.ext, &ExtTypesEncodeObj, config.states->interned.ext_types),
     };
 
-    if (_UNLIKELY(!parse_keywords(npos, args, nargs, kwargs, keyargs, NKEYARGS(keyargs))))
+    if (!parse_keywords(npos, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
         return NULL;
 
     return encbuffer_start(config, obj);
@@ -2453,7 +2064,7 @@ static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
         KEYARG(&config.ext, &ExtTypesDecodeObj, config.states->interned.ext_types),
     };
 
-    if (_UNLIKELY(!parse_keywords(npos, args, nargs, kwargs, keyargs, NKEYARGS(keyargs))))
+    if (!parse_keywords(npos, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
         return NULL;
 
     return decbuffer_start(config, encoded);
@@ -2497,7 +2108,7 @@ static PyObject *Encoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
         char *str;
         py_str_data(filename, &str, &strsize);
 
-        if (_UNLIKELY(str == NULL))
+        if (str == NULL)
         {
             PyObject_Del(enc);
             return NULL;
@@ -2506,7 +2117,7 @@ static PyObject *Encoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
         // Allocate the fdata object with space for the string (+1 for null terminator)
         enc->config.fdata = (filedata_t *)PyObject_Malloc(sizeof(filedata_t) + strsize + 1);
 
-        if (_UNLIKELY(enc->config.fdata == NULL))
+        if (enc->config.fdata == NULL)
         {
             PyObject_Del(enc);
 
@@ -2520,7 +2131,7 @@ static PyObject *Encoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
 
         // Open the file in advance
         enc->config.fdata->file = fopen(enc->config.fdata->name, "ab");
-        if (_UNLIKELY(enc->config.fdata->file == NULL))
+        if (enc->config.fdata->file == NULL)
         {
             const int err = errno;
             error_cannot_open_file(enc->config.fdata->name, err);
@@ -2570,7 +2181,7 @@ static PyObject *Decoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
         char *str;
         py_str_data(filename, &str, &strsize);
 
-        if (_UNLIKELY(str == NULL))
+        if (str == NULL)
         {
             PyObject_Del(dec);
             return NULL;
@@ -2579,7 +2190,7 @@ static PyObject *Decoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
         // Allocate a fdata object with space for the string
         dec->config.fdata = (filedata_t *)PyObject_Malloc(sizeof(filedata_t) + strsize + 1);
 
-        if (_UNLIKELY(dec->config.fdata == NULL))
+        if (dec->config.fdata == NULL)
         {
             PyObject_Del(dec);
 
@@ -2594,7 +2205,7 @@ static PyObject *Decoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
         // Open the file in advance
         dec->config.fdata->file = fopen(dec->config.fdata->name, "rb");
 
-        if (_UNLIKELY(dec->config.fdata->file == NULL))
+        if (dec->config.fdata->file == NULL)
         {
             Py_DECREF(dec);
 
@@ -2614,11 +2225,11 @@ static PyObject *Decoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
 static PyObject *encoder_encode(hookobj_t *enc, PyObject *obj)
 {
     // Check if the file is closed when streaming
-    if (_UNLIKELY(enc->config.fdata != NULL && enc->config.fdata->file == NULL))
+    if (enc->config.fdata != NULL && enc->config.fdata->file == NULL)
     {
         enc->config.fdata->file = fopen(enc->config.fdata->name, "ab");
 
-        if (_UNLIKELY(enc->config.fdata->file == NULL))
+        if (enc->config.fdata->file == NULL)
         {
             const int err = errno;
             return error_cannot_open_file(enc->config.fdata->name, err);
@@ -2638,12 +2249,12 @@ static PyObject *encoder_encode(hookobj_t *enc, PyObject *obj)
 
     // Check if all data is written to the file, otherwise truncate up until data that was written incompletely
     size_t written;
-    if (_UNLIKELY(size != (written = fwrite(PyBytes_AS_STRING(result), 1, size, enc->config.fdata->file))))
+    if (size != (written = fwrite(PyBytes_AS_STRING(result), 1, size, enc->config.fdata->file)))
     {
         PyErr_Format(PyExc_OSError, "Failed to write encoded data to file '%s'. A partial read might have occurred, which is attempted to be fixed.", enc->config.fdata->name);
 
         // Attempt to truncate the file
-        if (_UNLIKELY(_ftruncate_and_close(enc->config.fdata->file, ftell(enc->config.fdata->file) - written, enc->config.fdata->name) != 0))
+        if (_ftruncate_and_close(enc->config.fdata->file, ftell(enc->config.fdata->file) - written, enc->config.fdata->name) != 0)
         {
             // Set file to NULL to prevent invalid pointer errors, and trigger re-opening on a new write
             enc->config.fdata->file = NULL;
@@ -2662,7 +2273,7 @@ static PyObject *encoder_encode(hookobj_t *enc, PyObject *obj)
 // Check if we read nothing, throw appropriate error if so
 static _always_inline bool nowrite_check(buffer_t *b, const size_t read)
 {
-    if (_UNLIKELY(read == 0))
+    if (read == 0)
     {
         // Check if it's an EOF or something different
         if (feof(b->config.fdata->file))
@@ -2706,7 +2317,7 @@ static PyObject *decoder_decode(hookobj_t *dec, PyObject **args, Py_ssize_t narg
     // Set up the buffer
     b.base = (char *)malloc(DECBUFFER_DEFAULTSIZE);
 
-    if (_UNLIKELY(b.base == NULL))
+    if (b.base == NULL)
         return PyErr_NoMemory();
 
     b.offset = b.base;
@@ -2748,14 +2359,14 @@ static bool decoder_streaming_refresh(buffer_t *b, const size_t requested)
     fseek(b->config.fdata->file, -reread, SEEK_CUR);
 
     // Check if the requested size is larger than the entire buffer
-    if (_UNLIKELY(requested > (size_t)(b->maxoffset - b->base)))
+    if (requested > (size_t)(b->maxoffset - b->base))
     {
         // Allocate a new object to fit the requested size
         const size_t newsize = requested * 1.2;
 
         char *newptr = (char *)realloc(b->base, newsize);
 
-        if (_UNLIKELY(newptr == NULL))
+        if (newptr == NULL)
         {
             PyErr_NoMemory();
             return false;
@@ -2814,510 +2425,6 @@ static void decoder_dealloc(hookobj_t *dec)
 }
 
 
-//////////////////////
-//  SCHEMA OBJECTS  //
-//////////////////////
-
-static PyObject *schema_getattro(schema_obj_t *obj, PyObject *name)
-{
-    // Get the string data of the attribute
-    char *str;
-    size_t strlen;
-    py_str_data(name, &str, &strlen);
-
-    NULLCHECK(str);
-
-    for (size_t i = 0; i < obj->ptrs.nattrs; ++i)
-    {
-        schema_name_t name = obj->ptrs.names[i];
-
-        if (strlen != name.len)
-            continue;
-        
-        if (memcmp(str, name.str, strlen) != 0)
-            continue;
-        
-        PyObject *match = obj->attrs[i];
-
-        if (match == NULL)
-        {
-            PyErr_Format(PyExc_ValueError, "No value set on attribute '%s", str);
-            return NULL;
-        }
-
-        Py_INCREF(match);
-        return match;
-    }
-
-    PyErr_Format(PyExc_KeyError, "Could not find attribute '%s'", str);
-    return NULL;
-}
-
-static int schema_setattro(schema_obj_t *obj, PyObject *name, PyObject *val)
-{
-    // Get the string data of the attribute
-    char *str;
-    size_t strlen;
-    py_str_data(name, &str, &strlen);
-
-    if (_UNLIKELY(str == NULL))
-        return -1;
-
-    for (size_t i = 0; i < obj->ptrs.nattrs; ++i)
-    {
-        schema_name_t name = obj->ptrs.names[i];
-
-        if (strlen != name.len)
-            continue;
-        
-        if (memcmp(str, name.str, strlen) != 0)
-            continue;
-        
-        Py_XDECREF(obj->attrs[i]);
-        Py_XINCREF(val);
-
-        obj->attrs[i] = val;
-
-        return 0;
-    }
-
-    PyErr_Format(PyExc_KeyError, "Could not find attribute '%s'", str);
-    return -1;
-}
-
-static void schema_encdec_funcs_setup(encdec_funcs_t *funcs, PyTypeObject *tp)
-{
-    if (tp == &PyUnicode_Type)
-    {
-        funcs->enc = write_string;
-    }
-    else if (tp == &PyLong_Type)
-    {
-        funcs->enc = write_integer;
-    }
-    else if (tp == &PyFloat_Type)
-    {
-        funcs->enc = write_double;
-    }
-    else if (tp == &PyBool_Type)
-    {
-        funcs->enc = write_bool;
-    }
-    else if (PyType_IsSubtype(tp, &PyList_Type)) // No exact check to support subclasses
-    {
-        funcs->enc = write_list;
-    }
-    else if (PyType_IsSubtype(tp, &PyTuple_Type)) // Same as with lists, no exact check to support subclasses
-    {
-        funcs->enc = write_tuple;
-    }
-    else if (PyType_IsSubtype(tp, &PyDict_Type)) // Same as with lists and tuples
-    {
-        funcs->enc = write_dict;;
-    }
-    else if (tp == Py_TYPE(Py_None)) // No explicit PyNone_Type available
-    {
-        funcs->enc = write_nil;
-    }
-    else if (tp == &PyBytes_Type)
-    {
-        funcs->enc = write_bytes;
-    }
-    else if (tp == &PyByteArray_Type)
-    {
-        funcs->enc = write_bytearray;
-    }
-    else if (tp == &PyMemoryView_Type)
-    {
-        funcs->enc = write_memoryview;
-    }
-    else
-    {
-        funcs->enc = write_extension;
-    }
-}
-
-static bool schema_field_setup(mstates_t *states, char **buf, size_t *offset, PyObject *tp, PyObject *class_tp)
-{
-    // Allocate for 4x the word size to have enough for all cases
-    char *new = (char *)PyObject_Realloc(*buf, *offset + (sizeof(void *) * 4));
-
-    if (_UNLIKELY(new == NULL))
-    {
-        PyErr_NoMemory();
-        return false;
-    }
-
-    *buf = new;
-
-    // Check if the type is Any, Union, or the class itself
-    if (tp == states->typing.Any)
-    {
-        sc_any_t *sc = (sc_any_t *)(*buf + *offset);
-        
-        sc->flag = SC_ANY;
-
-        *offset += sizeof(sc_any_t);
-
-        return true;
-    }
-    else if (tp == states->typing.Union)
-    {
-        sc_union_t *sc = (sc_union_t *)(*buf + *offset);
-
-        // Get the args of the union
-        PyObject *args = PyObject_CallOneArg(states->typing.args, tp);
-        NULLCHECK(args);
-
-        size_t nargs = PyTuple_GET_SIZE(args);
-
-        sc->flag = SC_UNION;
-        sc->nfields = nargs;
-
-        // Remember this offset for the offset field and jump over it for now
-        size_t off_field_offset = *offset;
-        *offset += sizeof(uintptr_t);
-
-        // Set up the union items
-        for (size_t i = 0; i < nargs; ++i)
-        {
-            PyObject *item_tp = PyTuple_GET_ITEM(args, i);
-
-            if (_UNLIKELY(!schema_field_setup(states, buf, offset, item_tp, class_tp)))
-            {
-                Py_DECREF(args);
-                return false;
-            }
-        }
-
-        // Store the offset field
-        *(uintptr_t *)(*buf + off_field_offset) = (uintptr_t)*offset;
-
-        return true;
-    }
-    else if (tp == class_tp)
-    {
-        sc_self_t *sc = (sc_self_t *)(*buf + *offset);
-
-        sc->flag = SC_SELF;
-
-        *offset += sizeof(sc_self_t);
-
-        return true;
-    }
-
-    // Try to get the origin of the type
-    PyTypeObject *origin = (PyTypeObject *)PyObject_CallOneArg(states->typing.origin, tp);
-    NULLCHECK(origin);
-
-    // If we get None, it's not a typing object
-    if ((PyObject *)origin == Py_None)
-    {
-        // Check if the type is a subclass of SchemaObj
-        if (Py_TYPE(tp) == &SchemaObj)
-        {
-            sc_schema_t *sc = (sc_schema_t *)(*buf + *offset);
-
-            sc->flag = SC_SCHEMA;
-            sc->tp = (PyTypeObject *)tp;
-
-            *offset += sizeof(sc_schema_t);
-
-            return true;
-        }
-        else
-        {
-            sc_direct_t *sc = (sc_direct_t *)(*buf + *offset);
-
-            sc->flag = SC_DIRECT;
-            sc->tp = (PyTypeObject *)tp;
-
-            schema_encdec_funcs_setup(&sc->funcs, (PyTypeObject *)tp);
-
-            *offset += sizeof(sc_direct_t);
-        }
-        
-        return true;
-    }
-
-    // Get the args of the typing object
-    PyObject *args = PyObject_CallOneArg(states->typing.args, tp);
-    if (_UNLIKELY(args == NULL))
-    {
-        Py_DECREF(origin);
-        return false;
-    }
-
-    // Check the origin type
-    if (origin == &PyList_Type)
-    {
-        sc_list_t *sc = (sc_list_t *)(*buf + *offset);
-
-        sc->flag = SC_LIST;
-
-        *offset += sizeof(sc_list_t);
-
-        // We support just 1 type specifier
-        size_t nargs = PyTuple_GET_SIZE(args);
-        if (_UNLIKELY(nargs != 1))
-        {
-            PyErr_Format(PyExc_TypeError, "List type annotations support exactly one subtype, got %zu", nargs);
-            return false;
-        }
-
-        if (_UNLIKELY(!schema_field_setup(states, buf, offset, PyTuple_GET_ITEM(args, 0), class_tp)))
-        {
-            Py_DECREF(origin);
-            Py_DECREF(args);
-
-            return false;
-        }
-    }
-    else if (origin == &PyTuple_Type)
-    {
-        sc_tuple_t *sc = (sc_tuple_t *)(*buf + *offset);
-        size_t nargs = PyTuple_GET_SIZE(args);
-
-        sc->flag = SC_TUPLE;
-        sc->nfields = nargs;
-
-        *offset += sizeof(sc_tuple_t);
-
-        for (size_t i = 0; i < nargs; ++i)
-        {
-            if (_UNLIKELY(!schema_field_setup(states, buf, offset, PyTuple_GET_ITEM(args, i), class_tp)))
-            {
-                Py_DECREF(origin);
-                Py_DECREF(args);
-
-                return false;
-            }
-        }
-    }
-    else if (origin == &PyDict_Type)
-    {
-        sc_dict_t *sc = (sc_dict_t *)(*buf + *offset);
-
-        sc->flag = SC_DICT;
-
-        *offset += sizeof(sc_dict_t);
-
-        if (_UNLIKELY(!schema_field_setup(states, buf, offset, PyTuple_GET_ITEM(args, 1), class_tp))) // Val type object is located on index 1
-        {
-            Py_DECREF(origin);
-            Py_DECREF(args);
-
-            return false;
-        }
-    }
-    else
-    {
-        Py_DECREF(origin);
-        Py_DECREF(args);
-
-        PyErr_Format(PyExc_TypeError, "Received an unsupported typing object of type '%s'", origin->tp_name);
-        return false;
-    }
-
-    Py_DECREF(origin);
-    Py_DECREF(args);
-
-    return true;
-}
-
-static _always_inline bool schema_meta_setup(schema_meta_t *meta, PyObject *class, mstates_t *states, PyObject *annotations)
-{
-    // This will accumulate to be the total size to allocate
-    size_t total_size = 0;
-
-    // Get the number of annotations
-    meta->ptrs.nattrs = PyDict_GET_SIZE(annotations);
-
-    // Size of the name objects array
-    size_t names_size = sizeof(schema_name_t) * meta->ptrs.nattrs;
-    total_size += names_size;
-
-    // Calculate the number of slots for the attribute offsets array
-    //meta->ptrs.attr_offsets_slots = next_power_of_2(meta->ptrs.nattrs * SLOT_MULTIPLIER);
-
-    //size_t attr_offsets_size = sizeof(uint16_t) * meta->ptrs.attr_offsets_slots;
-    //total_size += attr_offsets_size;
-
-    /* The schema will dynamically re-allocate the buffer when it needs space */
-
-    // Allocate the buffer that will hold all fields
-    meta->buffer = (char *)PyObject_Malloc(total_size);
-
-    if (_UNLIKELY(meta->buffer == NULL))
-    {
-        PyErr_NoMemory();
-        return false;
-    }
-
-    // The offset for the schema field, located at the end of the buffer
-    size_t offset = total_size;
-
-    Py_ssize_t pos = 0;
-    for (size_t i = 0; i < meta->ptrs.nattrs; ++i)
-    {
-        PyObject *key, *val;
-        PyDict_Next(annotations, &pos, &key, &val);
-
-        // Ensure that the key is unicode
-        if (_UNLIKELY(!PyUnicode_CheckExact(key)))
-        {
-            PyErr_Format(PyExc_TypeError, "Annotation keys must be of type 'str', got an object of type '%s'", Py_TYPE(key)->tp_name);
-            return false;
-        }
-
-        // Get the string data of the key
-        char *str;
-        size_t strlen;
-        py_str_data(key, &str, &strlen);
-
-        // Assign the key to the names array (located at the start of the buffer)
-        schema_name_t *names = (schema_name_t *)meta->buffer;
-        names[i].str = str;
-        names[i].len = strlen;
-
-        // Set up the value type
-        if (_UNLIKELY(!schema_field_setup(states, &meta->buffer, &offset, val, class)))
-            return false;
-    }
-
-    // Assign the pointers based on the field sizes
-    meta->ptrs.names = (schema_name_t *)(meta->buffer);
-    //meta->ptrs.attr_offsets = meta->buffer + names_size;
-    meta->ptrs.schema = (char *)(meta->buffer + names_size); // + attr_offsets_size;
-
-    return true;
-}
-
-static PyObject *schema_meta_new(schema_meta_t *meta, PyObject *args, PyObject *kwargs)
-{
-    // Create the class object
-    PyTypeObject *class = (PyTypeObject *)PyType_Type.tp_new((PyTypeObject *)meta, args, kwargs);
-    NULLCHECK(class);
-
-    // Get the module states
-    mstates_t *states = get_mstates(PyState_FindModule(&cmsgpack));
-
-    // Get the annotations attribute
-    PyObject *annotations = PyObject_GetAttrString((PyObject *)class, "__annotations__");
-
-    // Ensure the annotations object is a dictionary
-    if (_UNLIKELY(annotations == NULL || !PyDict_CheckExact(annotations)))
-    {
-        if (annotations != NULL)
-        {
-            PyErr_Format(PyExc_TypeError, "Expected to get an annotations object of type 'dict', got an object of type '%s'", Py_TYPE(annotations)->tp_name);
-            Py_DECREF(annotations);
-        }
-        else
-        {
-            PyErr_SetString(PyExc_ValueError, "A schema object must have an '__annotations__' attribute");
-        }
-
-        return NULL;
-    }
-
-    // Set up the attribute fields
-    if (_UNLIKELY(!schema_meta_setup(meta, (PyObject *)class, states, annotations)))
-    {
-        Py_DECREF(annotations);
-        PyObject_Free(meta->buffer);
-
-        return NULL;
-    }
-
-    Py_DECREF(annotations);
-
-    return (PyObject *)class;
-}
-
-static _always_inline bool schema_parse_arguments(schema_obj_t *obj, PyObject *args, PyObject *kwargs)
-{
-    size_t max = obj->ptrs.nattrs;
-
-    size_t nargs = PyTuple_GET_SIZE(args);
-
-    if (_UNLIKELY(nargs > max))
-        return false;
-    
-    for (size_t i = 0; i < nargs; ++i)
-    {
-        PyObject *arg = PyTuple_GET_ITEM(args, i);
-
-        Py_INCREF(arg);
-        obj->attrs[i] = arg;
-    }
-
-    if (kwargs != NULL)
-    {
-        size_t nkwargs = PyDict_GET_SIZE(kwargs);
-
-        Py_ssize_t pos = 0;
-        for (size_t i = 0; i < nkwargs; ++i)
-        {
-            PyObject *key;
-            PyObject *val;
-            PyDict_Next(kwargs, &pos, &key, &val);
-
-            if (_UNLIKELY(schema_setattro(obj, key, val) < 0))
-                return false;
-        }
-    }
-
-    return true;
-}
-
-static PyObject *schema_new(PyTypeObject *tp, PyObject *args, PyObject *kwargs)
-{
-    // Get the meta object
-    schema_meta_t *meta = (schema_meta_t *)Py_TYPE(tp);
-
-    // Allocate the instance with the number of attributes to store
-    size_t attrs_size = sizeof(PyObject *) * meta->ptrs.nattrs;
-    schema_obj_t *obj = PyObject_Malloc(sizeof(schema_obj_t) + attrs_size);
-    
-    if (_UNLIKELY(obj == NULL))
-        return PyErr_NoMemory();
-    
-    // Initialize the object's Python data
-    Py_SET_TYPE(obj, &SchemaObj);
-    Py_SET_REFCNT(obj, 1);
-    
-    // Set the pointers
-    obj->ptrs = meta->ptrs;
-
-    // Initialize the attributes array with NULLs
-    memset(obj->attrs, 0, attrs_size);
-
-    if (_UNLIKELY(!schema_parse_arguments(obj, args, kwargs)))
-    {
-        Py_DECREF(obj);
-        return NULL;
-    }
-
-    return (PyObject *)obj;
-}
-
-static void schema_meta_dealloc(schema_meta_t *meta)
-{
-    PyObject_Free(meta->buffer);
-    Py_TYPE(meta)->tp_free(meta);
-}
-
-static void schema_dealloc(schema_obj_t *obj)
-{
-    // Remove reference to all attributes
-    for (size_t i = 0; i < obj->ptrs.nattrs; ++i)
-        Py_XDECREF(obj->attrs[i]);
-    
-    PyObject_Del(obj);
-}
-
-
 //////////////////
 //    STATES    //
 //////////////////
@@ -3328,8 +2435,9 @@ static _always_inline mstates_t *get_mstates(PyObject *m)
     return (mstates_t *)PyModule_GetState(m);
 }
 
-// Get interned string of NAME
-#define GET_ISTR(name) if ((s->interned.name = PyUnicode_InternFromString(#name)) == NULL) return false;
+// Create an interned string of NAME
+#define GET_ISTR(name) \
+    if ((s->interned.name = PyUnicode_InternFromString(#name)) == NULL) return false;
 
 // Set up the module states
 static bool setup_mstates(PyObject *m)
@@ -3341,76 +2449,67 @@ static bool setup_mstates(PyObject *m)
     GET_ISTR(ext_types)
     GET_ISTR(file_name)
 
-    // Get the typing module
-    s->typing.module = PyImport_ImportModule("typing");
-    NULLCHECK(s->typing.module);
-
-    // Get the origin function
-    s->typing.origin = PyObject_GetAttrString(s->typing.module, "get_origin");
-
-    if (_UNLIKELY(s->typing.origin == NULL))
-    {
-        Py_DECREF(s->typing.module);
-        return false;
-    }
-
-    // Get the args function
-    s->typing.args = PyObject_GetAttrString(s->typing.module, "get_args");
-
-    if (_UNLIKELY(s->typing.args == NULL))
-    {
-        Py_DECREF(s->typing.origin);
-        Py_DECREF(s->typing.module);
-        return false;
-    }
-
-    // Get the Any singleton
-    s->typing.Any = PyObject_GetAttrString(s->typing.module, "Any");
-
-    if (_UNLIKELY(s->typing.Any == NULL))
-    {
-        Py_DECREF(s->typing.args);
-        Py_DECREF(s->typing.origin);
-        Py_DECREF(s->typing.module);
-        return false;
-    }
-
-    // Get the Union object
-    s->typing.Union = PyObject_GetAttrString(s->typing.module, "Union");
-
-    if (_UNLIKELY(s->typing.Union == NULL))
-    {
-        Py_DECREF(s->typing.Any);
-        Py_DECREF(s->typing.args);
-        Py_DECREF(s->typing.origin);
-        Py_DECREF(s->typing.module);
-        return false;
-    }
 
     // NULL-initialize the string cache
     memset(s->caches.strings.strings, 0, sizeof(s->caches.strings.strings));
 
+    // Initialize match strengths as 1 so that they'll immediately reach 0 on the first decrement
+    memset(s->caches.strings.match_strength, 1, sizeof(s->caches.strings.match_strength));
+
+    #ifdef _need_threadsafe
+
     // Initialize the string cache's locks to a clear state
     for (size_t i = 0; i < STRING_CACHE_SLOTS; ++i)
         atomic_flag_clear(&s->caches.strings.locks[i]);
+
+    #endif
+
+
+    // Dummy objects to copy into the cache
+    PyLongObject *dummylong_pos = (PyLongObject *)PyLong_FromLong(1);
+    PyLongObject *dummylong_neg = (PyLongObject *)PyLong_FromLong(-1);
+
+    // Temporarily make them immortal
+    Py_ssize_t dummylong_pos_refcnt = Py_REFCNT(dummylong_pos);
+    Py_ssize_t dummylong_neg_refcnt = Py_REFCNT(dummylong_neg);
+    Py_SET_REFCNT(dummylong_pos, _Py_IMMORTAL_REFCNT);
+    Py_SET_REFCNT(dummylong_neg, _Py_IMMORTAL_REFCNT);
     
-    // Dummy object to copy into the cache
-    PyObject *dummylong = PyLong_FromLong(1);
-    
-    for (size_t i = 0; i < INTEGER_CACHE_SLOTS; ++i)
+    // First store the negative values
+    for (size_t i = 0; i < 128; ++i)
     {
-        // Copy the dummy object into the slot
-        memcpy(s->caches.integers + i, dummylong, sizeof(PyLongObject));
+        s->caches.integers[i] = *dummylong_neg;
+
+        digit val = 128 - i;
+
+        // Negative values are stored as positive
+        #if PYVER12
+        s->caches.integers[i].long_value.ob_digit[0] = val;
+        #else
+        s->caches.integers[i].ob_digit[0] = val;
+        #endif
+    }
+    
+    for (size_t i = 0; i < 1024; ++i)
+    {
+        size_t idx = i + 128;
+
+        s->caches.integers[idx] = *dummylong_pos;
 
         // Set the integer value to the current index
         #if PYVER12
-        s->caches.integers[i].long_value.ob_digit[0] = i;
+        s->caches.integers[idx].long_value.ob_digit[0] = i;
         #else
-        s->caches.integers[i].ob_digit[0] = i;
+        s->caches.integers[idx].ob_digit[0] = i;
         #endif
     }
 
-    Py_DECREF(dummylong);
+    // Restore the dummy refcount
+    Py_SET_REFCNT(dummylong_pos, dummylong_pos_refcnt);
+    Py_SET_REFCNT(dummylong_neg, dummylong_neg_refcnt);
+
+    Py_DECREF(dummylong_pos);
+    Py_DECREF(dummylong_neg);
 
     return true;
 }
@@ -3424,12 +2523,6 @@ static void cleanup_mstates(PyObject *m)
     for (size_t i = 0; i < STRING_CACHE_SLOTS; ++i)
         Py_XDECREF(s->caches.strings.strings[i]);
     
-    // Remove typing references
-    Py_DECREF(s->typing.Any);
-    Py_DECREF(s->typing.Union);
-    Py_DECREF(s->typing.args);
-    Py_DECREF(s->typing.origin);
-    Py_DECREF(s->typing.module);
 }
 
 
@@ -3497,27 +2590,6 @@ static PyTypeObject DecoderObj = {
     .tp_dealloc = (destructor)decoder_dealloc,
 };
 
-static PyTypeObject SchemaMetaObj = {
-    PyVarObject_HEAD_INIT(&PyType_Type, 0)
-    .tp_name = "cmsgpack.SchemaMeta",
-    .tp_basicsize = sizeof(schema_meta_t),
-    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-    .tp_dealloc = (destructor)schema_meta_dealloc,
-    .tp_new = (newfunc)schema_meta_new,
-    .tp_base = &PyType_Type,
-};
-
-static PyTypeObject SchemaObj = {
-    PyVarObject_HEAD_INIT(&SchemaMetaObj, 0)
-    .tp_name = "cmsgpack.Schema",
-    .tp_basicsize = sizeof(schema_obj_t),
-    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-    .tp_dealloc = (destructor)schema_dealloc,
-    .tp_new = (newfunc)schema_new,
-    .tp_getattro = (getattrofunc)schema_getattro,
-    .tp_setattro = (setattrofunc)schema_setattro,
-};
-
 static void cleanup(PyObject *module);
 
 static struct PyModuleDef cmsgpack = {
@@ -3540,9 +2612,10 @@ static void cleanup(PyObject *module)
 }
 
 #define PYTYPE_READY(type) \
-    if (PyType_Ready(&type)) return NULL;
+    if (PyType_Ready(&type) != 0) return NULL;
 
-PyMODINIT_FUNC PyInit_cmsgpack(void) {
+PyMODINIT_FUNC PyInit_cmsgpack(void)
+{
     // See if the module is already in the state
     PyObject *m = PyState_FindModule(&cmsgpack);
     if (m != NULL)
@@ -3558,9 +2631,6 @@ PyMODINIT_FUNC PyInit_cmsgpack(void) {
     PYTYPE_READY(ExtTypesEncodeObj);
     PYTYPE_READY(ExtTypesDecodeObj);
 
-    PYTYPE_READY(SchemaMetaObj);
-    PYTYPE_READY(SchemaObj);
-
     // Create main module
     m = PyModule_Create(&cmsgpack);
     NULLCHECK(m);
@@ -3568,14 +2638,6 @@ PyMODINIT_FUNC PyInit_cmsgpack(void) {
     // Add the module to the state
     if (PyState_AddModule(m, &cmsgpack) != 0) {
         Py_DECREF(m);
-        return NULL;
-    }
-
-    // Add the schema object to the module
-    Py_INCREF(&SchemaObj);
-    if (PyModule_AddObject(m, "Schema", (PyObject *)&SchemaObj) < 0)
-    {
-        Py_DECREF(&SchemaObj);
         return NULL;
     }
     

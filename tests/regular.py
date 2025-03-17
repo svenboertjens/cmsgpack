@@ -14,7 +14,7 @@ def test(enc, dec):
     for val in test_values:
         decoded = dec(enc(val))
         
-        if (val != decoded):
+        if val != decoded:
             print(f"----\nShould be: ({type(val).__name__})'{str(val)[:100]}'\n\nGot: ({type(decoded).__name__})'{str(decoded)[:100]}'\n----\n")
 
 test(cmsgpack.encode, cmsgpack.decode)

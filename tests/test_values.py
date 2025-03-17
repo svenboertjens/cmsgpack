@@ -4,11 +4,11 @@ test_values = [
 
     True, False, None,
 
-    0.0, -0.0, 3.14159, -3.14159, 1.5e-45, -1.5e-45, 1.5e+308, -1.5e+308,
+    0.0, -0.0, 3.14159, -3.14159, 1.5e-45, -1.5e-45, 1.5e+308, -1.5e+308, float('inf'), float('-inf'),
 
     "", "Hello, world!", "with\0null", "a" * 31, "a" * 32, "a" * 0xFF, "a" * 0xFFFF, "a" * 0xFFFFFF, "你好", "emoji 😊",
 
-    b"", b"Hello, world!", b"with\0null", b"a" * 31, b"a" * 32, b"a" * 0xFF, b"a" * 0xFFFF, b"a" * 0xFFFFFF,
+    b"", b"Hello, world!", b"with\0null", b"a" * 31, b"a" * 32, b"a" * 0xFF, b"a" * 0xFFFF, b"a" * 0xFFFFFF, bytes(range(256)),
 
     [], [1, "2", 3.0, True, False, None, b"in", [], {}], ["a"] * 15, ["a"] * 0xFF, ["a"] * 0xFFFFF,
 

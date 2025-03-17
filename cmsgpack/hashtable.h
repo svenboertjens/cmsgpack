@@ -3,6 +3,7 @@
 
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "internals.h"
 
 
@@ -108,7 +109,7 @@ static _always_inline table_t *hashtable_create(pair_t *_pairs, size_t npairs, b
     // Allocate memory for the table itself, and the offset, length, and pairs chunks
     table_t *table = (table_t *)malloc(sizeof(table_t) + offsetsize + lengthsize + pairsize);
 
-    if (_UNLIKELY(table == NULL))
+    if (table == NULL)
         return NULL;
     
     // Set the number of slots/pairs
