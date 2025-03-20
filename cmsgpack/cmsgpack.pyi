@@ -6,34 +6,34 @@ class Extensions:
 
     pass_memoryview: bool
     
-    def __init__(self, types: dict[int: (type, typing.Callable, typing.Callable)] | None=None, pass_memoryview: bool=False):
+    def __init__(self, types: dict | None=None, pass_memoryview: bool=False):
         ...
     
-    def add(self, id: int, type: type, encfunc: typing.Callable, decfunc: typing.Callable, /) -> None:
+    def add(self, id: int, type: type, encfunc: typing.Callable, decfunc: typing.Callable, /) -> typing.NoReturn:
         " Add an extension type for encoding and decoding. "
         ...
     
-    def add_encode(self, id: int, type: type, encfunc: typing.Callable, /) -> None:
+    def add_encode(self, id: int, type: type, encfunc: typing.Callable, /) -> typing.NoReturn:
         " Add an extension type for just encoding. "
         ...
     
-    def add_decode(self, id: int, decfunc: typing.Callable, /) -> None:
+    def add_decode(self, id: int, decfunc: typing.Callable, /) -> typing.NoReturn:
         " Add an extension type for just decoding. "
         ...
     
-    def remove(self, id: int, type: type) -> None:
-        " Remove the encoding and decoding entry for the ID and type. "
+    def remove(self, id: int, type: type) -> typing.NoReturn:
+        " Remove the encoding and decoding entry for the given ID and type. "
         ...
     
-    def remove_encode(self, type: type) -> None:
-        " Remove just the encoding entry for the type. "
+    def remove_encode(self, type: type) -> typing.NoReturn:
+        " Remove just the encoding entry for the given type. "
         ...
     
-    def remove_decode(self, id: int) -> None:
-        " Remove just the decoding entry for the ID. "
+    def remove_decode(self, id: int) -> typing.NoReturn:
+        " Remove just the decoding entry for the given ID. "
         ...
     
-    def clear(self) -> None:
+    def clear(self) -> typing.NoReturn:
         " Clears the entire extensions object. "
         ...
 
