@@ -51,12 +51,16 @@ test.exception(lambda: cm.Encoder(invalid_kwarg=123), TypeError)
 test.exception(lambda: cm.Decoder(invalid_kwarg=123), TypeError)
 
 # Test if valid args are accepted
-test.success(lambda: cm.Encoder(ext_types=cm.ExtTypesEncode({1: (str, lambda: None)}), file_name=FNAME))
-test.success(lambda: cm.Decoder(ext_types=cm.ExtTypesDecode({1: lambda: None}), file_name=FNAME))
+test.success(lambda: cm.Encoder(extensions=cm.Extensions(), file_name=FNAME))
+test.success(lambda: cm.Decoder(extensions=cm.Extensions(), file_name=FNAME))
 
 
 test.print()
 
-import os
-os.remove(FNAME)
+try:
+    import os
+    os.remove(FNAME)
+
+except:
+    pass
 

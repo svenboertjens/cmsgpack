@@ -9,7 +9,7 @@ ext_modules = [
         include_dirs=[
             'cmsgpack/'
         ],
-        #extra_compile_args=['-fsanitize=address']
+        #extra_compile_args=['-fsanitize=address'] # For debugging
     )
 ]
 
@@ -39,9 +39,5 @@ setup(
         ]
     },
     
-    classifiers=[
-        "License :: OSI Approved :: MIT License",
-        "Operating System :: OS Independent",
-    ],
     license='MIT',
 )

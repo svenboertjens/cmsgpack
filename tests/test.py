@@ -13,12 +13,20 @@ class Test:
         self.fails.append((stack[2].lineno, stack[1].function, message))
         return False
     
+    def __cutoff_value(self, value):
+        s = repr(value)
+
+        if len(s) > 125:
+            s = s[:125] + ' ... (cut off)'
+        
+        return s
+    
 
     def equal(self, expected, value):
         " Check if EXPECTED is equal to VALUE "
 
         if expected != value:
-            return self.__new_fail(f"Expected value to be equal to:\n {repr(expected):80s}\nBut got value:\n {repr(value):80s}")
+            return self.__new_fail(f"Expected value to be equal to:\n {self.__cutoff_value(expected)}\nBut got value:\n {self.__cutoff_value(value)}")
         
         return True
     
@@ -26,7 +34,7 @@ class Test:
         " Check if NOT_EXPECTED is unequal to VALUE "
 
         if not_expected == value:
-            return self.__new_fail(f"Expected value to be unequal to:\n {repr(not_expected):80s}\nBut got value:\n {repr(value):80s}")
+            return self.__new_fail(f"Expected value to be unequal to:\n {self.__cutoff_value(not_expected)}\nBut got value:\n {self.__cutoff_value(value)}")
         
         return True
     
@@ -50,7 +58,7 @@ class Test:
 
         except Exception as e:
             if exception and not isinstance(e, exception):
-                return self.__new_fail(f"Successfully failed a function, but with unexpected exception {e.__class__}: {e}")
+                return self.__new_fail(f"Successfully failed a function, but with unexpected exception: {type(e)}: {e}")
             
             return True
     
@@ -66,5 +74,5 @@ class Test:
         print(f"Found {nfails} fails in {fname}:")
 
         for line_no, check_type, fail in self.fails:
-            print(f"\n## line {line_no} ({check_type}) ##\n{fail}")
+            print(f"\n## Line {line_no} ## (func: '{check_type}')\n{fail}")
 

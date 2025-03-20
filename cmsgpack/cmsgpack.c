@@ -4,7 +4,6 @@
 
 #include "masks.h"
 #include "internals.h"
-#include "hashtable.h"
 
 #include <Python.h>
 #include <stdbool.h>
@@ -23,15 +22,13 @@
 //   CONSTANTS   //
 ///////////////////
 
-// Number of slots in ext type hash tables
-#define EXT_TABLE_SLOTS 256
-
 // Default (regular) buffer size
 #define BUFFER_DEFAULTSIZE 256
 
 // The number of slots to use in caches
 #define STRING_CACHE_SLOTS 1024
-#define INTEGER_CACHE_SLOTS (1024 + 128) // 1024 unsigned, 128 signed
+#define INTEGER_CACHE_SLOTS (1024 + 128) // 1023 positive, 128 negative, and a zero object
+#define INTEGER_CACHE_NNEG 128 // Number of negative slots in the integer cache
 
 // Minimum sizes for the 'extra' and 'item' adaptive allocation weights
 #define EXTRA_ALLOC_MIN 64
@@ -40,26 +37,35 @@
 // Recursion limit
 #define RECURSION_LIMIT 1000
 
+// The default values for extensions objects
+#define EXTENSIONS_PASSMEMVIEW_DEFAULTVAL false
+
 
 ///////////////////////////
 //  TYPEDEFS & FORWARDS  //
 ///////////////////////////
 
-// Usertypes encode object struct
 typedef struct {
     PyObject_HEAD
-    table_t *table;
-} ext_types_encode_t;
+    char id;        // ID of the type
+    PyObject *func; // The function used for encoding objects of the type set as the dict's key
+} ext_dictitem_t;
 
-// Usertypes decode object struct
+typedef struct {
+    bool pass_memview;     // Whether to pass memoryview objects instead of byte objects to decoding functions
+
+    PyObject *dict;   // Dict object containing encoding data
+    PyObject **funcs; // Functions array with decoding functions, indexed by ID casted to unsigned
+} ext_data_t;
+
 typedef struct {
     PyObject_HEAD
-    PyTypeObject *argtype;
-    PyObject *reads[256]; // Array of functions per ID, indexed based on the ID (256 IDs, range from -128 to 127. Normalize by casting the ID to unsigned)
-} ext_types_decode_t;
+    ext_data_t data;
+    PyObject *funcs[256]; // The functions array, inlined to avoid having to allocate it
+} extensions_t;
 
-static PyTypeObject ExtTypesEncodeObj;
-static PyTypeObject ExtTypesDecodeObj;
+static PyTypeObject ExtDictItemObj;
+static PyTypeObject ExtensionsObj;
 
 
 // String cache struct with a lock per object
@@ -77,8 +83,11 @@ typedef struct {
     // Interned strings
     struct {
         PyObject *obj;
-        PyObject *ext_types;
         PyObject *file_name;
+        PyObject *types;
+        PyObject *extensions;
+        PyObject *allow_subclasses;
+        PyObject *pass_memoryview;
     } interned;
 
     // Caches
@@ -86,6 +95,9 @@ typedef struct {
         PyLongObject integers[INTEGER_CACHE_SLOTS];
         strcache_t strings;
     } caches;
+
+    // Global extensions object
+    extensions_t extensions;
 } mstates_t;
 
 
@@ -95,29 +107,30 @@ typedef struct {
     char name[]; // Name of the file
 } filedata_t;
 
-// Configurations for buffer objects
 typedef struct {
-    mstates_t *states; // The module state
-    filedata_t *fdata; // File data pointer, NULL if not used
-    void *ext;         // Extension types, NULL if not used
-} bufconfig_t;
+    char *base;      // Base towards the buffer
+    char *offset;    // Current writing offset in the buffer
+    char *maxoffset; // The max writing offset
 
-// Struct holding buffer data for encoding
-typedef struct {
-    char *base;         // Base of the buffer object (base of PyBytesObject in encoding)
-    char *offset;       // Offset to write to
-    char *maxoffset;    // Maximum offset value before reallocation is needed
+    size_t recursion; // Recursion depth to prevent cyclic references during encoding
 
-    size_t recursion;   // Recursion depth against circular references
-
-    bufconfig_t config; // Configurations
+    ext_data_t ext;    // Extensions data
+    filedata_t *fdata; // File data (NULL when not using a file)
+    mstates_t *states; // The module states
 } buffer_t;
 
-// For encoder/decoder objects
+
 typedef struct {
     PyObject_HEAD
-    bufconfig_t config;
-} hookobj_t;
+
+    // For keeping a reference to the ext object in use
+    PyObject *ext;
+
+    // Data to preserve for serialization calls
+    ext_data_t ext_data;
+    filedata_t *fdata;
+    mstates_t *states;
+} classobj_t;
 
 static PyTypeObject EncoderObj;
 static PyTypeObject DecoderObj;
@@ -403,306 +416,401 @@ static _always_inline bool parse_keywords(Py_ssize_t npos, PyObject **args, Py_s
 //   EXT OBJECTS   //
 /////////////////////
 
-#define EXT_ENCODE_HASH(n) (((uintptr_t)(n) >> 8) % EXT_TABLE_SLOTS)
-
-static PyObject *ExtTypesEncode(PyObject *self, PyObject *pairsdict)
+static bool extensions_add_encode_internal(extensions_t *ext, char id, PyObject *type, PyObject *encfunc)
 {
-    if (!PyDict_Check(pairsdict))
-    {
-        error_unexpected_argtype("pairs", PyDict_Type.tp_name, Py_TYPE(pairsdict)->tp_name);
+    // Create a dict item object
+    ext_dictitem_t *item = PyObject_New(ext_dictitem_t, &ExtDictItemObj);
+
+    if (!item)
+        return PyErr_NoMemory();
+    
+    Py_INCREF(encfunc);
+
+    item->func = encfunc;
+    item->id = id;
+
+    int status = PyDict_SetItem(ext->data.dict, type, (PyObject *)item);
+
+    Py_DECREF(item);
+
+    return status >= 0;
+}
+
+static bool extensions_add_decode_internal(extensions_t *ext, char id, PyObject *decfunc)
+{
+    unsigned char idx = (unsigned char)id;
+
+    Py_XDECREF(ext->funcs[idx]);
+    Py_INCREF(decfunc);
+
+    ext->funcs[idx] = decfunc;
+
+    return true;
+}
+
+static PyObject *extensions_add(extensions_t *ext, PyObject **args, Py_ssize_t nargs)
+{
+    if (nargs != 4)
+        return PyErr_Format(PyExc_TypeError, "Expected exactly 4 arguments, but got %zi", nargs);
+    
+    PyObject *longobj = args[0];
+    PyObject *type = args[1];
+    PyObject *encfunc = args[2];
+    PyObject *decfunc = args[3];
+
+    if (!PyLong_CheckExact(longobj))
+        return error_unexpected_argtype("id", "int", Py_TYPE(longobj)->tp_name);
+
+    if (!PyType_Check(type))
+        return PyErr_Format(PyExc_TypeError, "Expected argument 'type' to be a type object, but got an object of type '%s'", Py_TYPE(type)->tp_name);
+
+    if (!PyCallable_Check(encfunc))
+        return PyErr_Format(PyExc_TypeError, "Expected argument 'encfunc' to be a callable object, but got an object of type '%s'", Py_TYPE(encfunc)->tp_name);
+
+    if (!PyCallable_Check(decfunc))
+        return PyErr_Format(PyExc_TypeError, "Expected argument 'decfunc' to be a callable object, but got an object of type '%s'", Py_TYPE(decfunc)->tp_name);
+    
+    long long_id = PyLong_AS_LONG(longobj);
+
+    if (long_id < -128 || long_id > 127)
+        return PyErr_Format(PyExc_ValueError, "Expected the ID to be between -128 and 127, but got an ID of %zi", long_id);
+    
+    char id = (char)long_id;
+
+    if (!extensions_add_encode_internal(ext, id, type, encfunc) ||
+        !extensions_add_decode_internal(ext, id, decfunc))
         return NULL;
-    }
+    
+    Py_RETURN_NONE;
+}
 
-    const size_t npairs = PyDict_GET_SIZE(pairsdict);
+static PyObject *extensions_add_encode(extensions_t *ext, PyObject **args, Py_ssize_t nargs)
+{
+    if (nargs != 3)
+        return PyErr_Format(PyExc_TypeError, "Expected exactly 3 arguments, but got %zi", nargs);
+    
+    PyObject *longobj = args[0];
+    PyObject *type = args[1];
+    PyObject *encfunc = args[2];
 
-    if (npairs == 0)
-    {
-        PyErr_SetString(PyExc_ValueError, "Expected at least one custom type in the dict, got zero");
+    if (!PyLong_CheckExact(longobj))
+        return error_unexpected_argtype("id", "int", Py_TYPE(longobj)->tp_name);
+
+    if (!PyType_Check(type))
+        return PyErr_Format(PyExc_TypeError, "Expected argument 'type' to be a type object, but got an object of type '%s'", Py_TYPE(type)->tp_name);
+
+    if (!PyCallable_Check(encfunc))
+        return PyErr_Format(PyExc_TypeError, "Expected argument 'encfunc' to be a callable object, but got an object of type '%s'", Py_TYPE(encfunc)->tp_name);
+    
+    long long_id = PyLong_AS_LONG(longobj);
+
+    if (long_id < -128 || long_id > 127)
+        return PyErr_Format(PyExc_ValueError, "Expected the ID to be between -128 and 127, but got an ID of %zi", long_id);
+    
+    char id = (char)long_id;
+
+    if (!extensions_add_encode_internal(ext, id, type, encfunc))
         return NULL;
-    }
+    
+    Py_RETURN_NONE;
+}
 
-    ext_types_encode_t *obj = PyObject_New(ext_types_encode_t, &ExtTypesEncodeObj);
-    if (obj == NULL)
+static PyObject *extensions_add_decode(extensions_t *ext, PyObject **args, Py_ssize_t nargs)
+{
+    if (nargs != 2)
+        return PyErr_Format(PyExc_TypeError, "Expected exactly 2 arguments, but got %zi", nargs);
+    
+    PyObject *longobj = args[0];
+    PyObject *decfunc = args[1];
+
+    if (!PyLong_CheckExact(longobj))
+        return error_unexpected_argtype("id", "int", Py_TYPE(longobj)->tp_name);
+
+    if (!PyCallable_Check(decfunc))
+        return PyErr_Format(PyExc_TypeError, "Expected argument 'decfunc' to be a callable object, but got an object of type '%s'", Py_TYPE(decfunc)->tp_name);
+    
+    long long_id = PyLong_AS_LONG(longobj);
+
+    if (long_id < -128 || long_id > 127)
+        return PyErr_Format(PyExc_ValueError, "Expected the ID to be between -128 and 127, but got an ID of %zi", long_id);
+    
+    char id = (char)long_id;
+
+    if (!extensions_add_decode_internal(ext, id, decfunc))
+        return NULL;
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject *extensions_remove(extensions_t *ext, PyObject **args, Py_ssize_t nargs)
+{
+    if (nargs != 2)
+        return PyErr_Format(PyExc_TypeError, "Expected exactly 2 arguments, but got %zi", nargs);
+    
+    PyObject *longobj = args[0];
+    PyObject *type = args[1];
+
+    if (!PyLong_CheckExact(longobj))
+        return error_unexpected_argtype("id", "int", Py_TYPE(longobj)->tp_name);
+
+    if (!PyType_Check(type))
+        return PyErr_Format(PyExc_TypeError, "Expected argument 'type' to be a type object, but got an object of type '%s'", Py_TYPE(type)->tp_name);
+    
+    long long_id = PyLong_AS_LONG(longobj);
+
+    if (long_id < -128 || long_id > 127)
+        return PyErr_Format(PyExc_ValueError, "Expected the ID to be between -128 and 127, but got an ID of %zi", long_id);
+    
+    char id = (char)long_id;
+
+    // Remove the encode item
+    if (PyDict_DelItem(ext->data.dict, type) < 0)
+        PyErr_Clear(); // Silence the error if it doesn't exist, this function supports attempting to delete non-existent entries
+
+    // Remove the decode function
+    Py_XDECREF(ext->funcs[(unsigned char)id]);
+    ext->funcs[(unsigned char)id] = NULL;
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject *extensions_remove_encode(extensions_t *ext, PyObject *type)
+{
+    if (!PyType_Check(type))
+        return PyErr_Format(PyExc_TypeError, "Expected argument 'type' to be a type object, but got an object of type '%s'", Py_TYPE(type)->tp_name);
+    
+    if (PyDict_DelItem(ext->data.dict, type) < 0)
+        PyErr_Clear();
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject *extensions_remove_decode(extensions_t *ext, PyObject *longobj)
+{
+    if (!PyLong_CheckExact(longobj))
+        return error_unexpected_argtype("id", "int", Py_TYPE(longobj)->tp_name);
+    
+    long long_id = PyLong_AS_LONG(longobj);
+
+    if (long_id < -128 || long_id > 127)
+        return PyErr_Format(PyExc_ValueError, "Expected the ID to be between -128 and 127, but got an ID of %zi", long_id);
+    
+    char id = (char)long_id;
+
+    Py_XDECREF(ext->funcs[(unsigned char)id]);
+    ext->funcs[(unsigned char)id] = NULL;
+    
+    Py_RETURN_NONE;
+}
+
+static PyObject *extensions_clear(extensions_t *ext)
+{
+    // Decref the dict and all registered functions
+    Py_DECREF(ext->data.dict);
+    
+    for (size_t i = 0; i < 256; ++i)
+    {
+        Py_XDECREF(ext->funcs[i]);
+        ext->funcs[i] = NULL;
+    }
+    
+    // Create a new dict object
+    ext->data.dict = PyDict_New();
+
+    if (!ext->data.dict)
+        return PyErr_NoMemory();
+    
+    Py_RETURN_NONE;
+}
+
+// Create an ExtTypesEncode object
+static PyObject *Extensions(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
+{
+    mstates_t *states = get_mstates(self);
+
+    PyObject *dict = NULL;
+    PyObject *allow_subclasses = NULL;
+    PyObject *pass_memview = NULL;
+
+    keyarg_t keyargs[] = {
+        KEYARG(&dict, &PyDict_Type, states->interned.types),
+        KEYARG(&allow_subclasses, &PyBool_Type, states->interned.allow_subclasses),
+        KEYARG(&pass_memview, &PyBool_Type, states->interned.pass_memoryview),
+    };
+
+    if (!parse_keywords(0, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
+        return NULL;
+
+
+    // Create the ext object itself
+    extensions_t *ext = PyObject_New(extensions_t, &ExtensionsObj);
+
+    if (!ext)
         return PyErr_NoMemory();
 
-    // Pairs buffer for the hash table
-    pair_t *pairs = (pair_t *)PyObject_Malloc(npairs * sizeof(pair_t));
-    if (pairs == NULL)
+    // Set the true/false values
+    ext->data.pass_memview = pass_memview ? pass_memview == Py_True : EXTENSIONS_PASSMEMVIEW_DEFAULTVAL;
+
+    // NULL-initialize the decoding functions array and set its pointer
+    memset(ext->funcs, 0, sizeof(ext->funcs));
+    ext->data.funcs = ext->funcs;
+
+    // Create the dict holding the data
+    ext->data.dict = PyDict_New();
+
+    if (!ext->data.dict)
     {
-        PyObject_Del(obj);
-
-        PyErr_NoMemory();
-        return NULL;
-    }
-    
-    // Collect all keys and vals in their respective arrays and type check them
-    Py_ssize_t pos = 0;
-    for (size_t i = 0; i < npairs; ++i)
-    {
-        PyObject *key;
-        PyObject *val;
-
-        PyDict_Next(pairsdict, &pos, &key, &val);
-
-        if (!PyLong_CheckExact(key) || !PyTuple_CheckExact(val))
-        {
-            PyObject_Del(obj);
-            PyObject_Free(pairs);
-
-            PyErr_Format(PyExc_TypeError, "Expected keys of type 'int' and values of type 'tuple', got a key of type '%s' with a value of type '%s'", Py_TYPE(key)->tp_name, Py_TYPE(val)->tp_name);
-            return NULL;
-        }
-
-        if (PyTuple_GET_SIZE(val) != 2)
-        {
-            PyObject_Del(obj);
-            PyObject_Free(pairs);
-
-            PyErr_Format(PyExc_TypeError, "Expected tuples with 2 items each, got a tuple with %zi items", PyTuple_GET_SIZE(val));
-            return NULL;
-        }
-
-        PyObject *type = PyTuple_GET_ITEM(val, 0);
-        PyObject *callable = PyTuple_GET_ITEM(val, 1);
-
-        if (!PyType_CheckExact(type) || !PyCallable_Check(callable))
-        {
-            PyObject_Del(obj);
-            PyObject_Free(pairs);
-
-            PyErr_Format(PyExc_TypeError, "Expected tuple items of type 'type' and 'callable' respectively, got '%s' and '%s'", Py_TYPE(type)->tp_name, Py_TYPE(callable)->tp_name);
-            return NULL;
-        }
-
-        long id = PyLong_AS_LONG(key);
-
-        if ((int8_t)id != id)
-        {
-            PyObject_Del(obj);
-            PyObject_Free(pairs);
-            
-            PyErr_Format(PyExc_ValueError, "Expected an ID between -128 and 127, got %li", id);
-            return NULL;
-        }
-
-        Py_INCREF(type);
-        Py_INCREF(callable);
-
-        pairs[i].key = type;
-        pairs[i].val = callable;
-        pairs[i].extra = (void *)id;
-    }
-
-    obj->table = hashtable_create(pairs, npairs, false);
-
-    PyObject_Free(pairs);
-
-    if (obj->table == NULL)
-    {
-        PyObject_Del(obj);
-
-        PyErr_NoMemory();
-        return NULL;
-    }
-
-    return (PyObject *)obj;
-}
-
-static PyObject *ExtTypesDecode(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
-{
-    if (nargs < 0)
-    {
-        PyErr_SetString(PyExc_TypeError, "Expected at least the positional 'pairs' argument");
-        return NULL;
-    }
-    if (nargs > 2)
-    {
-        PyErr_Format(PyExc_TypeError, "Expected 2 positional arguments at max, got %zi", nargs);
-        return NULL;
-    }
-
-    PyObject *pairsdict = args[0];
-    PyTypeObject *argtype = &PyBytes_Type;
-
-    if (nargs == 2)
-    {
-        argtype = (PyTypeObject *)args[1];
-
-        if (argtype != &PyBytes_Type && argtype != &PyMemoryView_Type)
-        {
-            if (!PyType_CheckExact(argtype))
-            {
-                PyErr_Format(PyExc_TypeError, "Argument 'arg_type' should be of type 'type', got '%s'", Py_TYPE(argtype)->tp_name);
-            }
-            else
-            {
-                PyErr_Format(PyExc_ValueError, "Argument 'arg_type' should be either 'bytes' or 'memoryview', got '%s'", argtype->tp_name);
-            }
-
-            return NULL;
-        }
-    }
-
-    if (PyDict_GET_SIZE(pairsdict) == 0)
-    {
-        PyErr_SetString(PyExc_ValueError, "Expected at least one custom type in the dict, got zero");
-        return NULL;
-    }
-
-    ext_types_decode_t *obj = PyObject_New(ext_types_decode_t, &ExtTypesDecodeObj);
-    if (obj == NULL)
+        PyObject_Del(ext);
         return PyErr_NoMemory();
+    }
 
-    // Zero-initialize the reads field to set unused slots to NULL
-    memset(obj->reads, 0, sizeof(obj->reads));
-    
-    obj->argtype = argtype;
-    
-    PyObject *key, *val;
-    Py_ssize_t pos = 0;
-    while (PyDict_Next(pairsdict, &pos, &key, &val))
+    // If we received a dict, parse it
+    if (dict && dict != Py_None)
     {
-        if (!PyLong_CheckExact(key) || !PyCallable_Check(val))
+        Py_ssize_t pos = 0;
+        PyObject *key, *val;
+        while (PyDict_Next(dict, &pos, &key, &val))
         {
-            Py_DECREF(obj);
-            PyErr_Format(PyExc_TypeError, "Expected keys of type 'int' and values of type 'callable', got a key of type '%s' with a value of type '%s'", Py_TYPE(key)->tp_name, Py_TYPE(val)->tp_name);
-            return NULL;
+            if (!PyTuple_CheckExact(val))
+            {
+                Py_DECREF(ext);
+                return PyErr_Format(PyExc_TypeError, "Expected dict values to be objects of type 'tuple', but got an object of type '%s'", Py_TYPE(val)->tp_name);
+            }
+
+            if (PyTuple_GET_SIZE(val) != 3)
+            {
+                Py_DECREF(ext);
+                return PyErr_Format(PyExc_ValueError, "Expected dict values to be tuples with 3 items, but got one with %zi items", PyTuple_GET_SIZE(val));
+            }
+
+            PyObject *longobj = key;
+            PyObject *type = PyTuple_GET_ITEM(val, 0);
+            PyObject *encfunc = PyTuple_GET_ITEM(val, 1);
+            PyObject *decfunc = PyTuple_GET_ITEM(val, 2);
+
+            if (!PyLong_CheckExact(longobj))
+            {
+                Py_DECREF(ext);
+                return PyErr_Format(PyExc_TypeError, "Expected dict keys to be of type 'int', but got an object of type '%s'", Py_TYPE(longobj)->tp_name);
+            }
+
+            long long_id = PyLong_AS_LONG(longobj);
+
+            if (long_id < -128 || long_id > 127)
+            {
+                Py_DECREF(ext);
+                return PyErr_Format(PyExc_ValueError, "Expected type IDs to be between -128 and 127, but got an ID of %zi", long_id);
+            }
+
+            char id = (char)long_id;
+
+            if (!PyType_CheckExact(type) || !PyCallable_Check(encfunc) || !PyCallable_Check(decfunc))
+            {
+                Py_DECREF(ext);
+                return PyErr_Format(PyExc_TypeError, "Expected dict tuples to hold a type object, a callable, and another callable (in respective order),"
+                    "but got items of type '%s', '%s', and '%s'", Py_TYPE(type)->tp_name, Py_TYPE(encfunc)->tp_name, Py_TYPE(decfunc)->tp_name);
+            }
+
+            if (!extensions_add_encode_internal(ext, id, type, encfunc) ||
+                !extensions_add_decode_internal(ext, id, decfunc))
+            {
+                Py_DECREF(ext);
+                return NULL;
+            }
         }
-
-        const long id = PyLong_AS_LONG(key);
-
-        if (id < -128 || id > 127)
-        {
-            Py_DECREF(obj);
-            PyErr_Format(PyExc_ValueError, "IDs are only allowed to range between -128 and 127, got %i", id);
-            return NULL;
-        }
-
-        // Index is the ID plus 128, to range from 0 to 255 for indexing
-        const uint8_t idx = (uint8_t)id;
-
-        // Set the reads function to the correct ID
-        obj->reads[idx] = val;
-
-        Py_INCREF(val);
     }
 
-    return (PyObject *)obj;
+    return (PyObject *)ext;
 }
 
-static void ext_types_encode_dealloc(ext_types_encode_t *obj)
+static void ExtDictItem_dealloc(ext_dictitem_t *item)
 {
-    size_t npairs;
-    pair_t *pairs = hashtable_get_pairs(obj->table, &npairs);
-
-    for (size_t i = 0; i < npairs; ++i)
-    {
-        Py_DECREF(pairs[i].key);
-        Py_DECREF(pairs[i].val);
-    }
-
-    hashtable_destroy(obj->table);
-
-    PyObject_Del(obj);
+    Py_DECREF(item->func);
+    PyObject_Del(item);
 }
 
-static void ext_types_decode_dealloc(ext_types_decode_t *obj)
+static void extensions_dealloc(extensions_t *ext)
 {
-    // Decref all objects stored in the read slots
-    for (size_t i = 0; i < EXT_TABLE_SLOTS; ++i)
-    {
-        Py_XDECREF(obj->reads[i]);
-    }
-
-    PyObject_Del(obj);
-}
-
-static PyObject *ext_decode_pull(ext_types_decode_t *obj, const int8_t id)
-{
-    const uint8_t idx = (uint8_t)id;
-
-    // Return the reads object located on the index. Will be NULL if it doesn't exist
-    return obj->reads[idx];
-}
-
-// Attempt to convert any object to bytes using an ext object. Returns a tuple to be decremented after copying data from PTR, or NULL on failure
-static PyObject *any_to_ext(buffer_t *b, PyObject *obj, int8_t *id, char **ptr, size_t *size)
-{
-    // Return NULL if we don't have ext types
-    if (b->config.ext == NULL)
-        return NULL;
+    // Decref the dict and all registered functions
+    Py_DECREF(ext->data.dict);
     
-    // Attempt to find the encoding function assigned to this type
-    pair_t *pair = hashtable_pull(((ext_types_encode_t *)b->config.ext)->table, Py_TYPE(obj));
-    if (pair == NULL)
-    {
-        // Attempt to match the parent type
-        pair = hashtable_pull(((ext_types_encode_t *)b->config.ext)->table, Py_TYPE(obj)->tp_base);
+    for (size_t i = 0; i < 256; ++i)
+        Py_XDECREF(ext->funcs[i]);
 
-        // No match against parent type either
-        if (pair == NULL)
-            return PyErr_Format(PyExc_ValueError, "Received unsupported type: '%s'", Py_TYPE(obj)->tp_name);
-    }
-    
-    // Call the function and get what it returns
-    PyObject *result = PyObject_CallOneArg((PyObject *)pair->val, obj);
-    NULLCHECK(result);
-    
-    if (!PyBytes_CheckExact(result))
-    {
-        Py_DECREF(result);
-
-        PyErr_Format(PyExc_TypeError, "Expected to receive a bytes object from an ext type encode function, got return argument of type '%s'", Py_TYPE(result)->tp_name);
-        return NULL;
-    }
-
-    *id = (int8_t)((uintptr_t)pair->extra);
-    *size = PyBytes_GET_SIZE(result);
-    *ptr = PyBytes_AS_STRING(result);
-
-    if (*size == 0)
-    {
-        Py_DECREF(result);
-        PyErr_SetString(PyExc_ValueError, "Ext types do not support zero-length data");
-        return NULL;
-    }
-
-    return result;
+    PyObject_Del(ext);
 }
 
-static PyObject *ext_to_any(buffer_t *b, const int8_t id, const size_t size)
+static PyObject *extensions_get_passmemview(extensions_t *ext, void *closure)
 {
-    if (b->config.ext == NULL)
-        return NULL;
+    return ext->data.pass_memview == true ? Py_True : Py_False;
+}
 
-    PyObject *func = ext_decode_pull(b->config.ext, id);
+static PyObject *extensions_set_passmemview(extensions_t *ext, PyObject *arg, void *closure)
+{
+    ext->data.pass_memview = arg == Py_True;
+    Py_RETURN_NONE;
+}
 
-    if (func == NULL)
+// Attempt to encode an object as an ext type. Returns the object from the type's encode function
+static _always_inline PyObject *attempt_encode_ext(buffer_t *b, PyObject *obj, char *id)
+{
+    // We're guaranteed to have an ExtTypesEncode object due to the global one
+
+    // Attempt to get an item for all subclasses of OBJ, up until Type
+    ext_dictitem_t *item = NULL;
+    PyTypeObject *type = Py_TYPE(obj);
+    while (type != &PyType_Type)
     {
-        PyErr_Format(PyExc_ValueError, "Could not match an ext function for decoding on id %i", id);
-        return NULL;
+        item = (ext_dictitem_t *)PyDict_GetItem(b->ext.dict, (PyObject *)type);
+
+        if (item)
+            break;
+        
+        type = Py_TYPE(type);
     }
 
-    // Either create bytes or a memoryview object based on what the user wants
-    PyObject *arg;
-    if (((ext_types_decode_t *)b->config.ext)->argtype == &PyMemoryView_Type)
+    // If we didn't find an item, the object is of an invalid type
+    if (!item)
+        return PyErr_Format(PyExc_TypeError, "Received unsupported type '%s'"
+            "\n\tHint: Did you mean to add this type to the Extension Types?", Py_TYPE(obj)->tp_name);
+    
+    *id = item->id;
+    
+    // Call the function for encoding data and return the result
+    return PyObject_CallOneArg(item->func, obj);
+}
+
+// Attempt to decode an ext type object. Returns the object from the type's decode function
+static _always_inline PyObject *attempt_decode_ext(buffer_t *b, char *buf, size_t size, char id)
+{
+    // We're guaranteed to have an ExtTypesDecode object due to the global one
+
+    // See if there's a function for this ID
+    PyObject *func = b->ext.funcs[(unsigned char)id];
+
+    if (!func)
+        return PyErr_Format(PyExc_TypeError, "Found an extension type with ID %i, but no function was registered for this ID"
+            "\n\tHint: Did you forget to add a decoding function to the extension types, or is there a mismatch between IDs?", id);
+    
+    // Decide if we should return a bytes or memoryview object
+    PyObject *bufobj;
+
+    if (b->ext.pass_memview)
     {
-        arg = PyMemoryView_FromMemory(b->offset, (Py_ssize_t)size, PyBUF_READ);
+        bufobj = PyMemoryView_FromMemory(buf, (Py_ssize_t)size, PyBUF_READ);
     }
     else
     {
-        arg = PyBytes_FromStringAndSize(b->offset, (Py_ssize_t)size);
+        bufobj = PyBytes_FromStringAndSize(buf, (Py_ssize_t)size);
     }
-    
-    if (arg == NULL)
+
+    if (!bufobj)
         return PyErr_NoMemory();
+    
+    // Call the decode function
+    PyObject *result = PyObject_CallOneArg(func, bufobj);
 
-    b->offset += size;
-
-    // Call the function, passing the memoryview to it, and return its result
-    PyObject *result = PyObject_CallOneArg(func, arg);
-
-    Py_DECREF(arg);
+    Py_DECREF(bufobj);
     return result;
 }
 
@@ -753,7 +861,7 @@ static _always_inline PyObject *map_to_py(buffer_t *b, const size_t npairs)
 
             const size_t size = mask & 0b11111;
 
-            key = fixstr_to_py(b->offset, size, &b->config.states->caches.strings);
+            key = fixstr_to_py(b->offset, size, &b->states->caches.strings);
             b->offset += size;
         }
         else
@@ -812,7 +920,7 @@ static _always_inline PyObject *map_to_py(buffer_t *b, const size_t npairs)
 #define OVERREAD_CHECK(to_add) do { \
     if (b->offset + to_add > b->maxoffset) \
     { \
-        if (b->config.fdata != NULL) \
+        if (b->fdata != NULL) \
         { \
             NULLCHECK(decoder_streaming_refresh(b, to_add)); \
         } \
@@ -903,9 +1011,31 @@ static _always_inline void py_str_data(PyObject *obj, char **base, size_t *size)
     }
 }
 
-// Write string without the data fetching part
-static _always_inline bool _write_string(buffer_t *b, char *base, size_t size)
+static _always_inline bool write_string(buffer_t *b, PyObject *obj)
 {
+    // Fast path for common cases
+    if (PyUnicode_IS_COMPACT_ASCII(obj) && ((PyASCIIObject *)obj)->length <= (Py_ssize_t)LIMIT_STR_FIXED)
+    {
+        char *base = (char *)(((PyASCIIObject *)obj) + 1);
+        size_t size = ((PyASCIIObject *)obj)->length;
+
+        ENSURE_SPACE(1 + LIMIT_STR_FIXED);
+
+        write_mask(b, DT_STR_FIXED, size, 0);
+
+        memcpy(b->offset, base, size);
+        b->offset += size;
+
+        return true;
+    }
+
+    char *base;
+    size_t size;
+    py_str_data(obj, &base, &size);
+
+    if (base == NULL)
+        return false;
+    
     ENSURE_SPACE(size + 5);
 
     if (size <= LIMIT_STR_FIXED)
@@ -934,34 +1064,6 @@ static _always_inline bool _write_string(buffer_t *b, char *base, size_t size)
     b->offset += size;
 
     return true;
-}
-
-static _always_inline bool write_string(buffer_t *b, PyObject *obj)
-{
-    // Fast path for common cases
-    if (PyUnicode_IS_COMPACT_ASCII(obj) && ((PyASCIIObject *)obj)->length <= (Py_ssize_t)LIMIT_STR_FIXED)
-    {
-        char *base = (char *)(((PyASCIIObject *)obj) + 1);
-        size_t size = ((PyASCIIObject *)obj)->length;
-
-        ENSURE_SPACE(1 + LIMIT_STR_FIXED);
-
-        write_mask(b, DT_STR_FIXED, size, 0);
-
-        memcpy(b->offset, base, size);
-        b->offset += size;
-
-        return true;
-    }
-
-    char *base;
-    size_t size;
-    py_str_data(obj, &base, &size);
-
-    if (base == NULL)
-        return false;
-
-    return _write_string(b, base, size);
 }
 
 // Separate for writing binary
@@ -1246,8 +1348,15 @@ static _always_inline bool write_nil(buffer_t *b, PyObject *obj)
     return true;
 }
 
-static _always_inline bool write_array_header(buffer_t *b, size_t nitems)
+// Used for writing array types
+static bool write_array(buffer_t *b, PyObject **items, size_t nitems)
 {
+    if (++(b->recursion) > RECURSION_LIMIT)
+    {
+        PyErr_SetString(PyExc_RecursionError, "Exceeded the maximum recursion depth");
+        return false;
+    }
+
     ENSURE_SPACE(5);
 
     if (nitems <= LIMIT_ARR_FIXED)
@@ -1267,20 +1376,6 @@ static _always_inline bool write_array_header(buffer_t *b, size_t nitems)
         error_size_limit(Array, nitems);
         return false;
     }
-
-    return true;
-}
-
-// Used for writing array types
-static bool write_array(buffer_t *b, PyObject **items, size_t nitems)
-{
-    if (++(b->recursion) > RECURSION_LIMIT)
-    {
-        PyErr_SetString(PyExc_RecursionError, "Exceeded the maximum recursion depth");
-        return false;
-    }
-
-    NULLCHECK(write_array_header(b, nitems));
 
     for (size_t i = 0; i < nitems; ++i)
     {
@@ -1309,8 +1404,16 @@ static _always_inline bool write_tuple(buffer_t *b, PyObject *obj)
     return write_array(b, items, nitems);
 }
 
-static _always_inline bool write_map_header(buffer_t *b, size_t npairs)
+static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
 {
+    if (++(b->recursion) > RECURSION_LIMIT)
+    {
+        PyErr_SetString(PyExc_RecursionError, "Exceeded the maximum recursion depth");
+        return false;
+    }
+
+    const size_t npairs = PyDict_GET_SIZE(obj);
+
     ENSURE_SPACE(5);
     
     if (npairs <= LIMIT_MAP_FIXED)
@@ -1330,21 +1433,6 @@ static _always_inline bool write_map_header(buffer_t *b, size_t npairs)
         error_size_limit(Map, npairs);
         return false;
     }
-
-    return true;
-}
-
-static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
-{
-    if (++(b->recursion) > RECURSION_LIMIT)
-    {
-        PyErr_SetString(PyExc_RecursionError, "Exceeded the maximum recursion depth");
-        return false;
-    }
-
-    const size_t npairs = PyDict_GET_SIZE(obj);
-
-    NULLCHECK(write_map_header(b, npairs));
 
     Py_ssize_t pos = 0;
     for (size_t i = 0; i < npairs; ++i)
@@ -1372,25 +1460,27 @@ static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
 
 static _always_inline bool write_extension(buffer_t *b, PyObject *obj)
 {
-    int8_t id;
-    char *ptr;
-    size_t size;
+    // Attempt to encode the object as an extension type
+    char id;
+    PyObject *result = attempt_encode_ext(b, obj, &id);
 
-    PyObject *result = any_to_ext(b, obj, &id, &ptr, &size);
-
-    if (result == NULL)
+    if (!result)
+        return false;
+    
+    Py_buffer buf;
+    if (PyObject_GetBuffer(result, &buf, PyBUF_SIMPLE) < 0)
     {
-        // Error might not be set, so default to unsupported type error
-        if (!PyErr_Occurred())
-            PyErr_Format(PyExc_TypeError, "Received unsupported type: '%s'", Py_TYPE(obj)->tp_name);
-        
+        PyErr_Format(PyExc_TypeError, "Expected to receive a bytes-like object from extension encode functions, but got an object of type '%s'", Py_TYPE(result)->tp_name);
+        Py_DECREF(result);
         return false;
     }
+
+    size_t size = (size_t)buf.len;
 
     ENSURE_SPACE(6 + size);
 
     // If the size is a base of 2 and not larger than 16, it can be represented with a fixsize mask
-    const bool is_baseof2 = (size & (size - 1)) == 0;
+    const bool is_baseof2 = size != 0 && (size & (size - 1)) == 0;
     if (size <= 16 && is_baseof2)
     {
         const unsigned char fixmask = (
@@ -1425,9 +1515,10 @@ static _always_inline bool write_extension(buffer_t *b, PyObject *obj)
 
     INCBYTE = id;
 
-    memcpy(b->offset, ptr, size);
+    memcpy(b->offset, buf.buf, size);
     b->offset += size;
 
+    PyBuffer_Release(&buf);
     Py_DECREF(result);
 
     return true;
@@ -1508,14 +1599,14 @@ static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char 
         mask &= 0x1F;
         OVERREAD_CHECK(mask);
 
-        PyObject *obj = fixstr_to_py(b->offset, mask, &b->config.states->caches.strings);
+        PyObject *obj = fixstr_to_py(b->offset, mask, &b->states->caches.strings);
         b->offset += mask;
 
         return obj;
     }
     else if ((mask & 0x80) == DT_UINT_FIXED) // uint only has upper bit set to 0
     {
-        return (PyObject *)&b->config.states->caches.integers[mask + 128];
+        return (PyObject *)&b->states->caches.integers[mask + INTEGER_CACHE_NNEG];
     }
     else if (fixmask == DT_INT_FIXED)
     {
@@ -1524,7 +1615,7 @@ static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char 
         if ((num & 0b10000) == 0b10000)
             num |= ~0b11111;
 
-        return (PyObject *)&b->config.states->caches.integers[num + 128];
+        return (PyObject *)&b->states->caches.integers[num + INTEGER_CACHE_NNEG];
     }
     else if ((mask & 0b11110000) == DT_ARR_FIXED) // Bit 5 is also set on ARR and MAP
     {
@@ -1581,7 +1672,7 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
 
         uint8_t num = SIZEBYTE;
 
-        return (PyObject *)&b->config.states->caches.integers[num + 128];
+        return (PyObject *)&b->states->caches.integers[num + INTEGER_CACHE_NNEG];
     }
     case VARLEN_DT(DT_UINT_BIT16):
     {
@@ -1591,7 +1682,7 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
         num |= SIZEBYTE;
 
         if (num <= 1023)
-            return (PyObject *)&b->config.states->caches.integers[num + 128];
+            return (PyObject *)&b->states->caches.integers[num + INTEGER_CACHE_NNEG];
         
         return PyLong_FromUnsignedLongLong(num);
     }
@@ -1626,7 +1717,7 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
 
         int8_t num = SIZEBYTE;
 
-        return (PyObject *)&b->config.states->caches.integers[num + 128];
+        return (PyObject *)&b->states->caches.integers[num + 128];
     }
     case VARLEN_DT(DT_INT_BIT16):
     {
@@ -1808,11 +1899,12 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
         ext_handling: // For fixsize cases
         NULL; // No-op statement for pre-C23 standards (declarations not allowed after labels)
 
-        const int8_t id = SIZEBYTE;
+        const char id = SIZEBYTE;
 
         OVERREAD_CHECK(n);
 
-        PyObject *obj = ext_to_any(b, id, n);
+        PyObject *obj = attempt_decode_ext(b, b->offset, n, id);
+        b->offset += n;
 
         if (obj == NULL)
         {
@@ -1946,12 +2038,15 @@ static _always_inline void update_adaptive_allocation(buffer_t *b, size_t nitems
 }
 
 // Start encoding with an encbuffer
-static PyObject *encbuffer_start(bufconfig_t config, PyObject *obj)
+static _always_inline PyObject *encbuffer_start(PyObject *obj, ext_data_t ext, mstates_t *states)
 {
     size_t nitems;
     buffer_t b;
 
-    b.config = config;
+    // Assign all standard fields
+    b.ext.dict = ext.dict;
+    b.states = states;
+    b.fdata = NULL; // File data doesn't go through here, so always NULL
     b.recursion = 0;
 
     // Prepare the encode buffer
@@ -1995,27 +2090,30 @@ static bool encbuffer_expand(buffer_t *b, size_t extra)
 
 
 // Start decoding with a decbuffer (not used with streaming)
-static _always_inline PyObject *decbuffer_start(bufconfig_t config, PyObject *encoded)
+static _always_inline PyObject *decbuffer_start(PyObject *encoded, ext_data_t ext, mstates_t *states)
 {
     buffer_t b;
 
+    // Assign the standard data
+    b.ext.funcs = ext.funcs;
+    b.ext.pass_memview = ext.pass_memview;
+    b.states = states;
+    b.fdata = NULL; // File data doesn't go through here, so always NULL
+
     // Get a buffer of the encoded data buffer
-    Py_buffer buffer;
-    if (PyObject_GetBuffer(encoded, &buffer, PyBUF_SIMPLE) != 0)
+    Py_buffer buf;
+    if (PyObject_GetBuffer(encoded, &buf, PyBUF_SIMPLE) != 0)
     {
         PyErr_SetString(PyExc_BufferError, "Unable to open a buffer of the received encoded data.");
         return NULL;
     }
     
-    b.base = buffer.buf;
-    b.offset = b.base;
-    b.maxoffset = b.base + buffer.len;
-
-    b.config = config;
+    b.offset = buf.buf;
+    b.maxoffset = buf.buf + buf.len;
 
     PyObject *result = decode_bytes(&b);
 
-    PyBuffer_Release(&buffer);
+    PyBuffer_Release(&buf);
 
     // Check if we reached the end of the buffer
     if (result != NULL && b.offset != b.maxoffset)
@@ -2034,52 +2132,44 @@ static _always_inline PyObject *decbuffer_start(bufconfig_t config, PyObject *en
 
 static PyObject *encode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
 {
-    const Py_ssize_t npos = 1;
-    min_positional(nargs, npos);
+    const Py_ssize_t npositional = 1;
+    min_positional(nargs, npositional);
 
     PyObject *obj = parse_positional(args, 0, NULL, "obj");
     NULLCHECK(obj);
 
-    bufconfig_t config;
-
-    // Default config values
-    config.states = get_mstates(self);
-    config.fdata = NULL;
-    config.ext = NULL;
+    mstates_t *states = get_mstates(self);
+    extensions_t *ext = &states->extensions;
 
     keyarg_t keyargs[] = {
-        KEYARG(&config.ext, &ExtTypesEncodeObj, config.states->interned.ext_types),
+        KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
-    if (!parse_keywords(npos, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
+    if (!parse_keywords(npositional, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
         return NULL;
 
-    return encbuffer_start(config, obj);
+    return encbuffer_start(obj, ext->data, states);
 }
 
 static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
 {
-    const Py_ssize_t npos = 1;
-    min_positional(nargs, npos);
+    const Py_ssize_t npositional = 1;
+    min_positional(nargs, npositional);
 
     PyObject *encoded = parse_positional(args, 0, NULL, "encoded");
     NULLCHECK(encoded);
 
-    bufconfig_t config;
-
-    // Default config values
-    config.states = get_mstates(self);
-    config.fdata = NULL;
-    config.ext = NULL;
+    mstates_t *states = get_mstates(self);
+    extensions_t *ext = &states->extensions;
 
     keyarg_t keyargs[] = {
-        KEYARG(&config.ext, &ExtTypesDecodeObj, config.states->interned.ext_types),
+        KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
-    if (!parse_keywords(npos, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
+    if (!parse_keywords(npositional, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
         return NULL;
 
-    return decbuffer_start(config, encoded);
+    return decbuffer_start(encoded, ext->data, states);
 }
 
 
@@ -2089,28 +2179,28 @@ static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
 
 static PyObject *Encoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
 {
-    PyObject *filename = NULL;
-    PyObject *ext = NULL;
-
     mstates_t *states = get_mstates(self);
+
+    PyObject *filename = NULL;
+    extensions_t *ext = &states->extensions;
 
     keyarg_t keyargs[] = {
         KEYARG(&filename, &PyUnicode_Type, states->interned.file_name),
-        KEYARG(&ext, &ExtTypesEncodeObj, states->interned.ext_types),
+        KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
     NULLCHECK(parse_keywords(0, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
 
 
-    // Create the Encoder
-    hookobj_t *enc = PyObject_New(hookobj_t, &EncoderObj);
+    // Create the class object
+    classobj_t *enc = PyObject_New(classobj_t, &EncoderObj);
     if (enc == NULL)
         return PyErr_NoMemory();
     
-    // Set the buffer configs
-    enc->config.ext = ext;
-    enc->config.fdata = NULL;
-    enc->config.states = get_mstates(self);
+    enc->ext = (PyObject *)ext;
+    enc->ext_data = ext->data;
+    enc->states = states;
+    enc->fdata = NULL;
 
     // Check if we got a filename
     if (filename != NULL)
@@ -2127,9 +2217,9 @@ static PyObject *Encoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
         }
 
         // Allocate the fdata object with space for the string (+1 for null terminator)
-        enc->config.fdata = (filedata_t *)PyObject_Malloc(sizeof(filedata_t) + strsize + 1);
+        enc->fdata = (filedata_t *)PyObject_Malloc(sizeof(filedata_t) + strsize + 1);
 
-        if (enc->config.fdata == NULL)
+        if (enc->fdata == NULL)
         {
             PyObject_Del(enc);
 
@@ -2138,52 +2228,52 @@ static PyObject *Encoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
         }
 
         // Copy the string name into the fdata object and null-terminate it
-        memcpy(enc->config.fdata->name, str, strsize);
-        enc->config.fdata->name[strsize] = 0;
+        memcpy(enc->fdata->name, str, strsize);
+        enc->fdata->name[strsize] = 0;
 
         // Open the file in advance
-        enc->config.fdata->file = fopen(enc->config.fdata->name, "ab");
-        if (enc->config.fdata->file == NULL)
+        enc->fdata->file = fopen(enc->fdata->name, "ab");
+        if (enc->fdata->file == NULL)
         {
             const int err = errno;
-            error_cannot_open_file(enc->config.fdata->name, err);
+            error_cannot_open_file(enc->fdata->name, err);
             return NULL;
         }
 
         // Disable buffering because we already write in chunks
-        setvbuf(enc->config.fdata->file, NULL, _IONBF, 0);
+        setvbuf(enc->fdata->file, NULL, _IONBF, 0);
     }
 
     // Keep reference to the ext object
-    Py_XINCREF(ext);
+    Py_INCREF(ext);
 
     return (PyObject *)enc;
 }
 
 static PyObject *Decoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
 {
-    PyObject *filename = NULL;
-    PyObject *ext = NULL;
-
     mstates_t *states = get_mstates(self);
+
+    PyObject *filename = NULL;
+    extensions_t *ext = &states->extensions;
 
     keyarg_t keyargs[] = {
         KEYARG(&filename, &PyUnicode_Type, states->interned.file_name),
-        KEYARG(&ext, &ExtTypesDecodeObj, states->interned.ext_types),
+        KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
     NULLCHECK(parse_keywords(0, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
 
 
-    // Create the Decoder
-    hookobj_t *dec = PyObject_New(hookobj_t, &DecoderObj);
+    // Create the Decoder object
+    classobj_t *dec = PyObject_New(classobj_t, &DecoderObj);
     if (dec == NULL)
         return PyErr_NoMemory();
     
-    // Set buffer configurations
-    dec->config.ext = ext;
-    dec->config.fdata = NULL;
-    dec->config.states = get_mstates(self);
+    dec->ext = (PyObject *)ext;
+    dec->ext_data = ext->data;
+    dec->states = states;
+    dec->fdata = NULL;
 
     // Check if we received a filename
     if (filename != NULL)
@@ -2200,9 +2290,9 @@ static PyObject *Decoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
         }
 
         // Allocate a fdata object with space for the string
-        dec->config.fdata = (filedata_t *)PyObject_Malloc(sizeof(filedata_t) + strsize + 1);
+        dec->fdata = (filedata_t *)PyObject_Malloc(sizeof(filedata_t) + strsize + 1);
 
-        if (dec->config.fdata == NULL)
+        if (dec->fdata == NULL)
         {
             PyObject_Del(dec);
 
@@ -2211,69 +2301,69 @@ static PyObject *Decoder(PyObject *self, PyObject **args, Py_ssize_t nargs, PyOb
         }
         
         // Copy the name into the name buffer and null-terminate
-        memcpy(dec->config.fdata->name, str, strsize);
-        dec->config.fdata->name[strsize] = 0;
+        memcpy(dec->fdata->name, str, strsize);
+        dec->fdata->name[strsize] = 0;
 
         // Open the file in advance
-        dec->config.fdata->file = fopen(dec->config.fdata->name, "rb");
+        dec->fdata->file = fopen(dec->fdata->name, "rb");
 
-        if (dec->config.fdata->file == NULL)
+        if (dec->fdata->file == NULL)
         {
             Py_DECREF(dec);
 
             const int err = errno;
-            return error_cannot_open_file(dec->config.fdata->name, err);
+            return error_cannot_open_file(dec->fdata->name, err);
         }
 
         // Disable buffering
-        setvbuf(dec->config.fdata->file, NULL, _IONBF, 0);
+        setvbuf(dec->fdata->file, NULL, _IONBF, 0);
     }
 
-    Py_XINCREF(ext);
+    Py_INCREF(ext);
 
     return (PyObject *)dec;
 }
 
-static PyObject *encoder_encode(hookobj_t *enc, PyObject *obj)
+static PyObject *encoder_encode(classobj_t *enc, PyObject *obj)
 {
-    // Check if the file is closed when streaming
-    if (enc->config.fdata != NULL && enc->config.fdata->file == NULL)
-    {
-        enc->config.fdata->file = fopen(enc->config.fdata->name, "ab");
-
-        if (enc->config.fdata->file == NULL)
-        {
-            const int err = errno;
-            return error_cannot_open_file(enc->config.fdata->name, err);
-        }
-    }
-
-    PyBytesObject *result = (PyBytesObject *)encbuffer_start(enc->config, obj);
+    PyBytesObject *result = (PyBytesObject *)encbuffer_start(obj, enc->ext_data, enc->states);
     NULLCHECK(result);
 
     // Simply return the result if we're not streaming
-    if (enc->config.fdata == NULL)
+    if (enc->fdata == NULL)
         return (PyObject *)result;
     
     // Otherwise stream the data to a file
+
+    // Check if the file is closed
+    if (enc->fdata->file == NULL)
+    {
+        enc->fdata->file = fopen(enc->fdata->name, "ab");
+
+        if (enc->fdata->file == NULL)
+        {
+            const int err = errno;
+            return error_cannot_open_file(enc->fdata->name, err);
+        }
+    }
 
     const size_t size = PyBytes_GET_SIZE(result);
 
     // Check if all data is written to the file, otherwise truncate up until data that was written incompletely
     size_t written;
-    if (size != (written = fwrite(PyBytes_AS_STRING(result), 1, size, enc->config.fdata->file)))
+    if (size != (written = fwrite(PyBytes_AS_STRING(result), 1, size, enc->fdata->file)))
     {
-        PyErr_Format(PyExc_OSError, "Failed to write encoded data to file '%s'. A partial read might have occurred, which is attempted to be fixed.", enc->config.fdata->name);
+        PyErr_Format(PyExc_OSError, "Failed to write encoded data to file '%s'. A partial read might have occurred, which is attempted to be fixed.", enc->fdata->name);
 
         // Attempt to truncate the file
-        if (_ftruncate_and_close(enc->config.fdata->file, ftell(enc->config.fdata->file) - written, enc->config.fdata->name) != 0)
+        if (_ftruncate_and_close(enc->fdata->file, ftell(enc->fdata->file) - written, enc->fdata->name) != 0)
         {
             // Set file to NULL to prevent invalid pointer errors, and trigger re-opening on a new write
-            enc->config.fdata->file = NULL;
+            enc->fdata->file = NULL;
 
             const int err = errno;
             PyErr_Print(); // Print previous error
-            PyErr_Format(PyExc_OSError, "Truncating the file back to its old size failed, leaving partially written or corrupt data in file '%s'. Received errno %i: %s", enc->config.fdata->name, err, strerror(err));
+            PyErr_Format(PyExc_OSError, "Truncating the file back to its old size failed, leaving partially written or corrupt data in file '%s'. Received errno %i: %s", enc->fdata->name, err, strerror(err));
         }
 
         return NULL;
@@ -2283,19 +2373,19 @@ static PyObject *encoder_encode(hookobj_t *enc, PyObject *obj)
 }
 
 // Check if we read nothing, throw appropriate error if so
-static _always_inline bool nowrite_check(buffer_t *b, const size_t read)
+static _always_inline bool noread_check(buffer_t *b, const size_t read)
 {
     if (read == 0)
     {
         // Check if it's an EOF or something different
-        if (feof(b->config.fdata->file))
+        if (feof(b->fdata->file))
         {
-            PyErr_Format(PyExc_EOFError, "Unable to read data from file '%s', reached End Of File (EOF)", b->config.fdata->name);
+            PyErr_Format(PyExc_EOFError, "Unable to read data from file '%s', reached End Of File (EOF)", b->fdata->name);
         }
         else
         {
             const int err = errno;
-            PyErr_Format(PyExc_OSError, "Unable to read data from file '%s', received errno %i: '%s'", b->config.fdata->name, err, strerror(err));
+            PyErr_Format(PyExc_OSError, "Unable to read data from file '%s', received errno %i: '%s'", b->fdata->name, err, strerror(err));
         }
 
         return false;
@@ -2306,10 +2396,10 @@ static _always_inline bool nowrite_check(buffer_t *b, const size_t read)
 
 #define DECBUFFER_DEFAULTSIZE 4096
 
-static PyObject *decoder_decode(hookobj_t *dec, PyObject **args, Py_ssize_t nargs)
+static PyObject *decoder_decode(classobj_t *dec, PyObject **args, Py_ssize_t nargs)
 {
     // Separate case for no streaming
-    if (dec->config.fdata == NULL)
+    if (dec->fdata == NULL)
     {
         // Parse arguments if not streaming
         fixed_positional(nargs, 1);
@@ -2317,14 +2407,15 @@ static PyObject *decoder_decode(hookobj_t *dec, PyObject **args, Py_ssize_t narg
         PyObject *encoded = parse_positional(args, 0, NULL, "encoded");
         NULLCHECK(encoded);
 
-        return decbuffer_start(dec->config, encoded);
+        return decbuffer_start(encoded, dec->ext_data, dec->states);
     }
 
     // Manually set up the buffer object
     buffer_t b;
-    
-    // Assign the config data
-    b.config = dec->config;
+
+    b.states = dec->states;
+    b.ext = dec->ext_data;
+    b.fdata = dec->fdata;
 
     // Set up the buffer
     b.base = (char *)malloc(DECBUFFER_DEFAULTSIZE);
@@ -2335,13 +2426,10 @@ static PyObject *decoder_decode(hookobj_t *dec, PyObject **args, Py_ssize_t narg
     b.offset = b.base;
     b.maxoffset = b.base + DECBUFFER_DEFAULTSIZE;
 
-    // Keep track of the file offset
-    //const size_t start_offset = ftell(b.config.fdata->file);
-
     // Read data from the file
-    const size_t read = fread(b.base, 1, DECBUFFER_DEFAULTSIZE, b.config.fdata->file);
+    const size_t read = fread(b.base, 1, DECBUFFER_DEFAULTSIZE, b.fdata->file);
 
-    NULLCHECK(nowrite_check(&b, read));
+    NULLCHECK(noread_check(&b, read));
 
     // Set the max offset to how far we read
     b.maxoffset = b.base + read;
@@ -2350,10 +2438,10 @@ static PyObject *decoder_decode(hookobj_t *dec, PyObject **args, Py_ssize_t narg
     PyObject *result = decode_bytes(&b);
 
     // Calculate up to where we used file data
-    const size_t end_offset = ftell(b.config.fdata->file) - (b.maxoffset - b.offset);
+    const size_t end_offset = ftell(b.fdata->file) - (b.maxoffset - b.offset);
 
     // Set the file offset at the end of the data we needed, so that it starts at the new data
-    fseek(b.config.fdata->file, end_offset, SEEK_SET);
+    fseek(b.fdata->file, end_offset, SEEK_SET);
 
     // Free the internal buffer
     free(b.base);
@@ -2368,7 +2456,7 @@ static bool decoder_streaming_refresh(buffer_t *b, const size_t requested)
     const size_t reread = (size_t)(b->maxoffset - b->offset);
 
     // Set the file cursor back to where we have to reread from
-    fseek(b->config.fdata->file, -reread, SEEK_CUR);
+    fseek(b->fdata->file, -reread, SEEK_CUR);
 
     // Check if the requested size is larger than the entire buffer
     if (requested > (size_t)(b->maxoffset - b->base))
@@ -2391,9 +2479,9 @@ static bool decoder_streaming_refresh(buffer_t *b, const size_t requested)
 
     // Read new data into the buffer
     const size_t to_read = b->maxoffset - b->base;
-    const size_t read = fread(b->base, 1, to_read, b->config.fdata->file);
+    const size_t read = fread(b->base, 1, to_read, b->fdata->file);
 
-    NULLCHECK(nowrite_check(b, read));
+    NULLCHECK(noread_check(b, read));
 
     // Update the offsets
     b->offset = b->base;
@@ -2402,38 +2490,21 @@ static bool decoder_streaming_refresh(buffer_t *b, const size_t requested)
     return true;
 }
 
-static void encoder_dealloc(hookobj_t *enc)
+static void classobj_dealloc(classobj_t *enc)
 {
-    Py_XDECREF(enc->config.ext);
+    Py_XDECREF(enc->ext);
 
-    if (enc->config.fdata != NULL)
+    if (enc->fdata != NULL)
     {
         // Check if a file is open
-        if (enc->config.fdata->file)
-                fclose(enc->config.fdata->file);
+        if (enc->fdata->file)
+                fclose(enc->fdata->file);
         
         // Free the fdata object itself
-        PyObject_Free(enc->config.fdata);
+        PyObject_Free(enc->fdata);
     }
 
     PyObject_Del(enc);
-}
-
-static void decoder_dealloc(hookobj_t *dec)
-{
-    Py_XDECREF(dec->config.ext);
-
-    if (dec->config.fdata != NULL)
-    {
-        // Check if a file is open
-        if (dec->config.fdata->file)
-                fclose(dec->config.fdata->file);
-        
-        // Free the fdata object itself
-        PyObject_Free(dec->config.fdata);
-    }
-
-    PyObject_Del(dec);
 }
 
 
@@ -2456,11 +2527,17 @@ static bool setup_mstates(PyObject *m)
 {
     mstates_t *s = get_mstates(m);
 
+    /* INTERNED STRINGS */
+
     // Create interned strings
     GET_ISTR(obj)
-    GET_ISTR(ext_types)
     GET_ISTR(file_name)
+    GET_ISTR(types)
+    GET_ISTR(extensions)
+    GET_ISTR(allow_subclasses)
+    GET_ISTR(pass_memoryview)
 
+    /* CACHES */
 
     // NULL-initialize the string cache
     memset(s->caches.strings.strings, 0, sizeof(s->caches.strings.strings));
@@ -2480,19 +2557,25 @@ static bool setup_mstates(PyObject *m)
     // Dummy objects to copy into the cache
     PyLongObject *dummylong_pos = (PyLongObject *)PyLong_FromLong(1);
     PyLongObject *dummylong_neg = (PyLongObject *)PyLong_FromLong(-1);
+    PyLongObject *dummylong_zero = (PyLongObject *)PyLong_FromLong(0);
+
+    if (!dummylong_pos || !dummylong_neg || !dummylong_zero)
+        return PyErr_NoMemory();
 
     // Temporarily make them immortal
     Py_ssize_t dummylong_pos_refcnt = Py_REFCNT(dummylong_pos);
     Py_ssize_t dummylong_neg_refcnt = Py_REFCNT(dummylong_neg);
+    Py_ssize_t dummylong_zero_refcnt = Py_REFCNT(dummylong_zero);
     Py_SET_REFCNT(dummylong_pos, _Py_IMMORTAL_REFCNT);
     Py_SET_REFCNT(dummylong_neg, _Py_IMMORTAL_REFCNT);
+    Py_SET_REFCNT(dummylong_zero, _Py_IMMORTAL_REFCNT);
     
     // First store the negative values
-    for (size_t i = 0; i < 128; ++i)
+    for (size_t i = 0; i < INTEGER_CACHE_NNEG; ++i)
     {
         s->caches.integers[i] = *dummylong_neg;
 
-        digit val = 128 - i;
+        digit val = INTEGER_CACHE_NNEG - i;
 
         // Negative values are stored as positive
         #if PYVER12
@@ -2501,10 +2584,14 @@ static bool setup_mstates(PyObject *m)
         s->caches.integers[i].ob_digit[0] = val;
         #endif
     }
+
+    // Store the zero object
+    s->caches.integers[INTEGER_CACHE_NNEG] = *dummylong_zero;
     
-    for (size_t i = 0; i < 1024; ++i)
+    // Then store positive values
+    for (size_t i = 1; i < INTEGER_CACHE_SLOTS - INTEGER_CACHE_NNEG; ++i)
     {
-        size_t idx = i + 128;
+        size_t idx = i + INTEGER_CACHE_NNEG; // Skip over negatives and zero
 
         s->caches.integers[idx] = *dummylong_pos;
 
@@ -2519,9 +2606,34 @@ static bool setup_mstates(PyObject *m)
     // Restore the dummy refcount
     Py_SET_REFCNT(dummylong_pos, dummylong_pos_refcnt);
     Py_SET_REFCNT(dummylong_neg, dummylong_neg_refcnt);
+    Py_SET_REFCNT(dummylong_zero, dummylong_zero_refcnt);
 
     Py_DECREF(dummylong_pos);
     Py_DECREF(dummylong_neg);
+    Py_DECREF(dummylong_zero);
+
+    /* GLOBAL EXTENSION OBJECTS */
+
+    // Set the ext object type and make them immortal
+    Py_SET_TYPE((PyObject *)&s->extensions, &ExtensionsObj);
+    Py_SET_REFCNT((PyObject *)&s->extensions, _Py_IMMORTAL_REFCNT);
+
+    // Create the dict object for the encoding extension types
+    s->extensions.data.dict = PyDict_New();
+
+    if (!s->extensions.data.dict)
+        return PyErr_NoMemory();
+
+    // NULL-initialize the decode functions
+    memset(s->extensions.funcs, 0, sizeof(s->extensions.funcs));
+    s->extensions.data.funcs = s->extensions.funcs;
+
+    // Set default values
+    s->extensions.data.pass_memview = EXTENSIONS_PASSMEMVIEW_DEFAULTVAL;
+
+    // Add the global ext object to the module
+    if (PyModule_AddObjectRef(m, "extensions", (PyObject *)&s->extensions) < 0)
+        return false;
 
     return true;
 }
@@ -2535,6 +2647,13 @@ static void cleanup_mstates(PyObject *m)
     for (size_t i = 0; i < STRING_CACHE_SLOTS; ++i)
         Py_XDECREF(s->caches.strings.strings[i]);
     
+    
+    // Lose references to the global ext objects' dict and functions
+    Py_DECREF(s->extensions.data.dict);
+
+    for (size_t i = 0; i < 256; ++i)
+        Py_XDECREF(s->extensions.funcs[i]);
+    
 }
 
 
@@ -2542,25 +2661,44 @@ static void cleanup_mstates(PyObject *m)
 //   METHOD DEFS   //
 /////////////////////
 
+static PyMethodDef ExtensionsMethods[] = {
+    {"add", (PyCFunction)extensions_add, METH_FASTCALL, NULL},
+    {"add_encode", (PyCFunction)extensions_add_encode, METH_FASTCALL, NULL},
+    {"add_decode", (PyCFunction)extensions_add_decode, METH_FASTCALL, NULL},
+
+    {"remove", (PyCFunction)extensions_remove, METH_FASTCALL, NULL},
+    {"remove_encode", (PyCFunction)extensions_remove_encode, METH_O, NULL},
+    {"remove_decode", (PyCFunction)extensions_remove_decode, METH_O, NULL},
+
+    {"clear", (PyCFunction)extensions_clear, METH_NOARGS, NULL},
+    {NULL}
+};
+
+static PyGetSetDef ExtensionsGetSet[] = {
+    {"pass_memoryview", (getter)extensions_get_passmemview, (setter)extensions_set_passmemview, NULL, NULL},
+    {NULL}
+};
+
 static PyMethodDef EncoderMethods[] = {
     {"encode", (PyCFunction)encoder_encode, METH_O, NULL},
+    {NULL}
 };
 
 static PyMethodDef DecoderMethods[] = {
     {"decode", (PyCFunction)decoder_decode, METH_FASTCALL, NULL},
+    {NULL}
 };
 
 static PyMethodDef CmsgpackMethods[] = {
     {"encode", (PyCFunction)encode, METH_FASTCALL | METH_KEYWORDS, NULL},
     {"decode", (PyCFunction)decode, METH_FASTCALL | METH_KEYWORDS, NULL},
 
-    {"ExtTypesEncode", (PyCFunction)ExtTypesEncode, METH_O, NULL},
-    {"ExtTypesDecode", (PyCFunction)ExtTypesDecode, METH_FASTCALL, NULL},
+    {"Extensions", (PyCFunction)Extensions, METH_FASTCALL | METH_KEYWORDS, NULL},
 
     {"Encoder", (PyCFunction)Encoder, METH_FASTCALL | METH_KEYWORDS, NULL},
     {"Decoder", (PyCFunction)Decoder, METH_FASTCALL | METH_KEYWORDS, NULL},
 
-    {NULL, NULL, 0, NULL}
+    {NULL}
 };
 
 
@@ -2568,38 +2706,40 @@ static PyMethodDef CmsgpackMethods[] = {
 //    OBJECTS    //
 ///////////////////
 
-static PyTypeObject ExtTypesEncodeObj = {
+static PyTypeObject ExtDictItemObj = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "cmsgpack.ExtTypesEncode",
-    .tp_basicsize = sizeof(ext_types_encode_t),
+    .tp_name = "cmsgpack.ExtDictItem",
+    .tp_basicsize = sizeof(ext_dictitem_t),
     .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_dealloc = (destructor)ext_types_encode_dealloc,
+    .tp_dealloc = (destructor)ExtDictItem_dealloc,
 };
 
-static PyTypeObject ExtTypesDecodeObj = {
+static PyTypeObject ExtensionsObj = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "cmsgpack.ExtTypesDecode",
-    .tp_basicsize = sizeof(ext_types_decode_t),
+    .tp_name = "cmsgpack.Extensions",
+    .tp_basicsize = sizeof(extensions_t),
     .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_dealloc = (destructor)ext_types_decode_dealloc,
+    .tp_methods = ExtensionsMethods,
+    .tp_dealloc = (destructor)extensions_dealloc,
+    .tp_getset = ExtensionsGetSet,
 };
 
 static PyTypeObject EncoderObj = {
     PyVarObject_HEAD_INIT(NULL, 0)
     .tp_name = "cmsgpack.Encoder",
-    .tp_basicsize = sizeof(hookobj_t),
+    .tp_basicsize = sizeof(classobj_t),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_methods = EncoderMethods,
-    .tp_dealloc = (destructor)encoder_dealloc,
+    .tp_dealloc = (destructor)classobj_dealloc,
 };
 
 static PyTypeObject DecoderObj = {
     PyVarObject_HEAD_INIT(NULL, 0)
     .tp_name = "cmsgpack.Decoder",
-    .tp_basicsize = sizeof(hookobj_t),
+    .tp_basicsize = sizeof(classobj_t),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_methods = DecoderMethods,
-    .tp_dealloc = (destructor)decoder_dealloc,
+    .tp_dealloc = (destructor)classobj_dealloc,
 };
 
 static void cleanup(PyObject *module);
@@ -2640,8 +2780,8 @@ PyMODINIT_FUNC PyInit_cmsgpack(void)
     PYTYPE_READY(EncoderObj);
     PYTYPE_READY(DecoderObj);
 
-    PYTYPE_READY(ExtTypesEncodeObj);
-    PYTYPE_READY(ExtTypesDecodeObj);
+    PYTYPE_READY(ExtDictItemObj);
+    PYTYPE_READY(ExtensionsObj);
 
     // Create main module
     m = PyModule_Create(&cmsgpack);
