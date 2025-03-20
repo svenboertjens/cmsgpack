@@ -4,8 +4,8 @@ import ormsgpack
 
 modules = {
     "cmsgpack": {
-        "encode": cmsgpack.Encoder().encode,
-        "decode": cmsgpack.Decoder().decode
+        "encode": cmsgpack.encode,
+        "decode": cmsgpack.decode
     },
     "msgspec": {
         "encode": msgspec.msgpack.encode,
