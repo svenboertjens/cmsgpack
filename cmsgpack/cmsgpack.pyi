@@ -51,23 +51,37 @@ def decode(encoded: typing.Buffer, /, extensions: Extensions=None) -> any:
     ...
 
 
-class Encoder:
-    " Class-based wrapper for `encode()` that stores optional arguments. "
+class Stream:
+    " Class-based wrapper for `encode()` and `decode()` that stores optional arguments. "
     
-    def __init__(self, file_name: str | None=None, extensions: Extensions=None):
+    def __init__(self, file_name: None=None, extensions: Extensions=None):
         ...
     
-    def encode(self, obj: any) -> bytes | None:
+    def encode(self, obj: any) -> bytes:
         " Encode Python data to bytes using the class's stored arguments. "
         ...
-
-class Decoder:
-    " Class-based wrapper for `decode()` that retains optional arguments. "
     
-    def __init__(self, file_name: str | None=None, extensions: Extensions=None):
-        ...
-    
-    def decode(self, encoded: typing.Buffer=None) -> any:
+    def decode(self, encoded: typing.Buffer) -> any:
         " Decode any MessagePack-encoded data using the class's stored arguments. "
         ...
+
+class FileStream:
+    " Class-based wrapper for `encode()` and `decode()` that stores optional arguments. "
+    
+    def __init__(self, file_name: str, extensions: Extensions=None):
+        ...
+    
+    def encode(self, obj: any) -> None:
+        " Encode Python data to bytes using the class's stored arguments. "
+        ...
+    
+    def decode(self) -> any:
+        " Decode any MessagePack-encoded data using the class's stored arguments. "
+        ...
+
+@typing.overload
+def Stream(file_name: None = None, extensions: Extensions = None) -> Stream: ...
+@typing.overload
+def Stream(file_name: str, extensions: Extensions = None) -> FileStream: ...
+def Stream(file_name: typing.Optional[str] = None, extensions: Extensions = None) -> typing.Union[Stream, FileStream]: ...
 

@@ -17,7 +17,6 @@ def decode_complex(b: bytes):
 
     return complex(b.decode())
 
-
 class MyClass:
     obj: str
     def __init__(self, obj):

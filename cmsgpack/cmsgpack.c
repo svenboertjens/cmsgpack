@@ -162,7 +162,7 @@ static bool encode_object(buffer_t *b, PyObject *obj);
 static PyObject *decode_bytes(buffer_t *b);
 
 static bool encbuffer_expand(buffer_t *b, size_t needed);
-static bool decoder_streaming_refresh(buffer_t *b, const size_t requested);
+static bool filestream_refresh_fbuf(buffer_t *b, size_t required);
 
 
 static struct PyModuleDef cmsgpack;
@@ -2207,7 +2207,7 @@ static bool stream_initialize_fdata(stream_t *_stream, PyObject *filename)
 
     // Get the filename data if we got a filename object
     size_t fname_size;
-    const char *fname = PyUnicode_AsUTF8AndSize(filename, &fname_size);
+    const char *fname = PyUnicode_AsUTF8AndSize(filename, (Py_ssize_t *)&fname_size);
 
     // Allocate the filename buffer
     stream->fname = (char *)malloc(fname_size + 1);
@@ -2455,8 +2455,8 @@ static bool filestream_refresh_fbuf(buffer_t *b, size_t required)
     // Read new data into the buffer above the unused data
     size_t read = fread(b->base + unused, 1, b->fbuf_size - unused, b->file);
 
-    // Check if we read less than required, meaning we reached EOF
-    if (read < required)
+    // Check if we have less data than required, meaning we reached EOF
+    if (read + unused < required)
     {
         PyErr_SetString(PyExc_EOFError, "Reached EOF while decoding from a file before reaching end of data");
         return false;
@@ -2464,7 +2464,7 @@ static bool filestream_refresh_fbuf(buffer_t *b, size_t required)
 
     // Update the offsets
     b->offset = b->base;
-    b->maxoffset = b->base + read;
+    b->maxoffset = b->base + unused + read;
 
     return true;
 }

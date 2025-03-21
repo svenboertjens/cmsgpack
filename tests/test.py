@@ -71,7 +71,7 @@ class Test:
             print(f"No fails in '{fname}'.")
             return
 
-        print(f"Found {nfails} fails in {fname}:")
+        print(f"Got {nfails} fails in {fname}:")
 
         for line_no, check_type, fail in self.fails:
             print(f"\n## Line {line_no} ## (func: '{check_type}')\n{fail}")
