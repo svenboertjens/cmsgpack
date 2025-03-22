@@ -1,5 +1,5 @@
 
-# Test class-based serialization
+# Test Stream-based serialization
 
 import cmsgpack as cm
 
@@ -7,7 +7,7 @@ from test_values import test_values
 from test import Test
 
 
-FNAME = "classes_test.bin"
+FNAME = "stream_test.bin"
 
 test = Test()
 
@@ -38,21 +38,13 @@ test.exception(lambda: dec(b"\0", 123), TypeError)
 
 # Test if invalid argument types are caught
 test.exception(lambda: cm.Stream(ext_types=123), TypeError)
-test.exception(lambda: cm.Stream(file_name=123), TypeError)
 
 # Test if invalid kwargs are caught
 test.exception(lambda: cm.Stream(invalid_kwarg=123), TypeError)
 
 # Test if valid args are accepted
-test.success(lambda: cm.Stream(extensions=cm.Extensions(), file_name=FNAME))
+test.success(lambda: cm.Stream(extensions=cm.Extensions()))
 
 
 test.print()
-
-try:
-    import os
-    os.remove(FNAME)
-
-except:
-    pass
 

@@ -12,7 +12,6 @@
 #include <stdatomic.h>
 #endif
 
-
 // Python versions
 #define PYVER12 (PY_VERSION_HEX >= 0x030C0000)
 #define PYVER13 (PY_VERSION_HEX >= 0x030D0000)
@@ -26,7 +25,7 @@
 #define BUFFER_DEFAULTSIZE 256
 
 // Default file buffer size
-#define FILEBUF_DEFAULTSIZE 4096
+#define FILEBUF_DEFAULTSIZE 16384 // 16 KB
 
 // The number of slots to use in caches
 #define STRING_CACHE_SLOTS 1024
@@ -85,12 +84,14 @@ typedef struct {
 typedef struct {
     // Interned strings
     struct {
-        PyObject *obj;
         PyObject *file_name;
         PyObject *types;
         PyObject *extensions;
         PyObject *allow_subclasses;
         PyObject *pass_memoryview;
+        PyObject *str_keys;
+        PyObject *reading_offset;
+        PyObject *chunk_size;
     } interned;
 
     // Caches
@@ -111,13 +112,13 @@ typedef struct {
 } filedata_t;
 
 typedef struct {
-    char *base;      // Base towards the buffer (for decoding from a file, this holds the file buffer)
-    char *offset;    // Current writing offset in the buffer
-    char *maxoffset; // The max writing offset
+    char *base;        // Base towards the buffer (for decoding from a file, this holds the file buffer)
+    char *offset;      // Current writing offset in the buffer
+    char *maxoffset;   // The max writing offset
 
-    size_t recursion;  // Recursion depth to prevent cyclic references during encoding
-
+    bool str_keys;     // Whether only string keys are allowed
     ext_data_t ext;    // Extensions data
+    size_t recursion;  // Recursion depth to prevent cyclic references during encoding
     mstates_t *states; // The module states
 
     FILE *file;        // The file object in use, NULL if not using a file
@@ -128,7 +129,7 @@ typedef struct {
 typedef struct {
     PyObject_HEAD
 
-    
+    bool str_keys;     // Whether to allow string keys
     extensions_t *ext; // The extensions object to use
     mstates_t *states; // The module states
 } stream_t;
@@ -136,20 +137,21 @@ typedef struct {
 typedef struct {
     PyObject_HEAD
 
-    // Fields from `stream_t` for interoperability during creation
-    extensions_t *ext;
-    mstates_t *states;
-
     #ifdef _need_threadsafe
-    atomic_flag flock; // File lock for multithreaded environments
+    atomic_flag lock; // Object lock for multithreaded environments
     #endif
+
+    bool str_keys;     // Whether to allow string keys
+    extensions_t *ext; // The extensions object to use
+    mstates_t *states; // The module states
+
     FILE *file;  // The file, opened in "a+b" mode
     size_t foff; // The file's reading offset
 
     char *fbuf;       // The file buffer for decoding
     size_t fbuf_size; // The size of the file buffer
 
-    char *fname; // The filename
+    char *fname;      // The filename
 } filestream_t;
 
 static PyTypeObject StreamObj;
@@ -162,7 +164,7 @@ static bool encode_object(buffer_t *b, PyObject *obj);
 static PyObject *decode_bytes(buffer_t *b);
 
 static bool encbuffer_expand(buffer_t *b, size_t needed);
-static bool filestream_refresh_fbuf(buffer_t *b, size_t required);
+static bool filestream_refresh_decode(buffer_t *b, size_t required);
 
 
 static struct PyModuleDef cmsgpack;
@@ -188,33 +190,9 @@ static struct PyModuleDef cmsgpack;
 #define error_cannot_open_file(filename, err) (PyErr_Format(PyExc_OSError, "Unable to open file '%s', received errno %i: '%s'", filename, err, strerror(err)))
 
 
-///////////////////
-//  BYTES TO PY  //
-///////////////////
-
-#ifdef _need_threadsafe
-
-// Acquire a lock
-static _always_inline void cache_acquire_lock(strcache_t *cache, size_t idx)
-{
-    atomic_flag *lock = &cache->locks[idx];
-    while (atomic_flag_test_and_set_explicit(lock, memory_order_acquire)) { }
-}
-
-// Release a lock
-static inline void cache_release_lock(strcache_t *cache, size_t idx)
-{
-    atomic_flag *lock = &cache->locks[idx];
-    atomic_flag_clear_explicit(lock, memory_order_release);
-}
-
-#else
-
-// Dummies
-#define cache_acquire_lock(cache, idx) (NULL)
-#define cache_release_lock(cache, idx) (NULL)
-
-#endif
+////////////////
+//   CACHES   //
+////////////////
 
 static _always_inline uint32_t fnv1a_32(const char *data, size_t size)
 {
@@ -235,8 +213,7 @@ static _always_inline PyObject *fixstr_to_py(char *ptr, size_t size, strcache_t 
     // Calculate the hash of the string
     const size_t hash = fnv1a_32(ptr, size) & (STRING_CACHE_SLOTS - 1);
 
-    // Wait on the lock of the hash
-    cache_acquire_lock(cache, hash);
+    lock_flag(&cache->locks[hash]);
 
     // Load the match stored at the hash index
     PyASCIIObject *match = cache->strings[hash];
@@ -253,7 +230,7 @@ static _always_inline PyObject *fixstr_to_py(char *ptr, size_t size, strcache_t 
             cache->match_strength[hash]++;
 
             // Release the lock
-            cache_release_lock(cache, hash);
+            unlock_flag(&cache->locks[hash]);
 
             return (PyObject *)match;
         }
@@ -279,10 +256,13 @@ static _always_inline PyObject *fixstr_to_py(char *ptr, size_t size, strcache_t 
     }
 
     // Release the lock
-    cache_release_lock(cache, hash);
+    unlock_flag(&cache->locks[hash]);
 
     return obj;
 }
+
+#define get_cached_int(n, cache) \
+    ((PyObject *)&(((PyLongObject *)cache)[(long)(n) + INTEGER_CACHE_NNEG]))
 
 
 ////////////////////
@@ -402,7 +382,7 @@ static _always_inline bool parse_keywords(Py_ssize_t npos, PyObject **args, Py_s
         if (keyarg.tp && !Py_IS_TYPE(obj, keyarg.tp))
         {
             // Use the interned string's value for the argument name
-            error_unexpected_argtype(PyUnicode_AsUTF8(obj), keyarg.tp->tp_name, Py_TYPE(obj)->tp_name);
+            error_unexpected_argtype(PyUnicode_AsUTF8(keyarg.interned), keyarg.tp->tp_name, Py_TYPE(obj)->tp_name);
             return false;
         }
 
@@ -893,6 +873,15 @@ static _always_inline PyObject *map_to_py(buffer_t *b, const size_t npairs)
                 Py_DECREF(dict);
                 return NULL;
             }
+
+            if (b->str_keys && !PyUnicode_CheckExact(key))
+            {
+                Py_DECREF(dict);
+                Py_DECREF(key);
+
+                PyErr_Format(PyExc_TypeError, "Got a map key of type '%s' while only string keys were allowed", Py_TYPE(key)->tp_name);
+                return NULL;
+            }
         }
 
         PyObject *val = decode_bytes(b);
@@ -920,7 +909,9 @@ static _always_inline PyObject *map_to_py(buffer_t *b, const size_t npairs)
 
 #define ENSURE_SPACE(extra) do { \
     if (b->offset + (extra) >= b->maxoffset) \
+    { \
         NULLCHECK(encbuffer_expand(b, (extra))); \
+    } \
 } while (0)
 
 // Get the current offset's byte and increment afterwards
@@ -1439,9 +1430,14 @@ static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
         {
             NULLCHECK(write_string(b, key));
         }
-        else
+        else if (!b->str_keys)
         {
             NULLCHECK(encode_object(b, key));
+        }
+        else
+        {
+            PyErr_Format(PyExc_TypeError, "Got a map key of type '%s' while only string keys were allowed", Py_TYPE(key)->tp_name);
+            return false;
         }
 
         NULLCHECK(encode_object(b, val));
@@ -1455,7 +1451,7 @@ static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
 static _always_inline bool write_extension(buffer_t *b, PyObject *obj)
 {
     // Attempt to encode the object as an extension type
-    char id;
+    char id = 0;
     PyObject *result = attempt_encode_ext(b, obj, &id);
 
     if (!result)
@@ -1599,7 +1595,7 @@ static bool encode_object(buffer_t *b, PyObject *obj)
     { \
         if (b->file) \
         { \
-            NULLCHECK(filestream_refresh_fbuf(b, to_add)); \
+            NULLCHECK(filestream_refresh_decode(b, to_add)); \
         } \
         else \
         { \
@@ -1626,7 +1622,7 @@ static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char 
     }
     else if ((mask & 0x80) == DT_UINT_FIXED) // uint only has upper bit set to 0
     {
-        return (PyObject *)&b->states->caches.integers[mask + INTEGER_CACHE_NNEG];
+        return get_cached_int(mask, b->states->caches.integers);
     }
     else if (fixmask == DT_INT_FIXED)
     {
@@ -1635,7 +1631,7 @@ static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char 
         if ((num & 0b10000) == 0b10000)
             num |= ~0b11111;
 
-        return (PyObject *)&b->states->caches.integers[num + INTEGER_CACHE_NNEG];
+        return get_cached_int(num, b->states->caches.integers);
     }
     else if ((mask & 0b11110000) == DT_ARR_FIXED) // Bit 5 is also set on ARR and MAP
     {
@@ -1692,7 +1688,7 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
 
         uint8_t num = SIZEBYTE;
 
-        return (PyObject *)&b->states->caches.integers[num + INTEGER_CACHE_NNEG];
+        return get_cached_int(num, b->states->caches.integers);
     }
     case VARLEN_DT(DT_UINT_BIT16):
     {
@@ -1702,7 +1698,7 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
         num |= SIZEBYTE;
 
         if (num <= 1023)
-            return (PyObject *)&b->states->caches.integers[num + INTEGER_CACHE_NNEG];
+            return get_cached_int(num, b->states->caches.integers);
         
         return PyLong_FromUnsignedLongLong(num);
     }
@@ -1737,7 +1733,7 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
 
         int8_t num = SIZEBYTE;
 
-        return (PyObject *)&b->states->caches.integers[num + 128];
+        return get_cached_int(num, b->states->caches.integers);
     }
     case VARLEN_DT(DT_INT_BIT16):
     {
@@ -2058,15 +2054,16 @@ static _always_inline void update_adaptive_allocation(buffer_t *b, size_t nitems
 }
 
 // Start encoding with an encbuffer
-static _always_inline PyObject *encbuffer_start(PyObject *obj, ext_data_t ext, mstates_t *states, FILE *file)
+static _always_inline PyObject *encbuffer_start(PyObject *obj, bool str_keys, ext_data_t ext, mstates_t *states)
 {
     size_t nitems;
     buffer_t b;
 
     // Assign all standard fields
+    b.str_keys = str_keys;
     b.ext = ext;
     b.states = states;
-    b.file = file;
+    b.file = NULL; // Files don't go through here, they use custom handling
     b.recursion = 0;
 
     // Prepare the encode buffer
@@ -2109,12 +2106,13 @@ static bool encbuffer_expand(buffer_t *b, size_t extra)
 }
 
 
-// Start decoding with a decbuffer (not used with streaming)
-static _always_inline PyObject *decbuffer_start(PyObject *encoded, ext_data_t ext, mstates_t *states)
+// Start decoding with a decbuffer
+static _always_inline PyObject *decbuffer_start(PyObject *encoded, bool str_keys, ext_data_t ext, mstates_t *states)
 {
     buffer_t b;
 
     // Assign the standard data
+    b.str_keys = str_keys;
     b.ext = ext;
     b.states = states;
     b.file = NULL; // File data doesn't go through here, so always NULL
@@ -2158,16 +2156,21 @@ static PyObject *encode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     NULLCHECK(obj);
 
     mstates_t *states = get_mstates(self);
+
+    PyObject *str_keys = Py_False;
     extensions_t *ext = &states->extensions;
 
     keyarg_t keyargs[] = {
+        KEYARG(&str_keys, &PyBool_Type, states->interned.str_keys),
         KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
     if (!parse_keywords(npositional, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
         return NULL;
+    
+    bool only_str_keys = str_keys == Py_True;
 
-    return encbuffer_start(obj, ext->data, states, NULL);
+    return encbuffer_start(obj, only_str_keys, ext->data, states);
 }
 
 static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
@@ -2179,32 +2182,79 @@ static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     NULLCHECK(encoded);
 
     mstates_t *states = get_mstates(self);
+
+    PyObject *str_keys = Py_False;
     extensions_t *ext = &states->extensions;
 
     keyarg_t keyargs[] = {
+        KEYARG(&ext, &PyBool_Type, states->interned.str_keys),
         KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
     if (!parse_keywords(npositional, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
         return NULL;
 
-    return decbuffer_start(encoded, ext->data, states);
+    bool only_str_keys = str_keys == Py_True;
+
+    return decbuffer_start(encoded, only_str_keys, ext->data, states);
+}
+
+////////////////////
+//  STREAM CLASS  //
+////////////////////
+
+static PyObject *Stream(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
+{
+    mstates_t *states = get_mstates(self);
+    extensions_t *ext = &states->extensions;
+
+    keyarg_t keyargs[] = {
+        KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
+    };
+
+    NULLCHECK(parse_keywords(0, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
+
+
+    // Allocate the stream object based on if we got a file to use or not
+    stream_t *stream = PyObject_New(stream_t, &StreamObj);
+
+    if (!stream)
+        return PyErr_NoMemory();
+
+    // Set the object fields
+    stream->ext = ext;
+    stream->states = states;
+
+    // Keep a reference to the ext object
+    Py_INCREF(ext);
+
+    return (PyObject *)stream;
+}
+
+static void stream_dealloc(stream_t *stream)
+{
+    // Remove reference to the ext object
+    Py_DECREF(stream->ext);
+    PyObject_Del(stream);
+}
+
+static PyObject *stream_encode(stream_t *stream, PyObject *obj)
+{
+    return encbuffer_start(obj, stream->str_keys, stream->ext->data, stream->states);
+}
+
+static PyObject *stream_decode(stream_t *stream, PyObject *encoded)
+{
+    return decbuffer_start(encoded, stream->str_keys, stream->ext->data, stream->states);
 }
 
 
-///////////////////////
-//  ENC/DEC OBJECTS  //
-///////////////////////
+/////////////////////////
+//  FILE STREAM CLASS  //
+/////////////////////////
 
-// Initialize the file data of a stream object
-static bool stream_initialize_fdata(stream_t *_stream, PyObject *filename)
+static bool filestream_setup_fdata(filestream_t *stream, PyObject *filename, PyObject *reading_offset, PyObject *chunk_size)
 {
-    // Nothing to do if we don't have a filename, not an error case
-    if (!filename)
-        return true;
-    
-    filestream_t *stream = (filestream_t *)_stream;
-
     // Get the filename data if we got a filename object
     size_t fname_size;
     const char *fname = PyUnicode_AsUTF8AndSize(filename, (Py_ssize_t *)&fname_size);
@@ -2219,8 +2269,14 @@ static bool stream_initialize_fdata(stream_t *_stream, PyObject *filename)
     memcpy(stream->fname, fname, fname_size);
     stream->fname[fname_size] = 0;
 
-    // Allocate the file buffer for decoding
+    // Decide the file buffer's size
     stream->fbuf_size = FILEBUF_DEFAULTSIZE;
+    if (chunk_size)
+    {
+        stream->fbuf_size = PyLong_AS_LONG(chunk_size);
+    }
+
+    // Allocate the file buffer for decoding
     stream->fbuf = (char *)malloc(stream->fbuf_size);
 
     if (!stream->fbuf)
@@ -2244,54 +2300,60 @@ static bool stream_initialize_fdata(stream_t *_stream, PyObject *filename)
     // Disable file buffering as we already read/write in a chunk-like manner
     setbuf(stream->file, NULL);
 
-    #ifdef _need_threadsafe
+    // Initialize the file offset
+    stream->foff = 0;
+    if (reading_offset)
+    {
+        stream->foff = PyLong_AS_LONG(chunk_size);
+    }
+
     // Initialize the file lock
-    atomic_flag_clear(&stream->flock);
-    #endif
+    clear_flag(&stream->lock);
 
     return true;
 }
 
-static PyObject *Stream(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
+static PyObject *FileStream(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
 {
     mstates_t *states = get_mstates(self);
 
+    PyObject *reading_offset = NULL;
+    PyObject *chunk_size = NULL;
     PyObject *filename = NULL;
     extensions_t *ext = &states->extensions;
 
     keyarg_t keyargs[] = {
         KEYARG(&filename, &PyUnicode_Type, states->interned.file_name),
+        KEYARG(&reading_offset, &PyLong_Type, states->interned.reading_offset),
+        KEYARG(&chunk_size, &PyLong_Type, states->interned.chunk_size),
         KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
     NULLCHECK(parse_keywords(0, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
 
-
-    // Allocate the stream object based on if we got a file to use or not
-    stream_t *stream;
-
-    if (filename)
+    // Check if we got the filename argument
+    if (!filename)
     {
-        stream = PyObject_New(stream_t, &FileStreamObj);
+        PyErr_SetString(PyExc_TypeError, "Did not receive mandatory argument 'file_name'");
+        return NULL;
     }
-    else
-    {
-        stream = PyObject_New(stream_t, &StreamObj);
-    }
+
+
+    filestream_t *stream = PyObject_New(filestream_t, &FileStreamObj);
 
     if (!stream)
         return PyErr_NoMemory();
-
-    // Set the object fields
-    stream->ext = ext;
-    stream->states = states;
-
-    // Set the file data if required
-    if (!stream_initialize_fdata(stream, filename))
+    
+    // Set the file data
+    if (!filestream_setup_fdata(stream, filename, reading_offset, chunk_size))
     {
         PyObject_Del(stream);
         return NULL;
     }
+
+    // Set the object fields
+    stream->ext = ext;
+    stream->states = states;
 
     // Keep a reference to the ext object
     Py_INCREF(ext);
@@ -2299,111 +2361,82 @@ static PyObject *Stream(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     return (PyObject *)stream;
 }
 
-static void stream_dealloc(stream_t *stream)
-{
-    // Remove reference to the ext object
-    Py_DECREF(stream->ext);
-    PyObject_Del(stream);
-}
-
 static void filestream_dealloc(filestream_t *stream)
 {
-    // Check if we were using a file
-    if (stream->file)
-    {
-        // Free the file buffer and file name, and close the file
-        free(stream->fbuf);
-        free(stream->fname);
-        fclose(stream->file);
-    }
+    // Free the file buffer and file name, and close the file
+    free(stream->fbuf);
+    free(stream->fname);
+    fclose(stream->file);
 
     // Remove reference to the ext object
     Py_DECREF(stream->ext);
 
     PyObject_Del(stream);
 }
-
-static PyObject *stream_encode(stream_t *stream, PyObject *obj)
-{
-    return encbuffer_start(obj, stream->ext->data, stream->states, NULL);
-}
-
-static PyObject *stream_decode(stream_t *stream, PyObject *encoded)
-{
-    return decbuffer_start(encoded, stream->ext->data, stream->states);
-}
-
-#ifdef _need_threadsafe
-
-// TODO
-#define filestream_lock() (NULL)
-#define filestream_unlock() (NULL)
-
-#else
-
-#define filestream_lock() (NULL)
-#define filestream_unlock() (NULL)
-
-#endif
 
 static PyObject *filestream_encode(filestream_t *stream, PyObject *obj)
 {
-    // Encode the data and get the result
-    PyObject *encoded = encbuffer_start(obj, stream->ext->data, stream->states, NULL);
+    PyObject *encoded = encbuffer_start(obj, stream->str_keys, stream->ext->data, stream->states);
 
     if (!encoded)
         return NULL;
-
-    filestream_lock();
-
+    
     // Get the buffer data
+    char *buf = PyBytes_AS_STRING(encoded);
     size_t size = PyBytes_GET_SIZE(encoded);
-    char *data = PyBytes_AS_STRING(encoded);
 
-    // Write the encoded data to the file
-    size_t written = fwrite(data, 1, size, stream->file);
+    lock_flag(&stream->lock);
 
-    // Ensure we wrote all data
+    // Write the data to the file
+    size_t written = fwrite(buf, 1, size, stream->file);
+
+    // Remove reference to the bytes object as we won't return it
+    Py_DECREF(encoded);
+
+    // Check if all data was written
     if (written != size)
     {
-        // Lose reference to the encoded object and set it to NULL to return NULL later
-        Py_DECREF(encoded);
-        encoded = NULL;
-
         // Get the errno
         const int err = errno;
 
-        // Check if anything was written
-        if (written == 0)
+        // Check if anything was written and otherwise attempt to truncate the file
+        size_t start_offset = ftell(stream->file) - written; // The offset before the written data
+        if (written == 0 || _ftruncate(stream->file, start_offset))
         {
-            PyErr_Format(PyExc_OSError, "Attempted to write encoded data to file '%s', but no data was written. Errno %i: %s", stream->fname, err, strerror(err));
+            PyErr_Format(PyExc_OSError, "Attempted to write encoded data, but no data was written."
+                "\n\tErrno %i: %s", err, strerror(err));
         }
         else
         {
-            // Attempt to reverse partial writes
-            // TODO
+            PyErr_Format(PyExc_OSError, "Attempted to write encoded data, but the write could not be completed and truncation failed. "
+                "Incomplete data was written on position %zu, and %zu bytes were written."
+                "\n\tErrno %i: %s", start_offset, written, err, strerror(err));
         }
+
+        unlock_flag(&stream->lock);
+
+        return NULL;
     }
 
-    filestream_unlock();
+    unlock_flag(&stream->lock);
 
-    return encoded;
+    Py_RETURN_NONE;
 }
 
 static PyObject *filestream_decode(filestream_t *stream)
 {
+    lock_flag(&stream->lock);
+
     // Set up the buffer object manually to have it use the file buffer
     buffer_t b;
 
+    b.str_keys = stream->str_keys;
     b.fbuf_size = stream->fbuf_size;
     b.base = stream->fbuf;
     b.offset = b.base;
-
-    b.file = stream->file;
     b.ext = stream->ext->data;
     b.states = stream->states;
-
-    filestream_lock();
+    b.file = stream->file;
 
     // Seek the file to the current offset
     fseek(b.file, stream->foff, SEEK_SET);
@@ -2420,18 +2453,19 @@ static PyObject *filestream_decode(filestream_t *stream)
     // Calculate up to where we had to read from the file (up until the data of the next encoded data block)
     size_t end_offset = ftell(b.file);
     size_t buffer_unused = (size_t)(b.maxoffset - b.offset);
-    stream->foff = end_offset - buffer_unused; // Update the reading offset
+    size_t new_offset = end_offset - buffer_unused;
+    stream->foff = new_offset; // Update the reading offset
 
-    // Update the file buffer size
+    // Update the file buffer address and size
+    stream->fbuf = b.base;
     stream->fbuf_size = b.fbuf_size;
 
-    filestream_unlock();
+    unlock_flag(&stream->lock);
 
     return result;
 }
 
-// Refresh the file buffer's contents
-static bool filestream_refresh_fbuf(buffer_t *b, size_t required)
+static bool filestream_refresh_decode(buffer_t *b, size_t required)
 {
     // Calculate how much from the buffer is unused
     size_t unused = (size_t)(b->maxoffset - b->offset);
@@ -2458,7 +2492,7 @@ static bool filestream_refresh_fbuf(buffer_t *b, size_t required)
     // Check if we have less data than required, meaning we reached EOF
     if (read + unused < required)
     {
-        PyErr_SetString(PyExc_EOFError, "Reached EOF while decoding from a file before reaching end of data");
+        PyErr_SetString(PyExc_EOFError, "Reached EOF before finishing the decoding run");
         return false;
     }
 
@@ -2492,12 +2526,14 @@ static bool setup_mstates(PyObject *m)
     /* INTERNED STRINGS */
 
     // Create interned strings
-    GET_ISTR(obj)
     GET_ISTR(file_name)
     GET_ISTR(types)
     GET_ISTR(extensions)
     GET_ISTR(allow_subclasses)
     GET_ISTR(pass_memoryview)
+    GET_ISTR(str_keys)
+    GET_ISTR(reading_offset)
+    GET_ISTR(chunk_size)
 
     /* CACHES */
 
@@ -2511,7 +2547,7 @@ static bool setup_mstates(PyObject *m)
 
     // Initialize the string cache's locks to a clear state
     for (size_t i = 0; i < STRING_CACHE_SLOTS; ++i)
-        atomic_flag_clear(&s->caches.strings.locks[i]);
+        clear_flag(&s->caches.strings.locks[i]);
 
     #endif
 
@@ -2596,6 +2632,7 @@ static bool setup_mstates(PyObject *m)
     // Add the global ext object to the module
     if (PyModule_AddObjectRef(m, "extensions", (PyObject *)&s->extensions) < 0)
         return false;
+    
 
     return true;
 }
@@ -2661,9 +2698,9 @@ static PyMethodDef CmsgpackMethods[] = {
     {"encode", (PyCFunction)encode, METH_FASTCALL | METH_KEYWORDS, NULL},
     {"decode", (PyCFunction)decode, METH_FASTCALL | METH_KEYWORDS, NULL},
 
-    {"Extensions", (PyCFunction)Extensions, METH_FASTCALL | METH_KEYWORDS, NULL},
-
     {"Stream", (PyCFunction)Stream, METH_FASTCALL | METH_KEYWORDS, NULL},
+    {"FileStream", (PyCFunction)FileStream, METH_FASTCALL | METH_KEYWORDS, NULL},
+    {"Extensions", (PyCFunction)Extensions, METH_FASTCALL | METH_KEYWORDS, NULL},
 
     {NULL}
 };
@@ -2680,6 +2717,7 @@ static PyTypeObject StreamObj = {
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_methods = StreamMethods,
     .tp_dealloc = (destructor)stream_dealloc,
+    .tp_new = NULL,
 };
 
 static PyTypeObject FileStreamObj = {
@@ -2689,6 +2727,7 @@ static PyTypeObject FileStreamObj = {
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_methods = FileStreamMethods,
     .tp_dealloc = (destructor)filestream_dealloc,
+    .tp_new = NULL,
 };
 
 static PyTypeObject ExtDictItemObj = {
@@ -2697,6 +2736,7 @@ static PyTypeObject ExtDictItemObj = {
     .tp_basicsize = sizeof(ext_dictitem_t),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_dealloc = (destructor)ExtDictItem_dealloc,
+    .tp_new = NULL,
 };
 
 static PyTypeObject ExtensionsObj = {
@@ -2707,9 +2747,13 @@ static PyTypeObject ExtensionsObj = {
     .tp_methods = ExtensionsMethods,
     .tp_dealloc = (destructor)extensions_dealloc,
     .tp_getset = ExtensionsGetSet,
+    .tp_new = NULL,
 };
 
-static void cleanup(PyObject *module);
+static void cleanup(PyObject *module)
+{
+    cleanup_mstates(module);
+}
 
 static struct PyModuleDef cmsgpack = {
     PyModuleDef_HEAD_INIT,
@@ -2724,11 +2768,6 @@ static struct PyModuleDef cmsgpack = {
 //////////////////////
 //  MODULE METHODS  //
 //////////////////////
-
-static void cleanup(PyObject *module)
-{
-    cleanup_mstates(module);
-}
 
 #define PYTYPE_READY(type) \
     if (PyType_Ready(&type) != 0) return NULL;

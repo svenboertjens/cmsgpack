@@ -15,15 +15,39 @@
 
 #define _always_inline Py_ALWAYS_INLINE inline
 
-#ifdef PY_NO_GIL
+
+#if defined(Py_NOGIL)
+
+// Define macro for needing thread-safety
 #define _need_threadsafe
+
+// Lock a flag
+#define lock_flag(flag) \
+    { while (atomic_flag_test_and_set_explicit(flag, memory_order_acquire)) { } }
+
+// Unlock a flag
+#define unlock_flag(flag) \
+    { atomic_flag_clear_explicit(flag, memory_order_release); }
+
+// Clear a flag / initialize it to unset
+#define clear_flag(flag) \
+    { atomic_flag_clear(flag); }
+
+#else
+
+// Dummy macros with no effect
+#define lock_flag(flag)
+#define unlock_flag(flag)
+#define clear_flag(flag)
+
 #endif
+
 
 #ifdef IS_BIG_ENDIAN
 
     #define BIG_64(x) (x)
     #define BIG_32(x) (x)
-    #define BIG_DOUBLE(x) (x)
+    #define BIG_DOUBLE(x) (NULL)
 
 #else
 
@@ -71,63 +95,24 @@
 
 
 #if defined(_WIN32) || defined(_WIN64)
+
     #include <io.h>
 
-    static int _ftruncate_and_close(FILE *file, const size_t size, const char *fname)
-    {
-        int state = _chsize_s(_fileno(file), size) != 0;
-        fclose(file);
-        return state;
-    }
+    #define _ftruncate(file, size) \
+        _chsize_s(_fileno(file), size) != 0
+
 #elif defined(_POSIX_VERSION)
+
     #include <unistd.h>
 
-    static int _ftruncate_and_close(FILE *file, const size_t size, const char *fname)
-    {
-        int state = ftruncate(fileno(file), size) != 0;
-        fclose(file);
-        return state;
-    }
+    #define _ftruncate(file, size) \
+        ftruncate(fileno(file), size) != 0
+
 #else
-    // Fallback by copying the correct file contents and rewriting it to the file
-    static int _ftruncate_and_close(FILE *file, const size_t size, const char *fname)
-    {
-        file = freopen(fname, "r+b", file);
 
-        if (_UNLIKELY(file == NULL))
-            return -1;
-        
-        char *tmp = (char *)malloc(size);
+    #define _ftruncate(file, size) \
+        false
 
-        if (_UNLIKELY(tmp == NULL))
-        {
-            fclose(file);
-            return -1;
-        }
-        
-        if (_UNLIKELY(fread(tmp, 1, size, file) != size))
-        {
-            fclose(file);
-            free(tmp);
-            return -1;
-        }
-
-        file = freopen(fname, "wb", file);
-
-        if (_UNLIKELY(file == NULL))
-        {
-            free(tmp);
-            return -1;
-        }
-
-        setvbuf(file, NULL, _IONBF, 0);
-
-        const size_t written = fwrite(tmp, 1, size, file);
-
-        free(tmp);
-
-        return written == size ? 0 : -1;
-    }
 #endif
 
 
@@ -139,29 +124,36 @@ static inline bool memcmp_small(const void *s1, const void *s2, size_t size)
     const char *p1 = s1;
     const char *p2 = s2;
 
-    while (size >= sizeof(uint64_t)) {
+    while (size >= 8)
+    {
         uint64_t v1, v2;
-        memcpy(&v1, p1, sizeof(v1));
-        memcpy(&v2, p2, sizeof(v2));
+        memcpy(&v1, p1, 8);
+        memcpy(&v2, p2, 8);
+
         if (v1 != v2)
             return false;
-        p1 += sizeof(v1);
-        p2 += sizeof(v2);
-        size -= sizeof(v1);
+        
+        p1   += 8;
+        p2   += 8;
+        size -= 8;
     }
 
-    while (size >= sizeof(uint32_t)) {
+    while (size >= 4)
+    {
         uint32_t v1, v2;
-        memcpy(&v1, p1, sizeof(v1));
-        memcpy(&v2, p2, sizeof(v2));
+        memcpy(&v1, p1, 4);
+        memcpy(&v2, p2, 4);
+
         if (v1 != v2)
             return false;
-        p1 += sizeof(v1);
-        p2 += sizeof(v2);
-        size -= sizeof(v1);
+        
+        p1   += 4;
+        p2   += 4;
+        size -= 4;
     }
 
-    while (size--) {
+    while (--size)
+    {
         if (*p1++ != *p2++)
             return false;
     }

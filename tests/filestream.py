@@ -1,5 +1,5 @@
 
-# Test file-based serialization
+# Test FileStream-based serialization
 
 import cmsgpack as cm
 
@@ -15,17 +15,33 @@ test = Test()
 
 
 # Test if the stream object can be created
-if not test.success(lambda: cm.Stream(file_name=FNAME)):
+if not test.success(lambda: cm.FileStream(FNAME)):
     test.print()
     exit()
 
+# Test if invalid argument types are caught
+test.exception(lambda: cm.FileStream(file_name=123), TypeError)
+test.exception(lambda: cm.FileStream(reading_offset=123), TypeError)
+test.exception(lambda: cm.FileStream(chunk_size=123), TypeError)
+test.exception(lambda: cm.FileStream(extensions=123), TypeError)
+test.exception(lambda: cm.FileStream(123), TypeError)
+test.exception(lambda: cm.FileStream("", None), TypeError)
+test.exception(lambda: cm.FileStream("", 1, None), TypeError)
+test.exception(lambda: cm.FileStream("", 1, 2, None), TypeError)
+
+# Test if invalid kwargs are caught
+test.exception(lambda: cm.FileStream(invalid_kwarg=123), TypeError)
+
+# Test if no filename given is caught
+test.exception(lambda: cm.FileStream(), TypeError)
+
+# Test if valid args are accepted
+test.success(lambda: cm.FileStream(FNAME, 1, 2, extensions=cm.Extensions()))
+
 # The object to use for streaming
-stream = cm.Stream(file_name=FNAME)
+stream = cm.FileStream(FNAME)
 enc = stream.encode
 dec = stream.decode
-
-# Test if we can create another instance towards the same file
-test.success(lambda: cm.Stream(file_name=FNAME))
 
 # Test if data can be written and read normally
 wrote = test.success(lambda: enc(123))
@@ -34,8 +50,8 @@ read  = test.success(lambda: dec())
 # Early exit if simple reading/writing fails
 if not wrote or not read:
     try:
-        import os
         os.remove(FNAME)
+
     except:
         pass
 
@@ -51,9 +67,16 @@ if not test.equal(123, dec()):
 
 # Test if the same data will be read if we open a separate object
 enc(456) # Encode value on top of the `123` to see if we don't get `456`
-dec()    # The decode call ensures the internal offset is updated for further tests
-if test.success(lambda: cm.Stream(file_name=FNAME).decode()):
-    test.equal(123, cm.Stream(file_name=FNAME).decode())
+if test.success(lambda: cm.FileStream(FNAME).decode()):
+    test.equal(123, cm.FileStream(FNAME).decode())
+
+# Clear the file contents
+open(FNAME, "wb")
+
+# Re-create stream objects
+stream = cm.FileStream(FNAME)
+enc = stream.encode
+dec = stream.decode
 
 # Test all items from the test values
 for v in test_values:
