@@ -21,15 +21,15 @@ class Extensions:
         " Add an extension type for just decoding. "
         ...
     
-    def remove(self, id: int, type: type) -> NoReturn:
+    def remove(self, id: int, type: type, /) -> NoReturn:
         " Remove the encoding and decoding entry for the given ID and type. "
         ...
     
-    def remove_encode(self, type: type) -> NoReturn:
+    def remove_encode(self, type: type, /) -> NoReturn:
         " Remove just the encoding entry for the given type. "
         ...
     
-    def remove_decode(self, id: int) -> NoReturn:
+    def remove_decode(self, id: int, /) -> NoReturn:
         " Remove just the decoding entry for the given ID. "
         ...
     
@@ -53,26 +53,35 @@ def decode(encoded: Buffer, /, str_keys: bool=False, extensions: Extensions=None
 
 class Stream:
     " Wrapper for `encode`/`decode` that retains optional arguments. "
+
+    str_keys: bool
+    extensions: Extensions
     
     def __init__(self, str_keys: bool=False, extensions: Extensions=None):
         ...
     
-    def encode(self, obj: any) -> bytes:
+    def encode(self, obj: any, /) -> bytes:
         " Encode Python data to bytes. "
         ...
     
-    def decode(self, encoded: Buffer) -> any:
+    def decode(self, encoded: Buffer, /) -> any:
         " Decode any MessagePack-encoded data. "
         ...
 
+
 class FileStream:
     " Wrapper for `encode`/`decode` that retains optional arguments and reads/writes a file directly. "
+
+    reading_offset: int
+    chunk_size: int
+    str_keys: bool
+    extensions: Extensions
     
-    def __init__(self, file_name: str, chunk_size: int, reading_offset: int, str_keys: bool=False, extensions: Extensions=None):
+    def __init__(self, file_name: str, reading_offset: int=0, chunk_size: int=16384, str_keys: bool=False, extensions: Extensions=None):
         ...
     
-    def encode(self, obj: any) -> None:
-        " Encode Python data to bytes and write it to the file. "
+    def encode(self, obj: any, /) -> NoReturn:
+        " Encode Python data and write it to the file. "
         ...
     
     def decode(self) -> any:

@@ -2,121 +2,12 @@
 
 This file explains how to use the `cmsgpack` module in Python.
 
-
 **Contents:**
 - [Installation](#installation)
-- [Quick start](#quick-start)
-	- [Encoding](#encoding-simplified)
-	- [Decoding](#decoding-simplified)
 - [Supported types](#supported-types)
 - [Encoding](#encoding)
-	- [`encode`](#encode)
-	- [`Encoder`](#encoder)
 - [Decoding](#decoding)
-	- [`decode`](#decode)
-	- [`Decoder`](#decoder)
 - [Extension types](#extension-types)
-	- [How ext types are managed](#how-extension-types-are-managed)
-	- [Global extensions object](#the-global-extensions-object)
-	- [Structuring the encoding/decoding functions](#structuring-the-encodingdecoding-functions)
-	- [`Extensions`](#extensions)
-- [Thread-safety](#thread-safety)
-- [Questions and feedback](#questions-and-feedback)
-
-
-## Introduction
-
-`cmsgpack` is a [MessagePack](https://msgpack.org/) serializer for Python. For those who are unfamiliar with those terms, serialization means converting Python objects to bytes here. The format used for preserving the data is MessagePack.
-
-But why use `cmsgpack` and not existing solutions like `msgpack`, or optimized solutions like `msgspec` and `ormgspack`? While these solutions are already great, `cmsgpack` aims to be **even better**. Apart from offering a simple-to-use API with rich features, `cmsgpack` is optimized to be efficient, fast, and lightweight. It minimizes memory allocations where possible through smart caching methods and adaptive buffer allocations.
-
-If you are looking for schema-based serialization, `cmsgpack` does not support this. This module is made to be lightweight and optimized for regular serialization.
-
-For performance benchmarks, you can use the [benchmark script](benchmarks/benchmark.py). This shows a comparison between the speed of `cmsgpack`, `ormsgpack`, and `msgspec`.
-
-
-## Installation
-
-The Python module is available via **pip**. To install it, you can use this command:
-
-```shell
-pip install cmsgpack
-```
-
-For a more manual approach, you can clone the repository and install it manually with this:
-
-```shell
-git clone https://github.com/svenboertjens/cmsgpack.git
-cd cmsgpack
-pip install .
-```
-
-These both install the `cmsgpack` module to your Python environment.
-
-> [Note]
->
-> The module is distributed as a "source distribution" (sdist) package, meaning it must be compiled during installation. This requires a C compiler. Recommended compilers are **GCC, Clang, and MSVC.**
-
-
-## Quick start
-
-Only need to know the basics of serialization? Here's a quick start!
-
-
-### Encoding (simplified)
-
-The function for encoding data is this:
-
-```python
-cmsgpack.encode(obj: any) -> bytes
-```
-
-*"Encode Python data into bytes."*
-
-**Arguments**:
-- `obj`: The object to encode. This can be any of the [supported types](#supported-types).
-
-**Returns:** The encoded data in a `bytes` object.
-
-
-### Decoding (simplified)
-
-The function for decoding data is this:
-
-```python
-cmsgpack.decode(encoded: bytes) -> any
-```
-
-*"Decode any MessagePack-encoded data."*
-
-**Arguments**:
-- `encoded`: A bytes object that holds the encoded data.
-
-**Returns:** The decoded Python object.
-
-
-### Example
-
-For reference, here is a simple example on how to use `encode` and `decode`.
-
-```python
-import cmsgpack
-
-# This is the value we want to encode
-obj = ["Hello,", "world!"]
-
-# We can encode it using `encode`
-encoded = cmsgpack.encode(obj)
-
-# Your code stuff...
-...
-
-# We can decode it again using `decode`
-decoded = cmsgpack.decode(encoded)
-
-# Now, `decoded` is a copy of `obj`
-assert obj == decoded # True
-```
 
 
 ## Supported types
@@ -139,110 +30,148 @@ For convenience, `cmsgpack` also supports the following types:
 - `tuple` objects & subclasses, encoded as a `list` type;
 - `bytearray` & `memoryview` objects & subclasses, encoded as a `bytes` type;
 
-If these types don't include a type requirement for you, have a look at the [Extension types](#extension-types).
+If this doesn't include a type you want to use, have a look at the [Extension types](#extension-types).
 
 
-## Encoding
+## Serialization
 
-Encoding data to a `bytes` object.
+For serialization, `cmsgpack` offers the regular `encode`/`decode` functions, a `Stream` object that retains optional arguments for your convenience, and a `FileStream` object that can be used for directly reading/writing a file.
+
+**Contents:**
+- [`encode`](#encode)
+- [`decode`](#decode)
+- [`Stream`](#stream)
+	- [`encode`](#streamencode)
+	- [`decode`](#streamdecode)
+- [`FileStream`](#filestream)
+	- [`encode`](#filestreamencode)
+	- [`decode`](#filestreamdecode)
 
 ### `encode`
 
 ```python
-cmsgpack.encode(obj: any, /, extensions: Extensions=None) -> bytes
+cmsgpack.encode(obj: any, /, str_keys: bool=False, extensions: Extensions=None) -> bytes
 ```
 
 *"Encode Python data to bytes."*
 
 **Arguments:**
 - `obj`: The object to encode. This can be any of the [supported types](#supported-types).
-- `extensions`: An [extension types](#extension-types) object for encoding custom objects.
+- `str_keys`: If true, dictionaries are only allowed to use keys of type `str`.
+- `extensions`: An [extension types](#extension-types) object for encoding custom objects. If not given, the global extensions object is used.
 
-**Returns:** The encoded data in a `bytes` object.
-
-
-### `Encoder`
-
-```python
-cmsgpack.Encoder(file_name: str|None=None, extensions: Extensions=None, strict_keys: bool=False) -> Encoder
-```
-
-*"Class-based wrapper for `encode()` that retains optional arguments."*
-
-**Arguments:**
-- `file_name`: The path to the file to stream data to.
-- `extensions`: An [extension types](#extension-types) object for encoding custom objects.
-
-**Returns:** A new instance of the `Encoder` class.
-
-> [Note]
->
-> When the `file_name` argument is passed, the `Encoder` will be used for streaming to that file. `Encoder.encode` will not return the bytes object and instead directly write it to the file.
-
-
-#### `Encoder.encode`
-
-```python
-cmsgpack.Encoder.encode(obj: any) -> bytes | None
-```
-
-*"Encode Python data to bytes using the class's stored arguments."*
-
-**Arguments:**
-- `obj`: The object to encode. This can be any of the [supported types](#supported-types).
-
-**Returns:** The encoded data in a `bytes` object **if not streaming**, otherwise `None`.
-
-
-## Decoding
-
-Decoding binary data.
-
+**Returns:** The encoded data as a `bytes` object.
 
 ### `decode`
 
 ```python
-cmsgpack.decode(encoded: Buffer, /, extensions: Extensions=None, strict_keys: bool=False) -> any:
+cmsgpack.decode(encoded: Buffer, /, str_keys: bool=False, extensions: Extensions=None) -> any:
 ```
 
 *"Decode any MessagePack-encoded data."*
 
 **Arguments:**
-- `encoded`: A buffer object that holds the encoded data. Buffers are `bytes`, `bytearray`, or a custom type that supports the buffer protocol.
-- `extensions`: An [extension types](#extension-types) object for encoding custom objects.
+- `encoded`: A buffer object that holds the encoded data. Can be any object that supports the buffer protocol.
+- `str_keys`: If true, dictionaries are only allowed to use keys of type `str`.
+- `extensions`: An [extension types](#extension-types) object for decoding custom objects. If not given, the global extensions object is used.
 
 **Returns:** The decoded Python object.
 
-
-### `Decoder`
-
-```python
-cmsgpack.Decoder(file_name: str|None=None, extensions: Extensions=None, strict_keys: bool=False) -> Decoder
-```
-
-*"Class-based wrapper for `decode()` that retains optional arguments."*
-
-**Arguments:**
-- `file_name`: The path to the file to read data from.
-- `extensions`: An [extension types](#extension-types) object for decoding custom objects.
-
-**Returns:** A new instance of the `Decoder` class.
-
-> [Note]
->
-> When the `file_name` argument is passed, the `Decoder` will be used for streaming from that file.
-
-
-#### `Decoder.decode`
+### `Stream`
 
 ```python
-cmsgpack.Decoder.decode(encoded: Buffer) -> any
+cmsgpack.Stream(str_keys: bool=False, extensions: Extensions=None) -> Stream
 ```
 
-*"Decode any MessagePack-encoded data using the class's stored arguments."*
+*"Wrapper for `encode`/`decode` that retains optional arguments."*
 
 **Arguments:**
-- `encoded`: A buffer object that holds the encoded data. Buffers are `bytes`, `bytearray`, or a custom type that supports the buffer protocol. **This argument is required unless streaming is enabled.**
+- `str_keys`: If true, dictionaries are only allowed to use keys of type `str`.
+- `extensions`: An [extension types](#extension-types) object for decoding custom objects. If not given, the global extensions object is used.
+
+**Returns:** A new instance of the `Stream` class.
+
+**Class variables:**
+- `str_keys: bool`
+- `extensions: Extensions`
+
+The `Stream` class can be used for incremental serialization. The optional arguments that you'd normally pass to `encode`/`decode` are instead passed once when you create an instance of the class, and the class retains them and automatically uses them when you use the class's `encode`/`decode` functions. Using the `Stream` object is also slightly more efficient when you plan on passing keyword arguments.
+
+#### `Stream.encode`
+
+```python
+cmsgpack.Stream.encode(obj: any, /) -> bytes
+```
+
+*"Encode Python data to bytes."*
+
+**Arguments:**
+- `obj`: The object to encode. This can be any of the [supported types](#supported-types).
+
+**Returns:** The encoded data as a `bytes` object.
+
+#### `Stream.decode`
+
+```python
+cmsgpack.Stream.decode(encoded: Buffer, /) -> any
+```
+
+*"Decode any MessagePack-encoded data."*
+
+**Arguments:**
+- `encoded`: A buffer object that holds the encoded data. Can be any object that supports the buffer protocol.
+
+**Returns:** The decoded Python object.
+
+### `FileStream`
+
+```python
+cmsgpack.FileStream(file_name: str, reading_offset: int=0, chunk_size: int=16384, str_keys: bool=False, extensions: Extensions=None) -> FileStream
+```
+
+*"Wrapper for `encode`/`decode` that retains optional arguments and reads/writes a file directly."*
+
+**Arguments:**
+- `file_name`: The path towards the file to use for reading and writing.
+- `reading_offset`: The reading offset to start at in the file.
+- `chunk_size`: The chunk size of the file buffer for reading. A larger size can be used if the size of the data is large to minimize direct disk reads. A smaller size can be used if the size of the data is small to minimize memory usage.
+- `str_keys`: If true, dictionaries are only allowed to use keys of type `str`.
+- `extensions`: An [extension types](#extension-types) object for decoding custom objects. If not given, the global extensions object is used.
+
+**Returns:** A new instance of the `FileStream` class.
+
+**Class variables:**
+- `reading_offset: int`
+- `chunk_size: int`
+- `str_keys: bool`
+- `extensions: Extensions`
+
+The `FileStream` object can be used for serialization to/from a file. Just like the `Stream` object, optional arguments are retained. Reading is done from an offset within the file, which defaults to the start of the file, offset 0. Writing always appends to the end of the file.
+
+In the unlikely event of a failed write due to an OS error, this library always attempts to truncate the file to remove any partially written data to avoid data corruption. Otherwise, the error message will always provide the exact writing offset and length. File truncation currently only works for Windows and POSIX-compliant systems.
+
+#### `FileStream.encode`
+
+```python
+cmsgpack.FileStream.encode(obj: any, /) -> NoReturn
+```
+
+*"Encode Python data and write it to the file."*
+
+**Arguments:**
+- `obj`: The object to encode. This can be any of the [supported types](#supported-types).
+
+**Returns:** This function does not return the encoded data, as this is written to the file. `None` is returned instead.
+
+#### `FileStream.decode`
+
+```python
+cmsgpack.FileStream.decode() -> any
+```
+
+*"Decode MessagePack-encoded data read from the file."*
+
+**Arguments:** This function does not take any arguments. The encoded data is read from the file instead.
 
 **Returns:** The decoded Python object.
 
@@ -253,6 +182,18 @@ Extension types (ext types) are used for serializing types not supported by defa
 
 It's important that the same ID is assigned to an extension type across all sessions. This includes sessions outside of `cmsgpack` or Python. The ID is used to identify the type, and when a different one is used, the serializer has no way to know what to do with the data.
 
+**Contents:**
+- [How extension types are managed](#how-extension-types-are-managed)
+- [The global extensions object](#the-global-extensions-object)
+- [Structuring the encoding/decoding functions](#structuring-the-encodingdecoding-functions)
+- [`Extensions`](#extensions)
+	- [`add`](#extensionsadd)
+	- [`add_encode`](#extensionsadd_encode)
+	- [`add_decode`](#extensionsadd_decode)
+	- [`remove`](#extensions.emove)
+	- [`remove_encode`](#extensionsremove_encode)
+	- [`remove_decode`](#extensionsremove_decode)
+	- [`clear`](#extensionsclear)
 
 ### How extension types are managed
 
@@ -268,14 +209,12 @@ This separation allows us to assign the same ID to different types, if required 
 > 
 > The separation between encoding and decoding makes the remove functions of extension objects appear a bit strange. The reason `cmsgpack` requires the extension type when removing the encoding part, and the ID when removing a decoding part, is because look-ups for encoding are done using the type, and look-ups for decoding are done using the ID.
 
-
 ### The global extensions object
 
 The global extensions object, `cmsgpack.extensions`, is already set up and ready for use. This
 object can be used just like a manually created extensions object, for example: `cmsgpack.extensions.add(...)` to add a type. The default values when creating an extensions object are also applied to this object.
 
 The global object does not have to be passed to functions explicitly, this is automatically managed internally. When you want to use a manual extensions object, you can pass it to the function, and it will override the global object.
-
 
 ### Structuring the encoding/decoding functions
 
@@ -285,7 +224,7 @@ The decoding function will receive a `bytes` object (or `memoryview` object, if 
 
 Both functions are allowed to throw exceptions. These will be handled properly, and the serialization process will be stopped so that the exception can be thrown.
 
-This is an example of how it might look for a `complex` object:
+Here is an example of how it might look for a `complex` object:
 
 ```python
 # The function for encoding a `complex` object
@@ -305,7 +244,6 @@ EXT_ID_COMPLEX = 1
 cmsgpack.extensions.add(EXT_ID_COMPLEX, complex, encode_complex, decode_complex)
 ```
 
-
 ### `Extensions`
 
 ```python
@@ -319,6 +257,9 @@ cmsgpack.Extensions(types: dict | None=None, pass_memoryview: bool=False) -> sel
 - `pass_memoryview`: Whether decoding functions should receive a `memoryview` object instead of a `bytes` object. Using a `memoryview` object is better for performance, but may add more complexity to handling the data.
 
 **Returns:** A new instance of the `Extensions` class.
+
+**Class variables:**
+- `pass_memoryview: bool`
 
 An example on how to structure the `types` dict:
 
@@ -345,7 +286,6 @@ ext = cmsgpack.Extensions(types)
 > [Note]
 > 
 > If multiple types need to be encoded under the same ID, they should be added explicitly through an add function.
-
 
 #### `Extensions.add`
 
@@ -392,7 +332,6 @@ cmsgpack.Extensions.add_decode(id: int, decfunc: Callable, /) -> None
 
 **Returns:** `None`.
 
-
 #### `Extensions.remove`
 
 ```python
@@ -424,7 +363,6 @@ cmsgpack.Extensions.remove_encode(type: type) -> None
 
 **Returns:** `None`.
 
-
 #### `Extensions.remove_decode`
 
 ```python
@@ -450,15 +388,3 @@ cmsgpack.Extensions.clear() -> None
 - No arguments.
 
 **Returns:** `None`.
-
-
-## Thread-safety
-
-`cmsgpack` is made to be thread-safe for Python versions that have the GIL removed. With the GIL, thread-safety is not required as only one operation can be performed at the same time. But without the GIL, `cmsgpack` makes sure to use thread-safe locks and other methods to prevent race-conditions and concurrency.
-
-When the GIL is active, `cmsgpack` does not apply any explicit thread-safety measures because they are not required, and thread-safety measures add performance overhead. However, everything is still structured to be safe for sharing, meaning an object like the `Encoder` can be used for different data "concurrently" when the GIL is enabled.
-
-
-## Questions and feedback
-
-If you have any questions or feel like something is unclear or could be better, feel free to contact me by [mail](mailto:boertjens.sven@gmail.com) or create an issue on the [GitHub](https://github.com/svenboertjens/cmsgpack) page.

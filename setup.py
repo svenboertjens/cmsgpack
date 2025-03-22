@@ -15,14 +15,14 @@ ext_modules = [
 
 setup(
     name="cmsgpack",
-    version="0.0.4",
+    version="0.1.0",
     
     author="Sven Boertjens",
     author_email="boertjens.sven@gmail.com",
     
     description="High-performance MessagePack library written in C",
     
-    long_description=open('README', 'r').read(),
+    long_description=open('README.md', 'r').read(),
     long_description_content_type="text/markdown",
     
     url="https://github.com/svenboertjens/cmsgpack",

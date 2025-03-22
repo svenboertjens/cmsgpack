@@ -2187,7 +2187,7 @@ static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     extensions_t *ext = &states->extensions;
 
     keyarg_t keyargs[] = {
-        KEYARG(&ext, &PyBool_Type, states->interned.str_keys),
+        KEYARG(&str_keys, &PyBool_Type, states->interned.str_keys),
         KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
@@ -2206,9 +2206,12 @@ static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
 static PyObject *Stream(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
 {
     mstates_t *states = get_mstates(self);
+
+    PyObject *str_keys = Py_False;
     extensions_t *ext = &states->extensions;
 
     keyarg_t keyargs[] = {
+        KEYARG(&str_keys, &PyBool_Type, states->interned.str_keys),
         KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
@@ -2224,6 +2227,7 @@ static PyObject *Stream(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     // Set the object fields
     stream->ext = ext;
     stream->states = states;
+    stream->str_keys = str_keys == Py_True;
 
     // Keep a reference to the ext object
     Py_INCREF(ext);
@@ -2246,6 +2250,37 @@ static PyObject *stream_encode(stream_t *stream, PyObject *obj)
 static PyObject *stream_decode(stream_t *stream, PyObject *encoded)
 {
     return decbuffer_start(encoded, stream->str_keys, stream->ext->data, stream->states);
+}
+
+static PyObject *stream_get_strkey(stream_t *stream, void *closure)
+{
+    return stream->str_keys == true ? Py_True : Py_False;
+}
+
+static PyObject *stream_get_extensions(stream_t *stream, void *closure)
+{
+    PyObject *ext = (PyObject *)stream->ext;
+
+    Py_INCREF(ext);
+    return ext;
+}
+
+static PyObject *stream_set_strkey(stream_t *stream, PyObject *arg, void *closure)
+{
+    stream->str_keys = arg == Py_True;
+    Py_RETURN_NONE;
+}
+
+static PyObject *stream_set_extensions(stream_t *stream, PyObject *arg, void *closure)
+{
+    if (Py_TYPE(arg) != &ExtensionsObj)
+        return PyErr_Format(PyExc_TypeError, "Expected an object of type 'cmsgpack.Extensions', but got an object of type '%s'", Py_TYPE(arg)->tp_name);
+    
+    Py_DECREF(stream->ext);
+    Py_INCREF(arg);
+
+    stream->ext = (extensions_t *)arg;
+    Py_RETURN_NONE;
 }
 
 
@@ -2320,12 +2355,14 @@ static PyObject *FileStream(PyObject *self, PyObject **args, Py_ssize_t nargs, P
     PyObject *reading_offset = NULL;
     PyObject *chunk_size = NULL;
     PyObject *filename = NULL;
+    PyObject *str_keys = Py_False;
     extensions_t *ext = &states->extensions;
 
     keyarg_t keyargs[] = {
         KEYARG(&filename, &PyUnicode_Type, states->interned.file_name),
         KEYARG(&reading_offset, &PyLong_Type, states->interned.reading_offset),
         KEYARG(&chunk_size, &PyLong_Type, states->interned.chunk_size),
+        KEYARG(&str_keys, &PyBool_Type, states->interned.str_keys),
         KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
@@ -2354,6 +2391,7 @@ static PyObject *FileStream(PyObject *self, PyObject **args, Py_ssize_t nargs, P
     // Set the object fields
     stream->ext = ext;
     stream->states = states;
+    stream->str_keys = str_keys == Py_True;
 
     // Keep a reference to the ext object
     Py_INCREF(ext);
@@ -2501,6 +2539,102 @@ static bool filestream_refresh_decode(buffer_t *b, size_t required)
     b->maxoffset = b->base + unused + read;
 
     return true;
+}
+
+static PyObject *filestream_get_readingoffset(filestream_t *stream, void *closure)
+{
+    PyObject *num = PyLong_FromLongLong(stream->foff);
+
+    if (!num)
+        return PyErr_NoMemory();
+    
+    return num;
+}
+
+static PyObject *filestream_get_chunksize(filestream_t *stream, void *closure)
+{
+    PyObject *num = PyLong_FromLongLong(stream->fbuf_size);
+
+    if (!num)
+        return PyErr_NoMemory();
+    
+    return num;
+}
+
+static PyObject *filestream_get_strkey(filestream_t *stream, void *closure)
+{
+    return stream->str_keys == true ? Py_True : Py_False;
+}
+
+static PyObject *filestream_get_extensions(filestream_t *stream, void *closure)
+{
+    PyObject *ext = (PyObject *)stream->ext;
+
+    Py_INCREF(ext);
+    return ext;
+}
+
+static PyObject *filestream_set_readingoffset(filestream_t *stream, PyObject *arg, void *closure)
+{
+    if (Py_TYPE(arg) != &PyLong_Type)
+        return PyErr_Format(PyExc_TypeError, "Expected an object of type 'int', but got an object of type '%s'", Py_TYPE(arg)->tp_name);
+    
+    int overflow = 0;
+    long num = PyLong_AsLongAndOverflow(arg, &overflow);
+
+    if (overflow)
+    {
+        PyErr_SetString(PyExc_ValueError, "Got an integer that exceeded the system word size");
+        return NULL;
+    }
+
+    stream->foff = num;
+    Py_RETURN_NONE;
+}
+
+static PyObject *filestream_set_chunksize(filestream_t *stream, PyObject *arg, void *closure)
+{
+    if (Py_TYPE(arg) != &PyLong_Type)
+        return PyErr_Format(PyExc_TypeError, "Expected an object of type 'int', but got an object of type '%s'", Py_TYPE(arg)->tp_name);
+    
+    int overflow = 0;
+    long num = PyLong_AsLongAndOverflow(arg, &overflow);
+
+    if (overflow)
+    {
+        PyErr_SetString(PyExc_ValueError, "Got an integer that exceeded the system word size");
+        return NULL;
+    }
+
+    char *newbuf = (char *)malloc(num);
+
+    if (!newbuf)
+        return PyErr_NoMemory();
+    
+    free(stream->fbuf);
+    
+    stream->fbuf = newbuf;
+    stream->fbuf_size = num;
+
+    Py_RETURN_NONE;
+}
+
+static PyObject *filestream_set_strkey(filestream_t *stream, PyObject *arg, void *closure)
+{
+    stream->str_keys = arg == Py_True;
+    Py_RETURN_NONE;
+}
+
+static PyObject *filestream_set_extensions(filestream_t *stream, PyObject *arg, void *closure)
+{
+    if (Py_TYPE(arg) != &ExtensionsObj)
+        return PyErr_Format(PyExc_TypeError, "Expected an object of type 'cmsgpack.Extensions', but got an object of type '%s'", Py_TYPE(arg)->tp_name);
+    
+    Py_DECREF(stream->ext);
+    Py_INCREF(arg);
+
+    stream->ext = (extensions_t *)arg;
+    Py_RETURN_NONE;
 }
 
 
@@ -2688,6 +2822,22 @@ static PyMethodDef ExtensionsMethods[] = {
     {NULL}
 };
 
+static PyGetSetDef StreamGetSet[] = {
+    {"str_keys", (getter)stream_get_strkey, (setter)stream_set_strkey, NULL, NULL},
+    {"extensions", (getter)stream_get_extensions, (setter)stream_set_extensions, NULL, NULL},
+
+    {NULL}
+};
+
+static PyGetSetDef FileStreamGetSet[] = {
+    {"reading_offset", (getter)filestream_get_readingoffset, (setter)filestream_set_readingoffset, NULL, NULL},
+    {"chunk_size", (getter)filestream_get_chunksize, (setter)filestream_set_chunksize, NULL, NULL},
+    {"str_keys", (getter)filestream_get_strkey, (setter)filestream_set_strkey, NULL, NULL},
+    {"extensions", (getter)filestream_get_extensions, (setter)filestream_set_extensions, NULL, NULL},
+
+    {NULL}
+};
+
 static PyGetSetDef ExtensionsGetSet[] = {
     {"pass_memoryview", (getter)extensions_get_passmemview, (setter)extensions_set_passmemview, NULL, NULL},
 
@@ -2717,6 +2867,7 @@ static PyTypeObject StreamObj = {
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_methods = StreamMethods,
     .tp_dealloc = (destructor)stream_dealloc,
+    .tp_getset = StreamGetSet,
     .tp_new = NULL,
 };
 
@@ -2727,6 +2878,7 @@ static PyTypeObject FileStreamObj = {
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_methods = FileStreamMethods,
     .tp_dealloc = (destructor)filestream_dealloc,
+    .tp_getset = FileStreamGetSet,
     .tp_new = NULL,
 };
 
