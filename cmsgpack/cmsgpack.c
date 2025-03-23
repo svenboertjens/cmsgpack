@@ -8,6 +8,8 @@
 #include <Python.h>
 #include <stdbool.h>
 
+//#define _need_threadsafe
+
 #ifdef _need_threadsafe
 #include <stdatomic.h>
 #endif
@@ -130,7 +132,7 @@ typedef struct {
     PyObject_HEAD
 
     bool str_keys;     // Whether to allow string keys
-    extensions_t *ext; // The extensions object to use
+    PyObject *ext;     // The extensions object to use
     mstates_t *states; // The module states
 } stream_t;
 
@@ -142,7 +144,7 @@ typedef struct {
     #endif
 
     bool str_keys;     // Whether to allow string keys
-    extensions_t *ext; // The extensions object to use
+    PyObject *ext;     // The extensions object to use
     mstates_t *states; // The module states
 
     FILE *file;  // The file, opened in "a+b" mode
@@ -163,13 +165,11 @@ static _always_inline mstates_t *get_mstates(PyObject *m);
 static _always_inline bool encode_object_inline(buffer_t *b, PyObject *obj);
 static PyObject *decode_bytes(buffer_t *b);
 
+static _always_inline bool ensure_space(buffer_t *b, size_t required);
 static _always_inline bool overread_check(buffer_t *b, size_t required);
 
-static bool encbuffer_expand(buffer_t *b, size_t needed);
-static bool filestream_refresh_decode(buffer_t *b, size_t required);
 
-
-static struct PyModuleDef cmsgpack;
+static PyModuleDef cmsgpack;
 
 
 /////////////////////
@@ -746,13 +746,6 @@ static _always_inline PyObject *attempt_decode_ext(buffer_t *b, char *buf, size_
 //  WRITING DATA  //
 ////////////////////
 
-#define ENSURE_SPACE(extra) do { \
-    if (b->offset + (extra) >= b->maxoffset) \
-    { \
-        NULLCHECK(encbuffer_expand(b, (extra))); \
-    } \
-} while (0)
-
 // Get the current offset's byte and increment afterwards
 #define INCBYTE ((b->offset++)[0])
 
@@ -843,8 +836,9 @@ static _always_inline bool write_string(buffer_t *b, PyObject *obj)
 
     if (base == NULL)
         return false;
-    
-    ENSURE_SPACE(size + 5);
+
+    if (!ensure_space(b, size + 5))
+        return false;
 
     if (size <= LIMIT_STR_FIXED)
     {
@@ -877,7 +871,8 @@ static _always_inline bool write_string(buffer_t *b, PyObject *obj)
 // Separate for writing binary
 static _always_inline bool write_binary(buffer_t *b, char *base, size_t size)
 {
-    ENSURE_SPACE(5 + size);
+    if (!ensure_space(b, size + 5))
+        return false;
 
     if (size <= LIMIT_SMALL)
     {
@@ -933,7 +928,8 @@ static _always_inline bool write_double(buffer_t *b, PyObject *obj)
 {
     double num = PyFloat_AS_DOUBLE(obj);
 
-    ENSURE_SPACE(9);
+    if (!ensure_space(b, 9))
+        return false;
 
     // Ensure big-endianness
     BIG_DOUBLE(num);
@@ -949,7 +945,8 @@ static _always_inline bool write_double(buffer_t *b, PyObject *obj)
 static bool write_integer(buffer_t *b, PyObject *obj)
 {
     // Ensure 9 bytes of space, max size of integer + header
-    ENSURE_SPACE(9);
+    if (!ensure_space(b, 9))
+        return false;
 
     // Cast the object to a long value to access internals
     PyLongObject *lobj = (PyLongObject *)obj;
@@ -1144,14 +1141,16 @@ static bool write_integer(buffer_t *b, PyObject *obj)
 
 static _always_inline bool write_bool(buffer_t *b, PyObject *obj)
 {
-    //ENSURE_SPACE(1);
+    // No ensure_space, already done globally
+
     INCBYTE = obj == Py_True ? DT_TRUE : DT_FALSE;
     return true;
 }
 
 static _always_inline bool write_nil(buffer_t *b, PyObject *obj)
 {
-    //ENSURE_SPACE(1);
+    // No ensure_space, already done globally
+
     INCBYTE = DT_NIL;
     return true;
 }
@@ -1170,7 +1169,7 @@ static _always_inline bool recursion_check(buffer_t *b)
 
 static _always_inline bool write_array_header(buffer_t *b, size_t nitems)
 {
-    //ENSURE_SPACE(5);
+    // No ensure_space, already done globally
 
     if (nitems <= LIMIT_ARR_FIXED)
     {
@@ -1318,7 +1317,7 @@ static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
 
     const size_t npairs = PyDict_Size(obj);
 
-    //ENSURE_SPACE(5);
+    // No ensure_space, already done globally
     
     if (npairs <= LIMIT_MAP_FIXED)
     {
@@ -1389,7 +1388,8 @@ static _always_inline bool write_extension(buffer_t *b, PyObject *obj)
 
     size_t size = (size_t)buf.len;
 
-    ENSURE_SPACE(6 + size);
+    if (!ensure_space(b, 6 + size))
+        return false;
 
     // If the size is a base of 2 and not larger than 16, it can be represented with a fixsize mask
     const bool is_baseof2 = size != 0 && (size & (size - 1)) == 0;
@@ -1626,19 +1626,19 @@ static bool encode_object(buffer_t *b, PyObject *obj, PyTypeObject *tp)
     {
         return write_list(b, obj);
     }
+    else if (PyDict_Check(obj)) // Supports dict subclasses
+    {
+        return write_dict(b, obj);
+    }
     else if (tp == &PyTuple_Type)
     {
         return write_tuple(b, obj);
     }
-    else if (PyDict_Check(obj)) // Dict subclasses are supported
-    {
-        return write_dict(b, obj);
-    }
-    else if (PyList_Check(obj)) // For list subclasses
+    else if (PyList_Check(obj)) // Support list subclasses
     {
         return write_list_subclass(b, obj);
     }
-    else if (PyTuple_Check(obj)) // For tuple subclasses
+    else if (PyTuple_Check(obj)) // Support tuple subclasses
     {
         return write_tuple_subclass(b, obj);
     }
@@ -1677,8 +1677,9 @@ static _always_inline bool encode_object_inline(buffer_t *b, PyObject *obj)
         return write_double(b, obj);
     }
 
-    // Many cases after this require up to 5 bytes, so do a global ensure
-    ENSURE_SPACE(5);
+    // Many cases after this require writes to 5 bytes, so do a global ensure_space for them
+    if (!ensure_space(b, 5))
+        return false;
 
     if (tp == &PyBool_Type)
     {
@@ -1702,31 +1703,8 @@ static _always_inline bool encode_object_inline(buffer_t *b, PyObject *obj)
 // INCBYTE but type-casted to ensure we operate with a single byte
 #define SIZEBYTE ((unsigned char)(b->offset++)[0])
 
-// Mask away the top 3 bits of a mask for varlen cases, as they all have the same upper 3 bits
+// Masks away the top 3 bits of a mask for varlen cases, as they all have the same upper 3 bits
 #define VARLEN_DT(mask) (mask & 0b11111)
-
-// Check if we aren't overreading the buffer
-static _always_inline bool overread_check(buffer_t *b, size_t required)
-{
-    // Check if the offset would exceed the max offset
-    if (b->offset + required > b->maxoffset)
-    {
-        // If we have a file, we need to refresh it
-        if (b->file)
-        {
-            if (!filestream_refresh_decode(b, required))
-                return false;
-        }
-        else
-        {
-            // Otherwise, we'll overread the data, so set an exception
-            PyErr_SetString(PyExc_ValueError, "Received incomplete encoded data, the buffer ended before the encoded data pattern ended");
-            return false;
-        }
-    }
-
-    return true;
-}
 
 // Decoding of fixsize objects
 static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char mask)
@@ -2118,54 +2096,14 @@ static PyObject *decode_bytes(buffer_t *b)
 }
 
 
-//////////////////////
-//  ENC/DEC BUFFER  //
-//////////////////////
+///////////////////////////
+//  ADAPTIVE ALLOCATION  //
+///////////////////////////
 
-// Use thread-local variables instead of atomic variables to keep
-// the averages more local, and to prevent counterintuitive scaling
+// Use thread-local variables instead of atomic variables for thread-safety and
+// to keep the averages more local, and to prevent counterintuitive scaling
 _Thread_local size_t extra_avg = (EXTRA_ALLOC_MIN * 2);
 _Thread_local size_t item_avg = (ITEM_ALLOC_MIN * 2);
-
-// Prepare the encoding buffer struct
-static _always_inline bool encbuffer_prepare(buffer_t *b, PyObject *obj, size_t *nitems)
-{
-    // Initialize the new size with the extra average and set NITEMS to 0 in advance
-    size_t allocsize = extra_avg;
-    *nitems = 0;
-
-    // Attempt to allocate appropriate memory for the buffer based on OBJ's type
-    PyTypeObject *tp = Py_TYPE(obj);
-    if (tp == &PyList_Type || tp == &PyDict_Type)
-    {
-        // Get the number of items in the container
-        *nitems = Py_SIZE(obj);
-        
-        // Add allocation size based on the number of items
-        allocsize += *nitems * item_avg;
-    }
-
-    // Create the new buffer object
-    b->base = (char *)PyBytes_FromStringAndSize(NULL, allocsize);
-
-    if (b->base == NULL)
-    {
-        // Attempt to create an object with the default buffer size
-        b->base = (char *)PyBytes_FromStringAndSize(NULL, BUFFER_DEFAULTSIZE);
-
-        if (b->base == NULL)
-        {
-            PyErr_NoMemory();
-            return false;
-        }
-    }
-
-    // Set up the offset and max offset based on the buffer
-    b->offset = PyBytes_AS_STRING(b->base);
-    b->maxoffset = PyBytes_AS_STRING(b->base) + allocsize;
-
-    return true;
-}
 
 static _always_inline size_t biased_average(size_t curr, size_t new)
 {
@@ -2209,40 +2147,183 @@ static _always_inline void update_adaptive_allocation(buffer_t *b, size_t nitems
     return;
 }
 
-// Start encoding with an encbuffer
-static _always_inline PyObject *encbuffer_start(PyObject *obj, bool str_keys, ext_data_t ext, mstates_t *states)
+
+/////////////////////
+//  ENC/DEC START  //
+/////////////////////
+
+static _always_inline PyObject *encoding_write_file(buffer_t *b, filestream_t *fstream, size_t datasize)
 {
-    size_t nitems;
+    lock_flag(&fstream->lock);
+
+    // Write the data to the file
+    size_t written = fwrite(PyBytes_AS_STRING(b->base), 1, datasize, fstream->file);
+
+    // Remove reference to the bytes object as we won't return it
+    Py_DECREF(b->base);
+
+    // Check if all data was written
+    if (written != datasize)
+    {
+        // Get the errno
+        const int err = errno;
+
+        // Check if anything was written and otherwise attempt to truncate the file
+        size_t start_offset = ftell(fstream->file) - written; // The offset before the written data
+        if (written == 0 || _ftruncate(fstream->file, start_offset))
+        {
+            PyErr_Format(PyExc_OSError, "Attempted to write encoded data, but no data was written."
+                "\n\tErrno %i: %s", err, strerror(err));
+        }
+        else
+        {
+            PyErr_Format(PyExc_OSError, "Attempted to write encoded data, but the write could not be completed and truncation failed. "
+                "Incomplete data was written on position %zu, and %zu bytes were written."
+                "\n\tErrno %i: %s", start_offset, written, err, strerror(err));
+        }
+
+        unlock_flag(&fstream->lock);
+
+        return NULL;
+    }
+
+    unlock_flag(&fstream->lock);
+
+    Py_RETURN_NONE;
+}
+
+static _always_inline PyObject *encoding_start(PyObject *obj, mstates_t *states, PyObject *ext, bool str_keys, filestream_t *fstream)
+{
     buffer_t b;
 
-    // Assign all standard fields
+    // Assign non-buffer fields (not filedata, that's not used for encoding)
+    b.ext = ((extensions_t *)ext)->data;
     b.str_keys = str_keys;
-    b.ext = ext;
     b.states = states;
-    b.file = NULL; // Files don't go through here, they use custom handling
     b.recursion = 0;
 
-    // Prepare the encode buffer
-    NULLCHECK(encbuffer_prepare(&b, obj, &nitems));
+    // Estimate how much to allocate for the encoding buffer
+    size_t buffersize = extra_avg;
+    size_t nitems = 0;
 
-    // Encode the object
-    NULLCHECK(encode_object_inline(&b, obj));
+    // Check if the object is a list/tuple/dict for adaptive allocation
+    if (PyList_CheckExact(obj) || PyTuple_CheckExact(obj) || PyDict_CheckExact(obj))
+    {
+        nitems = Py_SIZE(obj);
+        buffersize += item_avg * nitems;
+    }
+    
+    // Allocate the buffer
+    b.base = (char *)PyBytes_FromStringAndSize(NULL, buffersize);
 
-    // Set the object's size
-    Py_SET_SIZE(b.base, (size_t)(b.offset - PyBytes_AS_STRING(b.base)));
+    if (!b.base)
+        return PyErr_NoMemory();
+    
+    // Set the offset and max offset
+    b.offset = PyBytes_AS_STRING(b.base);
+    b.maxoffset = b.offset + buffersize;
+
+    // Attempt to encode the object
+    if (!encode_object_inline(&b, obj))
+    {
+        Py_DECREF(b.base);
+        return NULL;
+    }
+    
+    // Calculate the size of the encoded data
+    size_t datasize = (size_t)(b.offset - PyBytes_AS_STRING(b.base));
+    Py_SET_SIZE(b.base, datasize);
 
     // Update the adaptive allocation
     update_adaptive_allocation(&b, nitems);
 
-    // Return the object
-    return (PyObject *)b.base;
+    // If not streaming, just return the object
+    if (!fstream)
+        return (PyObject *)b.base;
+
+    // Otherwise, write the data to the file
+    return encoding_write_file(&b, fstream, datasize);
 }
 
-// Expand the encoding buffer
-static bool encbuffer_expand(buffer_t *b, size_t extra)
+// Start a decoding run
+static _always_inline PyObject *decoding_start(PyObject *encoded, mstates_t *states, PyObject *ext, bool str_keys, filestream_t *fstream)
+{
+    buffer_t b;
+
+    // Assign non-buffer fields
+    b.ext = ((extensions_t *)ext)->data;
+    b.str_keys = str_keys;
+    b.states = states;
+
+    // Simply decode and return if not file streaming
+    if (!fstream)
+    {
+        // Set the file to NULL for overread checks
+        b.file = NULL;
+
+        // Get the buffer of the object
+        Py_buffer buf;
+        if (PyObject_GetBuffer(encoded, &buf, PyBUF_SIMPLE) < 0)
+            return NULL;
+        
+        // Set the buffer fields (base not used for regular decoding)
+        b.offset = buf.buf;
+        b.maxoffset = buf.buf + buf.len;
+        
+        // Decode the data
+        PyObject *result = decode_bytes(&b);
+
+        // Release the buffer
+        PyBuffer_Release(&buf);
+
+        // Check if we reached the end of the buffer
+        if (result != NULL && b.offset != b.maxoffset)
+        {
+            PyErr_SetString(PyExc_ValueError, "The encoded data pattern ended before the buffer ended");
+            return NULL;
+        }
+
+        return result;
+    }
+
+    // This path is reached when file streaming
+
+    // Assign the file-related fields (maxoffset is assigned based on how many bytes are read later)
+    b.fbuf_size = fstream->fbuf_size;
+    b.file = fstream->file;
+    b.base = fstream->fbuf;
+    b.offset = b.base;
+    
+    // Seek the file to the current offset
+    fseek(b.file, fstream->foff, SEEK_SET);
+
+    // Read data from the file into the buffer
+    size_t read = fread(b.base, 1, b.fbuf_size, b.file);
+    b.maxoffset = b.base + read; // Set the max buffer offset based on how much data we read
+
+    // Decode the read data
+    PyObject *result = decode_bytes(&b);
+
+    // Calculate up to where we had to read from the file (up until the data of the next encoded data block)
+    size_t end_offset = ftell(b.file);
+    size_t buffer_unused = (size_t)(b.maxoffset - b.offset);
+    size_t new_offset = end_offset - buffer_unused;
+    fstream->foff = new_offset; // Update the reading offset
+
+    // Update the file buffer address and size
+    fstream->fbuf = b.base;
+    fstream->fbuf_size = b.fbuf_size;
+
+    unlock_flag(&fstream->lock);
+
+    return result;
+}
+
+// Expand the encoding buffer when it doesn't have enough space
+static bool encoding_expand_buffer(buffer_t *b, size_t required)
 {
     // Scale the size by factor 1.5x
-    const size_t allocsize = ((size_t)(b->offset - PyBytes_AS_STRING(b->base)) + extra) * 1.5;
+    const size_t allocsize = ((size_t)(b->offset - PyBytes_AS_STRING(b->base)) + required) * 1.5;
 
     // Reallocate the object (also allocate space for the bytes object itself)
     char *reallocd = PyObject_Realloc(b->base, allocsize + sizeof(PyBytesObject));
@@ -2261,38 +2342,74 @@ static bool encbuffer_expand(buffer_t *b, size_t extra)
     return true;
 }
 
-
-// Start decoding with a decbuffer
-static _always_inline PyObject *decbuffer_start(PyObject *encoded, bool str_keys, ext_data_t ext, mstates_t *states)
+// Refresh the file buffer with new data while decoding
+static bool decoding_refresh_fbuf(buffer_t *b, size_t required)
 {
-    buffer_t b;
+    // Calculate how much from the buffer is unused
+    size_t unused = (size_t)(b->maxoffset - b->offset);
 
-    // Assign the standard data
-    b.str_keys = str_keys;
-    b.ext = ext;
-    b.states = states;
-    b.file = NULL; // File data doesn't go through here, so always NULL
+    // Move the unused data to the start of the buffer
+    memmove(b->base, b->offset, unused);
 
-    // Get a buffer of the encoded data buffer
-    Py_buffer buf;
-    if (PyObject_GetBuffer(encoded, &buf, PyBUF_SIMPLE) < 0)
-        return PyErr_Format(PyExc_BufferError, "Unable to open the encoded data object as a buffer. Object has type '%s'", Py_TYPE(encoded)->tp_name);
-    
-    b.offset = buf.buf;
-    b.maxoffset = buf.buf + buf.len;
-
-    PyObject *result = decode_bytes(&b);
-
-    PyBuffer_Release(&buf);
-
-    // Check if we reached the end of the buffer
-    if (result != NULL && b.offset != b.maxoffset)
+    // Check if the required size exceeds the buffer size
+    if (required > b->fbuf_size)
     {
-        PyErr_SetString(PyExc_ValueError, "The encoded data pattern ended before ");
-        return NULL;
+        size_t newsize = required * 1.2;
+        char *fbuf = (char *)realloc(b->base, newsize);
+
+        if (!fbuf)
+            return PyErr_NoMemory();
+        
+        b->base = fbuf;
+        b->fbuf_size = newsize;
     }
 
-    return result;
+    // Read new data into the buffer above the unused data
+    size_t read = fread(b->base + unused, 1, b->fbuf_size - unused, b->file);
+
+    // Check if we have less data than required, meaning we reached EOF
+    if (read + unused < required)
+    {
+        PyErr_SetString(PyExc_EOFError, "Reached EOF before finishing the decoding run");
+        return false;
+    }
+
+    // Update the offsets
+    b->offset = b->base;
+    b->maxoffset = b->base + unused + read;
+
+    return true;
+}
+
+// Ensure enough space is in the encoding buffer
+static _always_inline bool ensure_space(buffer_t *b, size_t required)
+{
+    if (b->offset + required >= b->maxoffset)
+        return encoding_expand_buffer(b, required);
+    
+    return true;
+}
+
+// Check if we aren't overreading the buffer when reading REQUIRED bytes
+static _always_inline bool overread_check(buffer_t *b, size_t required)
+{
+    // Check if the offset would exceed the max offset
+    if (b->offset + required > b->maxoffset)
+    {
+        // If we have a file, we need to refresh it
+        if (b->file)
+        {
+            return decoding_refresh_fbuf(b, required);
+        }
+        else
+        {
+            // Otherwise, we'll overread the data, so set an exception
+            PyErr_SetString(PyExc_ValueError, "Received incomplete encoded data, the buffer ended before the encoded data pattern ended");
+            return false;
+        }
+    }
+
+    return true;
 }
 
 
@@ -2311,7 +2428,7 @@ static PyObject *encode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     mstates_t *states = get_mstates(self);
 
     PyObject *str_keys = Py_False;
-    extensions_t *ext = &states->extensions;
+    PyObject *ext = (PyObject *)&states->extensions;
 
     keyarg_t keyargs[] = {
         KEYARG(&str_keys, &PyBool_Type, states->interned.str_keys),
@@ -2320,10 +2437,8 @@ static PyObject *encode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
 
     if (!parse_keywords(npositional, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
         return NULL;
-    
-    bool only_str_keys = str_keys == Py_True;
 
-    return encbuffer_start(obj, only_str_keys, ext->data, states);
+    return encoding_start(obj, states, ext, str_keys == Py_True, NULL);
 }
 
 static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
@@ -2337,7 +2452,7 @@ static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     mstates_t *states = get_mstates(self);
 
     PyObject *str_keys = Py_False;
-    extensions_t *ext = &states->extensions;
+    PyObject *ext = (PyObject *)&states->extensions;
 
     keyarg_t keyargs[] = {
         KEYARG(&str_keys, &PyBool_Type, states->interned.str_keys),
@@ -2347,9 +2462,7 @@ static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     if (!parse_keywords(npositional, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
         return NULL;
 
-    bool only_str_keys = str_keys == Py_True;
-
-    return decbuffer_start(encoded, only_str_keys, ext->data, states);
+    return decoding_start(encoded, states, ext, str_keys == Py_True, NULL);
 }
 
 ////////////////////
@@ -2361,7 +2474,7 @@ static PyObject *Stream(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     mstates_t *states = get_mstates(self);
 
     PyObject *str_keys = Py_False;
-    extensions_t *ext = &states->extensions;
+    PyObject *ext = (PyObject *)&states->extensions;
 
     keyarg_t keyargs[] = {
         KEYARG(&str_keys, &PyBool_Type, states->interned.str_keys),
@@ -2397,12 +2510,12 @@ static void stream_dealloc(stream_t *stream)
 
 static PyObject *stream_encode(stream_t *stream, PyObject *obj)
 {
-    return encbuffer_start(obj, stream->str_keys, stream->ext->data, stream->states);
+    return encoding_start(obj, stream->states, stream->ext, stream->str_keys, NULL);
 }
 
 static PyObject *stream_decode(stream_t *stream, PyObject *encoded)
 {
-    return decbuffer_start(encoded, stream->str_keys, stream->ext->data, stream->states);
+    return decoding_start(encoded, stream->states, stream->ext, stream->str_keys, NULL);
 }
 
 static PyObject *stream_get_strkey(stream_t *stream, void *closure)
@@ -2412,7 +2525,7 @@ static PyObject *stream_get_strkey(stream_t *stream, void *closure)
 
 static PyObject *stream_get_extensions(stream_t *stream, void *closure)
 {
-    PyObject *ext = (PyObject *)stream->ext;
+    PyObject *ext = stream->ext;
 
     Py_INCREF(ext);
     return ext;
@@ -2432,7 +2545,7 @@ static PyObject *stream_set_extensions(stream_t *stream, PyObject *arg, void *cl
     Py_DECREF(stream->ext);
     Py_INCREF(arg);
 
-    stream->ext = (extensions_t *)arg;
+    stream->ext = arg;
     Py_RETURN_NONE;
 }
 
@@ -2509,7 +2622,7 @@ static PyObject *FileStream(PyObject *self, PyObject **args, Py_ssize_t nargs, P
     PyObject *chunk_size = NULL;
     PyObject *filename = NULL;
     PyObject *str_keys = Py_False;
-    extensions_t *ext = &states->extensions;
+    PyObject *ext = (PyObject *)&states->extensions;
 
     keyarg_t keyargs[] = {
         KEYARG(&filename, &PyUnicode_Type, states->interned.file_name),
@@ -2567,131 +2680,12 @@ static void filestream_dealloc(filestream_t *stream)
 
 static PyObject *filestream_encode(filestream_t *stream, PyObject *obj)
 {
-    PyObject *encoded = encbuffer_start(obj, stream->str_keys, stream->ext->data, stream->states);
-
-    if (!encoded)
-        return NULL;
-    
-    // Get the buffer data
-    char *buf = PyBytes_AS_STRING(encoded);
-    size_t size = PyBytes_GET_SIZE(encoded);
-
-    lock_flag(&stream->lock);
-
-    // Write the data to the file
-    size_t written = fwrite(buf, 1, size, stream->file);
-
-    // Remove reference to the bytes object as we won't return it
-    Py_DECREF(encoded);
-
-    // Check if all data was written
-    if (written != size)
-    {
-        // Get the errno
-        const int err = errno;
-
-        // Check if anything was written and otherwise attempt to truncate the file
-        size_t start_offset = ftell(stream->file) - written; // The offset before the written data
-        if (written == 0 || _ftruncate(stream->file, start_offset))
-        {
-            PyErr_Format(PyExc_OSError, "Attempted to write encoded data, but no data was written."
-                "\n\tErrno %i: %s", err, strerror(err));
-        }
-        else
-        {
-            PyErr_Format(PyExc_OSError, "Attempted to write encoded data, but the write could not be completed and truncation failed. "
-                "Incomplete data was written on position %zu, and %zu bytes were written."
-                "\n\tErrno %i: %s", start_offset, written, err, strerror(err));
-        }
-
-        unlock_flag(&stream->lock);
-
-        return NULL;
-    }
-
-    unlock_flag(&stream->lock);
-
-    Py_RETURN_NONE;
+    return encoding_start(obj, stream->states, stream->ext, stream->str_keys, stream);
 }
 
 static PyObject *filestream_decode(filestream_t *stream)
 {
-    lock_flag(&stream->lock);
-
-    // Set up the buffer object manually to have it use the file buffer
-    buffer_t b;
-
-    b.str_keys = stream->str_keys;
-    b.fbuf_size = stream->fbuf_size;
-    b.base = stream->fbuf;
-    b.offset = b.base;
-    b.ext = stream->ext->data;
-    b.states = stream->states;
-    b.file = stream->file;
-
-    // Seek the file to the current offset
-    fseek(b.file, stream->foff, SEEK_SET);
-
-    // Read data from the file into the buffer
-    size_t read = fread(b.base, 1, b.fbuf_size, b.file);
-
-    // Set the max buffer offset based on how much data we read
-    b.maxoffset = b.base + read;
-
-    // Decode the data and get the result
-    PyObject *result = decode_bytes(&b);
-
-    // Calculate up to where we had to read from the file (up until the data of the next encoded data block)
-    size_t end_offset = ftell(b.file);
-    size_t buffer_unused = (size_t)(b.maxoffset - b.offset);
-    size_t new_offset = end_offset - buffer_unused;
-    stream->foff = new_offset; // Update the reading offset
-
-    // Update the file buffer address and size
-    stream->fbuf = b.base;
-    stream->fbuf_size = b.fbuf_size;
-
-    unlock_flag(&stream->lock);
-
-    return result;
-}
-
-static bool filestream_refresh_decode(buffer_t *b, size_t required)
-{
-    // Calculate how much from the buffer is unused
-    size_t unused = (size_t)(b->maxoffset - b->offset);
-
-    // Move the unused data to the start of the buffer
-    memmove(b->base, b->offset, unused);
-
-    // Check if the required size exceeds the buffer size
-    if (required > b->fbuf_size)
-    {
-        size_t newsize = required * 1.2;
-        char *fbuf = (char *)realloc(b->base, newsize);
-
-        if (!fbuf)
-            return PyErr_NoMemory();
-        
-        b->base = fbuf;
-        b->fbuf_size = newsize;
-    }
-
-    // Read new data into the buffer above the unused data
-    size_t read = fread(b->base + unused, 1, b->fbuf_size - unused, b->file);
-
-    // Check if we have less data than required, meaning we reached EOF
-    if (read + unused < required)
-    {
-        PyErr_SetString(PyExc_EOFError, "Reached EOF before finishing the decoding run");
-        return false;
-    }
-
-    // Update the offsets
-    b->offset = b->base;
-    b->maxoffset = b->base + unused + read;
-
-    return true;
+    return decoding_start(NULL, stream->states, stream->ext, stream->str_keys, stream);
 }
 
 static PyObject *filestream_get_readingoffset(filestream_t *stream, void *closure)
@@ -2721,7 +2715,7 @@ static PyObject *filestream_get_strkey(filestream_t *stream, void *closure)
 
 static PyObject *filestream_get_extensions(filestream_t *stream, void *closure)
 {
-    PyObject *ext = (PyObject *)stream->ext;
+    PyObject *ext = stream->ext;
 
     Py_INCREF(ext);
     return ext;
@@ -2786,7 +2780,7 @@ static PyObject *filestream_set_extensions(filestream_t *stream, PyObject *arg, 
     Py_DECREF(stream->ext);
     Py_INCREF(arg);
 
-    stream->ext = (extensions_t *)arg;
+    stream->ext = arg;
     Py_RETURN_NONE;
 }
 

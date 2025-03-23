@@ -30,7 +30,7 @@ if test.success(lambda: dec(enc(test_values))):
 test.exception(lambda: enc(2j + 3), TypeError)
 
 # Test if non-buffer objects are caught
-test.exception(lambda: dec(123), BufferError)
+test.exception(lambda: dec(123), TypeError)
 
 # Test if redundant arguments are accepted
 test.exception(lambda: enc(None,  123), TypeError)

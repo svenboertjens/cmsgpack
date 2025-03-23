@@ -27,7 +27,7 @@ test.exception(lambda: cm.encode(cyclic_ref), RecursionError)
 test.exception(lambda: cm.encode(2j + 3), TypeError)
 
 # Test if non-buffer objects are caught
-test.exception(lambda: cm.decode(123), BufferError)
+test.exception(lambda: cm.decode(123), TypeError)
 
 # Test if invalid encoded data is caught
 test.exception(lambda: cm.decode(b"\0\0"), ValueError)
