@@ -13,10 +13,14 @@
 #define IS_BIG_ENDIAN
 #endif
 
-#define _always_inline Py_ALWAYS_INLINE inline
+#ifdef __always_inline
+#define _always_inline __always_inline
+#else
+#define _always_inline inline
+#endif
 
 
-#if defined(Py_NOGIL)
+#ifdef Py_NOGIL
 
 // Define macro for needing thread-safety
 #define _need_threadsafe

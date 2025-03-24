@@ -8,8 +8,6 @@
 #include <Python.h>
 #include <stdbool.h>
 
-//#define _need_threadsafe
-
 #ifdef _need_threadsafe
 #include <stdatomic.h>
 #endif
@@ -41,8 +39,8 @@
 // Recursion limit
 #define RECURSION_LIMIT 1000
 
-// The default values for extensions objects
-#define EXTENSIONS_PASSMEMVIEW_DEFAULTVAL false
+// Immortal refcount value
+#define _immortal_refcnt 0xFFFFFFFF
 
 
 ///////////////////////////
@@ -576,7 +574,7 @@ static PyObject *Extensions(PyObject *self, PyObject **args, Py_ssize_t nargs, P
         return PyErr_NoMemory();
 
     // Set the true/false values
-    ext->data.pass_memview = pass_memview ? pass_memview == Py_True : EXTENSIONS_PASSMEMVIEW_DEFAULTVAL;
+    ext->data.pass_memview = pass_memview == Py_True;
 
     // NULL-initialize the decoding functions array and set its pointer
     memset(ext->funcs, 0, sizeof(ext->funcs));
@@ -1066,24 +1064,21 @@ static bool write_integer(buffer_t *b, PyObject *obj)
     // Set the first digit of the value
     uint64_t num = (uint64_t)digits[0];
 
-    if (!_PyLong_IsCompact(lobj))
+    uint64_t last;
+    while (--ndigits >= 1)
     {
-        uint64_t last;
-        while (--ndigits >= 1)
-        {
-            last = num;
+        last = num;
 
-            num <<= PyLong_SHIFT;
-            num |= digits[ndigits];
+        num <<= PyLong_SHIFT;
+        num |= digits[ndigits];
 
-            if ((num >> PyLong_SHIFT) != last)
-                return false;
-        }
-
-        // Check if the value exceeds the size limit when negative
-        if (neg && num > (1ull << 63))
+        if ((num >> PyLong_SHIFT) != last)
             return false;
     }
+
+    // Check if the value exceeds the size limit when negative
+    if (neg && num > (1ull << 63))
+        return false;
 
     if (!neg)
     {
@@ -2396,7 +2391,7 @@ static _always_inline bool overread_check(buffer_t *b, size_t required)
     // Check if the offset would exceed the max offset
     if (b->offset + required > b->maxoffset)
     {
-        // If we have a file, we need to refresh it
+        // If we have a file, we need to refresh the file buffer
         if (b->file)
         {
             return decoding_refresh_fbuf(b, required);
@@ -2845,9 +2840,9 @@ static bool setup_mstates(PyObject *m)
     Py_ssize_t dummylong_pos_refcnt = Py_REFCNT(dummylong_pos);
     Py_ssize_t dummylong_neg_refcnt = Py_REFCNT(dummylong_neg);
     Py_ssize_t dummylong_zero_refcnt = Py_REFCNT(dummylong_zero);
-    Py_SET_REFCNT(dummylong_pos, _Py_IMMORTAL_REFCNT);
-    Py_SET_REFCNT(dummylong_neg, _Py_IMMORTAL_REFCNT);
-    Py_SET_REFCNT(dummylong_zero, _Py_IMMORTAL_REFCNT);
+    Py_SET_REFCNT(dummylong_pos, _immortal_refcnt);
+    Py_SET_REFCNT(dummylong_neg, _immortal_refcnt);
+    Py_SET_REFCNT(dummylong_zero, _immortal_refcnt);
     
     // First store the negative values
     for (size_t i = 0; i < INTEGER_CACHE_NNEG; ++i)
@@ -2895,7 +2890,7 @@ static bool setup_mstates(PyObject *m)
 
     // Set the ext object type and make them immortal
     Py_SET_TYPE((PyObject *)&s->extensions, &ExtensionsObj);
-    Py_SET_REFCNT((PyObject *)&s->extensions, _Py_IMMORTAL_REFCNT);
+    Py_SET_REFCNT((PyObject *)&s->extensions, _immortal_refcnt);
 
     // Create the dict object for the encoding extension types
     s->extensions.data.dict = PyDict_New();
@@ -2908,7 +2903,7 @@ static bool setup_mstates(PyObject *m)
     s->extensions.data.funcs = s->extensions.funcs;
 
     // Set default values
-    s->extensions.data.pass_memview = EXTENSIONS_PASSMEMVIEW_DEFAULTVAL;
+    s->extensions.data.pass_memview = false;
 
     // Add the global ext object to the module
     if (PyModule_AddObjectRef(m, "extensions", (PyObject *)&s->extensions) < 0)

@@ -3,34 +3,21 @@
 This file explains how to use the `cmsgpack` module in Python.
 
 **Contents:**
-- [Installation](#installation)
+- [Summary](#summary)
+- [Serialization](#serialization)
 - [Supported types](#supported-types)
-- [Encoding](#encoding)
-- [Decoding](#decoding)
 - [Extension types](#extension-types)
 
 
-## Supported types
+## Summary
 
-The following types are supported as-is:
-- `str`
-- `int`
-- `float`
-- `bytes`
-- `bool`
-- `NoneType`
-- `list`
-- `dict`
+Here is a summary that briefly goes through everything that this serializer offers.
 
-These types are defined in the MessagePack format and can be serialized as normal.
+For straightforward and easy-to-use serialization, see [regular serialization](#regular-serialization). If you plan to pass optional arguments frequently, the [`Stream`](#stream) object is useful for both convenience and performance.
 
-For convenience, `cmsgpack` also supports the following types:
-- `dict` subclasses;
-- `list` subclasses;
-- `tuple` objects & subclasses, encoded as a `list` type;
-- `bytearray` & `memoryview` objects & subclasses, encoded as a `bytes` type;
+For file-based serialization, this library offers the [`FileStream`](#filestream) object. This object supports serialization that directly uses a file, meaning you don't have to manage file operations yourself.
 
-If this doesn't include a type you want to use, have a look at the [Extension types](#extension-types).
+For information on what types are supported and how, see the [supported types](#supported-types) section, or for unsupported types, the [extension types](#extension-types) section.
 
 
 ## Serialization
@@ -38,8 +25,9 @@ If this doesn't include a type you want to use, have a look at the [Extension ty
 For serialization, `cmsgpack` offers the regular `encode`/`decode` functions, a `Stream` object that retains optional arguments for your convenience, and a `FileStream` object that can be used for directly reading/writing a file.
 
 **Contents:**
-- [`encode`](#encode)
-- [`decode`](#decode)
+- [Regular serialization](#regular-serialization)
+	- [`encode`](#encode)
+	- [`decode`](#decode)
 - [`Stream`](#stream)
 	- [`encode`](#streamencode)
 	- [`decode`](#streamdecode)
@@ -47,7 +35,11 @@ For serialization, `cmsgpack` offers the regular `encode`/`decode` functions, a 
 	- [`encode`](#filestreamencode)
 	- [`decode`](#filestreamdecode)
 
-### `encode`
+### Regular serialization
+
+For regular and straightforward serialization, the `encode` and `decode` functions are plenty. These functions support all optional features, but parsing them in each function call will add a little overhead, which is where the [`Stream`](#stream) object shines.
+
+#### `encode`
 
 ```python
 cmsgpack.encode(obj: any, /, str_keys: bool=False, extensions: Extensions=None) -> bytes
@@ -62,7 +54,7 @@ cmsgpack.encode(obj: any, /, str_keys: bool=False, extensions: Extensions=None) 
 
 **Returns:** The encoded data as a `bytes` object.
 
-### `decode`
+#### `decode`
 
 ```python
 cmsgpack.decode(encoded: Buffer, /, str_keys: bool=False, extensions: Extensions=None) -> any:
@@ -95,7 +87,7 @@ cmsgpack.Stream(str_keys: bool=False, extensions: Extensions=None) -> Stream
 - `str_keys: bool`
 - `extensions: Extensions`
 
-The `Stream` class can be used for incremental serialization. The optional arguments that you'd normally pass to `encode`/`decode` are instead passed once when you create an instance of the class, and the class retains them and automatically uses them when you use the class's `encode`/`decode` functions. Using the `Stream` object is also slightly more efficient when you plan on passing keyword arguments.
+The `Stream` object is useful when you need to pass optional arguments and want the best performance, or just for convenience. Instead of having to pass optional arguments to the `encode` and `decode` functions, you pass them once on class creation. These arguments can always be modified through the object's attributes.
 
 #### `Stream.encode`
 
@@ -146,9 +138,11 @@ cmsgpack.FileStream(file_name: str, reading_offset: int=0, chunk_size: int=16384
 - `str_keys: bool`
 - `extensions: Extensions`
 
-The `FileStream` object can be used for serialization to/from a file. Just like the `Stream` object, optional arguments are retained. Reading is done from an offset within the file, which defaults to the start of the file, offset 0. Writing always appends to the end of the file.
+The `FileStream` object is used for serialization with a file. This object manages everything from chunked reading to file offsets for you. And just like the `Stream` object, optional arguments for `encode` and `decode` are passed at object creation.
 
-In the unlikely event of a failed write due to an OS error, this library always attempts to truncate the file to remove any partially written data to avoid data corruption. Otherwise, the error message will always provide the exact writing offset and length. File truncation currently only works for Windows and POSIX-compliant systems.
+Writing data with this object will always append it to the end of the file. In case a write fails due to an OS error, the object always attempts to reverse any partially written data to avoid corruption. Otherwise, the error message will state the exact writing offset and length. Writing data is not chunked for performance reasons.
+
+Reading data with this object starts from the reading offset, which is the start of the file by default. After reading/decoding data, the offset is automatically updated. Reading is always done in chunks.
 
 #### `FileStream.encode`
 
@@ -176,16 +170,43 @@ cmsgpack.FileStream.decode() -> any
 **Returns:** The decoded Python object.
 
 
+## Supported types
+
+This library supports all types defined by the MessagePack format. All encoded objects will be represented using the MessagePack type headers. This could mean loss of specific type information, like how a `list` and `tuple` both **have** to be encoded as an `ARRAY` type.
+
+These types are supported "as-is", and decoded data will always output in these types:
+- `str`
+- `int`
+- `float`
+- `list`
+- `dict`
+- `bool`
+- `NoneType`
+- `bytes`
+
+These are not the only supported types, but any other types *will lose their exact type info*. These are the other supported types and what they will be encoded as:
+- `dict` subclasses, encoded as a regular `dict`
+- `list` subclasses, encoded as a regular `list`
+- `tuple` and `tuple` subclasses, encoded as a `list`
+- `bytearray` & `memoryview`, encoded as `bytes`
+
+Besides these types, MessagePack also offers "Extension Types". These types are identified using an ID instead, and require manually defined functions for encoding/decoding. More on those at the [Extension types](#extension-types) section below.
+
+
 ## Extension types
 
-Extension types (ext types) are used for serializing types not supported by default in MessagePack. To see which types are supported, see the [supported types](#supported-types). Extension types each have their own user-defined ID to track them.
+Extension types are used for serializing types that aren't supported by MessagePack. An extension type always goes paired with an ID between -128 and 127. This ID is used for identifying the type in encoded data, so the same ID has to be passed for encoding and decoding a type. Because these are *custom, unsupported* types, you're required to assign a function for encoding and decoding that type.
 
-It's important that the same ID is assigned to an extension type across all sessions. This includes sessions outside of `cmsgpack` or Python. The ID is used to identify the type, and when a different one is used, the serializer has no way to know what to do with the data.
+For clarity, the ID for a type has to be chosen by you, and it does not matter if you pick 1 or -17 or whatever, as long as it's within -128 and 127. If you assign the ID 1 to the type `complex`, the serializer stores that it's an extension type with ID 1 when you encode a `complex` type, and when you decode the data, it sees an extension type with ID 1 and calls the function assigned for decoding data with that ID.
+
+This can be done using an `Extensions` object. You add your custom types to this object and pass it to `encode`/`decode` functions. Types can be registered for both encoding and decoding, or exclusively for either. The object can be initialized with types, and types can be dynamically added and removed freely after initialization.
+
+`Extensions` objects handle types differently for encoding and decoding. When you encode a custom type, the type is used for looking up the ID and function for encoding that custom type. This means that multiple types are allowed to be stored under the same ID. When you decode data with an extension type in it, the stored ID is used for getting the function for decoding the data. In short, the custom type is used for identification during encoding, and the ID assigned to that custom type is used for identification during decoding.
+
+For convenienve, `cmsgpack` also has a global `Extensions` object ready for use. This object can be accessed through `cmsgpack.extensions`. This `Extensions` object is automatically used in serialization unless a manually created `Extensions` object is passed, overriding the global object.
 
 **Contents:**
-- [How extension types are managed](#how-extension-types-are-managed)
-- [The global extensions object](#the-global-extensions-object)
-- [Structuring the encoding/decoding functions](#structuring-the-encodingdecoding-functions)
+- [The custom encoding/decoding functions](#the-custom-encodingdecoding-functions)
 - [`Extensions`](#extensions)
 	- [`add`](#extensionsadd)
 	- [`add_encode`](#extensionsadd_encode)
@@ -195,36 +216,21 @@ It's important that the same ID is assigned to an extension type across all sess
 	- [`remove_decode`](#extensionsremove_decode)
 	- [`clear`](#extensionsclear)
 
-### How extension types are managed
+### The custom encoding/decoding functions
 
-An ext type has to be identified with an ID, which can be any number between -128 and 127. These types can be registered in an extension object for use in serialization with `cmsgpack`. Besides the ID, a function for encoding and decoding is needed for the ID. The encoding function is invoked when an object of the ext type is found, and the decoding function is invoked when an ext type with the specified ID is encountered.
+The functions you need to provide for encoding and decoding a custom type should follow these function signatures:
 
-Ext types are registered through `Extension` objects. These objects can be created manually using `cmsgpack.Extensions()`, or the global extensions object `cmsgpack.extensions` can be used for simplicity.
+```python
+def encode_MyType(obj: MyType) -> Buffer: ...
+def decode_MyType(data: bytes) -> any: ...
+```
 
-Extension objects handle both the encoding and decoding part, but they are managed differently. The encoding part is centered around the extension type (the type you want to support through extensions), and when an unsupported object is encountered, `cmsgpack` checks if the used extensions object supports the object's type. The decoding part is centered around the ext type's ID, the type itself is not used. When `cmsgpack` encounters an ext type, it checks if a function for decoding is registered under the ID of the ext type and invokes it.
+The encoding function will receive an object of the custom type, and is expected to return bytes-like object of the encoded object. `cmsgpack` will manage storing this encoded object.
+The decoding function will receive a `bytes` object (or `memoryview` object, if enabled) that contains the encoded object. This would be the exact same object as the object that was returned by your encoding function. This function is free to return anything, no matter what type.
 
-This separation allows us to assign the same ID to different types, if required for your use case. And decoding is not limited to one type, but instead invokes the decoding function, which is allowed to return anything.
+These functions are allowed to throw exceptions.
 
-> [Note]
-> 
-> The separation between encoding and decoding makes the remove functions of extension objects appear a bit strange. The reason `cmsgpack` requires the extension type when removing the encoding part, and the ID when removing a decoding part, is because look-ups for encoding are done using the type, and look-ups for decoding are done using the ID.
-
-### The global extensions object
-
-The global extensions object, `cmsgpack.extensions`, is already set up and ready for use. This
-object can be used just like a manually created extensions object, for example: `cmsgpack.extensions.add(...)` to add a type. The default values when creating an extensions object are also applied to this object.
-
-The global object does not have to be passed to functions explicitly, this is automatically managed internally. When you want to use a manual extensions object, you can pass it to the function, and it will override the global object.
-
-### Structuring the encoding/decoding functions
-
-The encoding function will receive an object that is guaranteed to be of the type under which the function was registered, and is expected to return a bytes-like object of the encoded object.
-
-The decoding function will receive a `bytes` object (or `memoryview` object, if enabled) containing the data previously encoded by the type's encoding function. This function is allowed to return anything, no type checking is performed on the return value.
-
-Both functions are allowed to throw exceptions. These will be handled properly, and the serialization process will be stopped so that the exception can be thrown.
-
-Here is an example of how it might look for a `complex` object:
+Here is an example on how this might be done for the `complex` type:
 
 ```python
 # The function for encoding a `complex` object
@@ -312,7 +318,7 @@ cmsgpack.Extensions.add_encode(id: int, type: type, encfunc: Callable, /) -> Non
 *"Add an extension type for just encoding."*
 
 **Arguments:**
-- `id`: The Id to assign to the extension type.
+- `id`: The ID to assign to the extension type.
 - `type`: The extension type.
 - `encfunc`: The function to call for encoding an object of type `type`.
 
@@ -327,7 +333,7 @@ cmsgpack.Extensions.add_decode(id: int, decfunc: Callable, /) -> None
 *"Add an extension type for just decoding."*
 
 **Arguments:**
-- `id`: The Id to assign to the extension type.
+- `id`: The ID to assign to the extension type.
 - `decfunc`: The function to call for decoding an ext type with ID `id`.
 
 **Returns:** `None`.
@@ -388,3 +394,4 @@ cmsgpack.Extensions.clear() -> None
 - No arguments.
 
 **Returns:** `None`.
+
