@@ -15,7 +15,7 @@ ext_modules = [
 
 setup(
     name="cmsgpack",
-    version="0.1.0",
+    version="0.1.1",
     
     author="Sven Boertjens",
     author_email="boertjens.sven@gmail.com",

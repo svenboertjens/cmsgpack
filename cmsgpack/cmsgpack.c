@@ -9,11 +9,10 @@
 #include <stdbool.h>
 
 #ifdef _need_threadsafe
-#include <stdatomic.h>
+    #include <stdatomic.h>
 #endif
 
-// Python versions
-#define PYVER12 (PY_VERSION_HEX >= 0x030C0000)
+// Python versions for version-specific macros
 #define PYVER13 (PY_VERSION_HEX >= 0x030D0000)
 
 
@@ -29,7 +28,7 @@
 
 // The number of slots to use in caches
 #define STRING_CACHE_SLOTS 1024
-#define INTEGER_CACHE_SLOTS (1024 + 128) // 1023 positive, 128 negative, and a zero object
+#define INTEGER_CACHE_SLOTS (1024 + 128) // 1023 positive, 128 negative, and a zero
 #define INTEGER_CACHE_NNEG 128 // Number of negative slots in the integer cache
 
 // Minimum sizes for the 'extra' and 'item' adaptive allocation weights
@@ -107,7 +106,7 @@ typedef struct {
 
 // File data
 typedef struct {
-    FILE *file;  // File object being used
+    FILE *file; // File object being used
     char *name; // Name of the file
 } filedata_t;
 
@@ -788,7 +787,7 @@ static _always_inline void write_mask(buffer_t *b, const unsigned char mask, con
         memcpy(b->offset, _buf, 5);
         b->offset += 5;
     }
-    else if (nbytes == 8) // For specific cases
+    else if (nbytes == 8)
     {
         char _buf[9] = {
             mask,
@@ -837,7 +836,7 @@ static _always_inline bool write_string(buffer_t *b, PyObject *obj)
 
     if (!ensure_space(b, size + 5))
         return false;
-
+    
     if (size <= LIMIT_STR_FIXED)
     {
         write_mask(b, DT_STR_FIXED, size, 0);
@@ -866,7 +865,6 @@ static _always_inline bool write_string(buffer_t *b, PyObject *obj)
     return true;
 }
 
-// Separate for writing binary
 static _always_inline bool write_binary(buffer_t *b, char *base, size_t size)
 {
     if (!ensure_space(b, size + 5))
@@ -948,9 +946,6 @@ static bool write_integer(buffer_t *b, PyObject *obj)
 
     // Cast the object to a long value to access internals
     PyLongObject *lobj = (PyLongObject *)obj;
-
-    #if PYVER12
-
     uint64_t num = lobj->long_value.ob_digit[0];
 
     const uintptr_t tag = lobj->long_value.lv_tag & 0b11010; // Bit 4/5 store size, bit 2 stores signedness (0 is positive)
@@ -1046,90 +1041,6 @@ static bool write_integer(buffer_t *b, PyObject *obj)
             }
         }
     }
-
-    #else
-
-    // Number of digits (negative value if the long is negative)
-    long _ndigits = (long)Py_SIZE(lobj);
-
-    // Convert the digits to its absolute value
-    long ndigits = Py_ABS(ndigits);
-
-    // Set the negative flag based on if the number of digits changed (went from negative to positive)
-    bool neg = ndigits != _ndigits;
-
-    // Set the pointer to the digits array
-    digit *digits = lobj->ob_digit;
-
-    // Set the first digit of the value
-    uint64_t num = (uint64_t)digits[0];
-
-    uint64_t last;
-    while (--ndigits >= 1)
-    {
-        last = num;
-
-        num <<= PyLong_SHIFT;
-        num |= digits[ndigits];
-
-        if ((num >> PyLong_SHIFT) != last)
-            return false;
-    }
-
-    // Check if the value exceeds the size limit when negative
-    if (neg && num > (1ull << 63))
-        return false;
-
-    if (!neg)
-    {
-        if (num <= LIMIT_UINT_FIXED)
-        {
-            INCBYTE = num;
-        }
-        else if (num <= LIMIT_UINT_BIT8)
-        {
-            write_mask(b, DT_UINT_BIT8, num, 1);
-        }
-        else if (num <= LIMIT_UINT_BIT16)
-        {
-            write_mask(b, DT_UINT_BIT16, num, 2);
-        }
-        else if (num <= LIMIT_UINT_BIT32)
-        {
-            write_mask(b, DT_UINT_BIT32, num, 4);
-        }
-        else
-        {
-            write_mask(b, DT_UINT_BIT64, num, 8);
-        }
-    }
-    else
-    {
-        int64_t _num = -((int64_t)num);
-
-        if (_num >= LIMIT_INT_FIXED)
-        {
-            write_mask(b, DT_INT_FIXED, _num & 0b11111, 0);
-        }
-        else if (_num >= LIMIT_INT_BIT8)
-        {
-            write_mask(b, DT_INT_BIT8, _num, 1);
-        }
-        else if (_num >= LIMIT_INT_BIT16)
-        {
-            write_mask(b, DT_INT_BIT16, _num, 2);
-        }
-        else if (_num >= LIMIT_INT_BIT32)
-        {
-            write_mask(b, DT_INT_BIT32, _num, 4);
-        }
-        else
-        {
-            write_mask(b, DT_INT_BIT64, _num, 8);
-        }
-    }
-
-    #endif
 
     return true;
 }
@@ -1621,7 +1532,7 @@ static bool encode_object(buffer_t *b, PyObject *obj, PyTypeObject *tp)
     {
         return write_list(b, obj);
     }
-    else if (PyDict_Check(obj)) // Supports dict subclasses
+    else if (PyDict_Check(obj))
     {
         return write_dict(b, obj);
     }
@@ -1672,10 +1583,10 @@ static _always_inline bool encode_object_inline(buffer_t *b, PyObject *obj)
         return write_double(b, obj);
     }
 
-    // Many cases after this require writes to 5 bytes, so do a global ensure_space for them
     if (!ensure_space(b, 5))
         return false;
 
+    
     if (tp == &PyBool_Type)
     {
         return write_bool(b, obj);
@@ -2852,11 +2763,7 @@ static bool setup_mstates(PyObject *m)
         digit val = INTEGER_CACHE_NNEG - i;
 
         // Negative values are stored as positive
-        #if PYVER12
         s->caches.integers[i].long_value.ob_digit[0] = val;
-        #else
-        s->caches.integers[i].ob_digit[0] = val;
-        #endif
     }
 
     // Store the zero object
@@ -2870,11 +2777,7 @@ static bool setup_mstates(PyObject *m)
         s->caches.integers[idx] = *dummylong_pos;
 
         // Set the integer value to the current index
-        #if PYVER12
         s->caches.integers[idx].long_value.ob_digit[0] = i;
-        #else
-        s->caches.integers[idx].ob_digit[0] = i;
-        #endif
     }
 
     // Restore the dummy refcount

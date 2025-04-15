@@ -37,7 +37,7 @@ pip install .
 
 > [Note]
 >
-> The module is distributed as a "source distribution" (sdist) package, meaning it must be compiled during installation. This requires a C compiler (with C11 support). Recommended compilers are **GCC, Clang, and MSVC**.
+> The module is distributed as a "source distribution" (sdist) package, meaning it must be compiled during installation. This requires a C compiler (with C11 support). Recommended compilers are **GCC** and **Clang**. **MSVC is not supported** due to its lack of standards compliance.
 
 
 ## Quick start
