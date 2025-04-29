@@ -8,6 +8,7 @@
 #include <Python.h>
 #include <stdbool.h>
 
+// Check if we need to consider thread-safety (for GIL-free Python)
 #ifdef _need_threadsafe
     #include <stdatomic.h>
 #endif
@@ -39,19 +40,20 @@
 #define RECURSION_LIMIT 1000
 
 // Immortal refcount value
-#define _immortal_refcnt 0xFFFFFFFF
-
+#define _immortal_refcnt _Py_IMMORTAL_REFCNT
 
 ///////////////////////////
 //  TYPEDEFS & FORWARDS  //
 ///////////////////////////
 
+// Dict item for extensions
 typedef struct {
     PyObject_HEAD
     char id;        // ID of the type
     PyObject *func; // The function used for encoding objects of the type set as the dict's key
 } ext_dictitem_t;
 
+// Extension data for during serialization
 typedef struct {
     bool pass_memview; // Whether to pass memoryview objects instead of byte objects to decoding functions
 
@@ -59,6 +61,7 @@ typedef struct {
     PyObject **funcs; // Functions array with decoding functions, indexed by ID casted to unsigned
 } ext_data_t;
 
+// Extensions object
 typedef struct {
     PyObject_HEAD
     ext_data_t data;
@@ -69,15 +72,30 @@ static PyTypeObject ExtDictItemObj;
 static PyTypeObject ExtensionsObj;
 
 
-// String cache struct with a lock per object
+// Keyarg struct for parsing keyword arguments
 typedef struct {
-    PyASCIIObject *strings[STRING_CACHE_SLOTS];
+    PyObject **dest;
+    PyTypeObject *tp;
+    PyObject *interned;
+} keyarg_t;
+
+
+// String cache struct
+typedef struct {
+    PyASCIIObject *slots[STRING_CACHE_SLOTS];
     uint8_t match_strength[STRING_CACHE_SLOTS];
 
+    // One lock for each slot
     #ifdef _need_threadsafe
     atomic_flag locks[STRING_CACHE_SLOTS];
     #endif
 } strcache_t;
+
+// Integer cache struct
+typedef struct {
+    // No locks, these objects aren't modified after setup
+    PyLongObject slots[INTEGER_CACHE_SLOTS];
+} intcache_t;
 
 // Module states
 typedef struct {
@@ -95,11 +113,11 @@ typedef struct {
 
     // Caches
     struct {
-        PyLongObject integers[INTEGER_CACHE_SLOTS];
+        intcache_t integers;
         strcache_t strings;
     } caches;
 
-    // Global extensions object
+    // The global extensions object
     extensions_t extensions;
 } mstates_t;
 
@@ -193,41 +211,58 @@ static PyModuleDef cmsgpack;
 //  ARGS PARSING  //
 ////////////////////
 
-#if PYVER13 // Python 3.13 and up
-#define _unicode_equal(x, y) (PyUnicode_Compare(x, y) == 0)
+/* # How to use argument parsing tools
+ * 
+ * Positional-only arguments:
+ * - Use `min_positional` to check if we got the minimum required number of arguments.
+ * - Use `parse_positional` for each positional argument, with `nth` as the argument position.
+ * 
+ * Keyword arguments:
+ * - Use the `keyarg_t` struct for declaring all keyword arguments. Declare this as a `keyarg_t[]` array.
+ * - Define a keyarg in the keyargs array using `KEYARG()` and fill in the fields.
+ * - Use `parse_keywords` for parsing keyword arguments, where:
+ *       The `npos` argument should be 0 if there are no positional-only keywords, or else the number of positional-only keywords;
+ *       The `nkey` argument should be the number of keyword arguments. For simplicity, use `NKEYARGS(keyarg_array)`.
+ * 
+ */
+
+// Unicode object compare macros
+#if PYVER13
+    #define _unicode_equal(x, y) (PyUnicode_Compare(x, y) == 0)
 #else
-#define _unicode_equal(x, y) _PyUnicode_EQ(x, y)
+    #define _unicode_equal(x, y) _PyUnicode_EQ(x, y)
 #endif
 
-typedef struct {
-    PyObject **dest;
-    PyTypeObject *tp;
-    PyObject *interned;
-} keyarg_t;
-
+/* Declare a keyarg slot for in a keyargs array.
+ * `dest` must be a pointer to the variable that will hold the argument's value (not set to NULL if argument wasn't passed),
+ * `type` is the type that the argument's value should have (can be NULL),
+ * `interned` is the interned string object of the argument's keyword name.
+ */
 #define KEYARG(_dest, _type, _interned) \
     {.dest = (PyObject **)_dest, .tp = (PyTypeObject *)_type, .interned = (PyObject *)_interned}
 
-#define min_positional(nargs, min) do { \
-    if (nargs < min) \
-    { \
-        PyErr_Format(PyExc_TypeError, "Expected at least %zi positional arguments, but received only %zi", min, nargs); \
-        return NULL; \
-    } \
-} while (0)
+// Get the number of keyargs in a keyarg array, to pass as `nkey`
+#define NKEYARGS(keyargs) \
+    (sizeof(keyargs) / sizeof(keyargs[0]))
 
-#define fixed_positional(nargs, required) do { \
-    if (nargs != required) \
-    { \
-        PyErr_Format(PyExc_TypeError, "Expected exactly %zi positional arguments, but received %zi", required, nargs); \
-        return NULL; \
-    } \
-} while (0)
+// Check if there's a minimum of MIN arguments
+static _always_inline bool min_positional(Py_ssize_t nargs, Py_ssize_t min)
+{
+    if (nargs < min)
+    {
+        PyErr_Format(PyExc_TypeError, "Expected at least %zi positional arguments, but received only %zi", min, nargs);
+        return false;
+    }
 
+    return true;
+}
+
+// Parse positional arguments
 static _always_inline PyObject *parse_positional(PyObject **args, size_t nth, PyTypeObject *type, const char *argname)
 {
     PyObject *obj = args[nth];
 
+    // Check if we have a type to check for, and if so, check if it matches the object
     if (type && !Py_IS_TYPE(obj, type))
     {
         error_unexpected_argtype(argname, type->tp_name, Py_TYPE(obj)->tp_name);
@@ -237,9 +272,7 @@ static _always_inline PyObject *parse_positional(PyObject **args, size_t nth, Py
     return obj;
 }
 
-#define NULLCHECK(obj) \
-    if (!obj) return NULL;
-
+// Parse a single keyword argument
 static _always_inline bool _parse_kwarg(PyObject *kwname, PyObject *val, Py_ssize_t nkey, keyarg_t *keyargs)
 {
     for (Py_ssize_t i = 0; i < nkey; ++i)
@@ -281,6 +314,7 @@ static _always_inline bool _parse_kwarg(PyObject *kwname, PyObject *val, Py_ssiz
     return false;
 }
 
+// Parse keyword arguments
 static _always_inline bool parse_keywords(Py_ssize_t npos, PyObject **args, Py_ssize_t nargs, PyObject *kwargs, keyarg_t *keyargs, Py_ssize_t nkey)
 {
     // Return early if nothing to parse
@@ -331,9 +365,6 @@ static _always_inline bool parse_keywords(Py_ssize_t npos, PyObject **args, Py_s
 
     return true;
 }
-
-#define NKEYARGS(keyargs) \
-    (sizeof(keyargs) / sizeof(keyargs[0]))
 
 
 /////////////////////
@@ -746,7 +777,8 @@ static _always_inline PyObject *attempt_decode_ext(buffer_t *b, char *buf, size_
 // Get the current offset's byte and increment afterwards
 #define INCBYTE ((b->offset++)[0])
 
-// Write a header's typemask and its size based on the number of bytes the size should take up
+// Write a header's typemask and its size based on the number of bytes the size should take up.
+// NBYTES can be 0 for FIXSIZE, 1 for SMALL, 2 for MEDIUM, 4 for LARGE, and 8 for 64-bit int/uint cases
 static _always_inline void write_mask(buffer_t *b, const unsigned char mask, const size_t size, const size_t nbytes)
 {
     if (nbytes == 0) // FIXSIZE
@@ -755,28 +787,28 @@ static _always_inline void write_mask(buffer_t *b, const unsigned char mask, con
     }
     else if (nbytes == 1) // SMALL
     {
-        char _buf[2] = {
+        const char head[2] = {
             mask,
             size
         };
 
-        memcpy(b->offset, _buf, 2);
+        memcpy(b->offset, head, 2);
         b->offset += 2;
     }
     else if (nbytes == 2) // MEDIUM
     {
-        char _buf[3] = {
+        const char head[3] = {
             mask,
             size >> 8,
             size
         };
 
-        memcpy(b->offset, _buf, 3);
+        memcpy(b->offset, head, 3);
         b->offset += 3;
     }
     else if (nbytes == 4) // LARGE
     {
-        char _buf[5] = {
+        const char head[5] = {
             mask,
             size >> 24,
             size >> 16,
@@ -784,12 +816,12 @@ static _always_inline void write_mask(buffer_t *b, const unsigned char mask, con
             size,
         };
 
-        memcpy(b->offset, _buf, 5);
+        memcpy(b->offset, head, 5);
         b->offset += 5;
     }
     else if (nbytes == 8)
     {
-        char _buf[9] = {
+        const char head[9] = {
             mask,
             size >> 56,
             size >> 48,
@@ -801,7 +833,7 @@ static _always_inline void write_mask(buffer_t *b, const unsigned char mask, con
             size
         };
 
-        memcpy(b->offset, _buf, 9);
+        memcpy(b->offset, head, 9);
         b->offset += 9;
     }
 }
@@ -922,10 +954,9 @@ static _always_inline bool write_memoryview(buffer_t *b, PyObject *obj)
 
 static _always_inline bool write_double(buffer_t *b, PyObject *obj)
 {
-    double num = PyFloat_AS_DOUBLE(obj);
+    // No ensure_space, already done globally
 
-    if (!ensure_space(b, 9))
-        return false;
+    double num = PyFloat_AS_DOUBLE(obj);
 
     // Ensure big-endianness
     BIG_DOUBLE(num);
@@ -938,11 +969,9 @@ static _always_inline bool write_double(buffer_t *b, PyObject *obj)
     return true;
 }
 
-static bool write_integer(buffer_t *b, PyObject *obj)
+static _always_inline bool write_integer(buffer_t *b, PyObject *obj)
 {
-    // Ensure 9 bytes of space, max size of integer + header
-    if (!ensure_space(b, 9))
-        return false;
+    // No ensure_space, already done globally
 
     // Cast the object to a long value to access internals
     PyLongObject *lobj = (PyLongObject *)obj;
@@ -1100,6 +1129,8 @@ static _always_inline bool write_array_header(buffer_t *b, size_t nitems)
 
 static _always_inline bool write_list(buffer_t *b, PyObject *obj)
 {
+    // No ensure_space, already done globally
+
     b->recursion++;
 
     if (!recursion_check(b))
@@ -1125,6 +1156,8 @@ static _always_inline bool write_list(buffer_t *b, PyObject *obj)
 
 static _always_inline bool write_tuple(buffer_t *b, PyObject *obj)
 {
+    // No ensure_space, already done globally
+
     b->recursion++;
 
     if (!recursion_check(b))
@@ -1148,80 +1181,16 @@ static _always_inline bool write_tuple(buffer_t *b, PyObject *obj)
     return true;
 }
 
-static _always_inline bool write_list_subclass(buffer_t *b, PyObject *obj)
-{
-    b->recursion++;
-
-    if (!recursion_check(b))
-        return false;
-
-    size_t nitems = PyList_Size(obj);
-
-    if (!write_array_header(b, nitems))
-        return false;
-    
-    for (size_t i = 0; i < nitems; ++i)
-    {
-        PyObject *item = PyList_GetItem(obj, i);
-
-        if (!item)
-        {
-            if (!PyErr_Occurred())
-                PyErr_Format(PyExc_ValueError, "Failed to get an item from an object of type '%s', a list subclass", Py_TYPE(obj)->tp_name);
-            
-            return false;
-        }
-        
-        if (!encode_object_inline(b, item))
-            return false;
-    }
-
-    b->recursion--;
-
-    return true;
-}
-
-static _always_inline bool write_tuple_subclass(buffer_t *b, PyObject *obj)
-{
-    b->recursion++;
-
-    if (!recursion_check(b))
-        return false;
-
-    size_t nitems = PyTuple_Size(obj);
-
-    if (!write_array_header(b, nitems))
-        return false;
-    
-    for (size_t i = 0; i < nitems; ++i)
-    {
-        PyObject *item = PyTuple_GetItem(obj, i);
-
-        if (!item)
-        {
-            if (!PyErr_Occurred())
-                PyErr_Format(PyExc_TypeError, "Failed to get an item from an object of type '%s', a tuple subclass", Py_TYPE(obj)->tp_name);
-            
-            return false;
-        }
-        
-        if (!encode_object_inline(b, item))
-            return false;
-    }
-
-    b->recursion--;
-
-    return true;
-}
-
 static _always_inline bool write_dict(buffer_t *b, PyObject *obj)
 {
+    // No ensure_space, already done globally
+
     b->recursion++;
 
     if (!recursion_check(b))
         return false;
 
-    const size_t npairs = PyDict_Size(obj);
+    const size_t npairs = PyDict_GET_SIZE(obj);
 
     // No ensure_space, already done globally
     
@@ -1361,8 +1330,14 @@ static _always_inline uint32_t fnv1a_32(const char *data, size_t size)
 }
 
 // Create a string (<32 bytes) and attempt to get it from cache
-static _always_inline PyObject *get_cached_str(char *ptr, size_t size, strcache_t *cache)
+static _always_inline PyObject *get_cached_str(buffer_t *b, size_t size)
 {
+    // Pointer to the string is at the current offset
+    const char *ptr = b->offset;
+
+    // Get the string cache
+    strcache_t *cache = &b->states->caches.strings;
+
     // Calculate the hash of the string
     const size_t hash = fnv1a_32(ptr, size) & (STRING_CACHE_SLOTS - 1);
 
@@ -1370,7 +1345,7 @@ static _always_inline PyObject *get_cached_str(char *ptr, size_t size, strcache_
     lock_flag(&cache->locks[hash]);
 
     // Load the match stored at the hash index
-    PyASCIIObject *match = cache->strings[hash];
+    PyASCIIObject *match = cache->slots[hash];
 
     if (match)
     {
@@ -1411,7 +1386,7 @@ static _always_inline PyObject *get_cached_str(char *ptr, size_t size, strcache_
             Py_INCREF(obj);
 
             // Assign the object to the cache and initialize match strength at 3
-            cache->strings[hash] = (PyASCIIObject *)obj;
+            cache->slots[hash] = (PyASCIIObject *)obj;
             cache->match_strength[hash] = 3;
         }
     }
@@ -1423,9 +1398,9 @@ static _always_inline PyObject *get_cached_str(char *ptr, size_t size, strcache_
 }
 
 // Get a cached integer, must be between -128 and 1023
-static _always_inline PyObject *get_cached_int(long n, PyLongObject *cache)
+static _always_inline PyObject *get_cached_int(buffer_t *b, int n)
 {
-    return (PyObject *)&cache[n + INTEGER_CACHE_NNEG];
+    return (PyObject *)&b->states->caches.integers.slots[n + INTEGER_CACHE_NNEG];
 }
 
 /////////////////////////
@@ -1480,7 +1455,7 @@ static _always_inline PyObject *create_map(buffer_t *b, const size_t npairs)
 
             const size_t size = mask & 0b11111;
 
-            key = get_cached_str(b->offset, size, &b->states->caches.strings);
+            key = get_cached_str(b, size);
             b->offset += size;
         }
         else
@@ -1528,25 +1503,17 @@ static _always_inline PyObject *create_map(buffer_t *b, const size_t npairs)
 
 static bool encode_object(buffer_t *b, PyObject *obj, PyTypeObject *tp)
 {
-    if (tp == &PyList_Type)
+    if (tp == &PyList_Type || PyList_Check(obj))
     {
         return write_list(b, obj);
     }
-    else if (PyDict_Check(obj))
+    else if (tp == &PyDict_Type || PyDict_Check(obj))
     {
         return write_dict(b, obj);
     }
-    else if (tp == &PyTuple_Type)
+    else if (tp == &PyTuple_Type || PyTuple_Check(obj))
     {
         return write_tuple(b, obj);
-    }
-    else if (PyList_Check(obj)) // Support list subclasses
-    {
-        return write_list_subclass(b, obj);
-    }
-    else if (PyTuple_Check(obj)) // Support tuple subclasses
-    {
-        return write_tuple_subclass(b, obj);
     }
     else if (tp == &PyBytes_Type)
     {
@@ -1574,7 +1541,12 @@ static _always_inline bool encode_object_inline(buffer_t *b, PyObject *obj)
     {
         return write_string(b, obj);
     }
-    else if (tp == &PyLong_Type)
+
+    // A lot of cases below require 9 or less space, ensure globally for all of them here
+    if (!ensure_space(b, 9))
+        return false;
+
+    if (tp == &PyLong_Type)
     {
         return write_integer(b, obj);
     }
@@ -1582,12 +1554,7 @@ static _always_inline bool encode_object_inline(buffer_t *b, PyObject *obj)
     {
         return write_double(b, obj);
     }
-
-    if (!ensure_space(b, 5))
-        return false;
-
-    
-    if (tp == &PyBool_Type)
+    else if (tp == &PyBool_Type)
     {
         return write_bool(b, obj);
     }
@@ -1623,14 +1590,14 @@ static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char 
         if (!overread_check(b, mask))
             return NULL;
 
-        PyObject *obj = get_cached_str(b->offset, mask, &b->states->caches.strings);
+        PyObject *obj = get_cached_str(b, mask);
         b->offset += mask;
 
         return obj;
     }
     else if ((mask & 0x80) == DT_UINT_FIXED) // uint only has upper bit set to 0
     {
-        return get_cached_int(mask, b->states->caches.integers);
+        return get_cached_int(b, mask);
     }
     else if ((mask & 0b11100000) == DT_INT_FIXED)
     {
@@ -1639,7 +1606,7 @@ static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char 
         if ((num & 0b10000) == 0b10000)
             num |= ~0b11111;
 
-        return get_cached_int(num, b->states->caches.integers);
+        return get_cached_int(b, num);
     }
     else if ((mask & 0b11110000) == DT_ARR_FIXED) // Bit 5 is also set on ARR and MAP
     {
@@ -1703,7 +1670,7 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
 
         uint8_t num = SIZEBYTE;
 
-        return get_cached_int(num, b->states->caches.integers);
+        return get_cached_int(b, num);
     }
     case VARLEN_DT(DT_UINT_BIT16):
     {
@@ -1714,7 +1681,7 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
         num |= SIZEBYTE;
 
         if (num <= 1023)
-            return get_cached_int(num, b->states->caches.integers);
+            return get_cached_int(b, num);
         
         return PyLong_FromUnsignedLongLong(num);
     }
@@ -1752,7 +1719,7 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
 
         int8_t num = SIZEBYTE;
 
-        return get_cached_int(num, b->states->caches.integers);
+        return get_cached_int(b, num);
     }
     case VARLEN_DT(DT_INT_BIT16):
     {
@@ -2326,10 +2293,13 @@ static _always_inline bool overread_check(buffer_t *b, size_t required)
 static PyObject *encode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
 {
     const Py_ssize_t npositional = 1;
-    min_positional(nargs, npositional);
+    if (!min_positional(nargs, npositional))
+        return NULL;
 
     PyObject *obj = parse_positional(args, 0, NULL, "obj");
-    NULLCHECK(obj);
+
+    if (!obj)
+        return NULL;
 
     mstates_t *states = get_mstates(self);
 
@@ -2350,10 +2320,13 @@ static PyObject *encode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
 static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
 {
     const Py_ssize_t npositional = 1;
-    min_positional(nargs, npositional);
+    if (!min_positional(nargs, npositional))
+        return NULL;
 
     PyObject *encoded = parse_positional(args, 0, NULL, "encoded");
-    NULLCHECK(encoded);
+
+    if (!encoded)
+        return NULL;
 
     mstates_t *states = get_mstates(self);
 
@@ -2387,7 +2360,8 @@ static PyObject *Stream(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
         KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
-    NULLCHECK(parse_keywords(0, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
+    if (!parse_keywords(0, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
+        return NULL;
 
 
     // Allocate the stream object based on if we got a file to use or not
@@ -2538,7 +2512,8 @@ static PyObject *FileStream(PyObject *self, PyObject **args, Py_ssize_t nargs, P
         KEYARG(&ext, &ExtensionsObj, states->interned.extensions),
     };
 
-    NULLCHECK(parse_keywords(0, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
+    if (!parse_keywords(0, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
+        return NULL;
 
     // Check if we got the filename argument
     if (!filename)
@@ -2725,7 +2700,7 @@ static bool setup_mstates(PyObject *m)
     /* CACHES */
 
     // NULL-initialize the string cache
-    memset(s->caches.strings.strings, 0, sizeof(s->caches.strings.strings));
+    memset(s->caches.strings.slots, 0, sizeof(s->caches.strings.slots));
 
     // Initialize match strengths as 1 so that they'll immediately reach 0 on the first decrement
     memset(s->caches.strings.match_strength, 1, sizeof(s->caches.strings.match_strength));
@@ -2758,26 +2733,26 @@ static bool setup_mstates(PyObject *m)
     // First store the negative values
     for (size_t i = 0; i < INTEGER_CACHE_NNEG; ++i)
     {
-        s->caches.integers[i] = *dummylong_neg;
+        s->caches.integers.slots[i] = *dummylong_neg;
 
         digit val = INTEGER_CACHE_NNEG - i;
 
         // Negative values are stored as positive
-        s->caches.integers[i].long_value.ob_digit[0] = val;
+        s->caches.integers.slots[i].long_value.ob_digit[0] = val;
     }
 
     // Store the zero object
-    s->caches.integers[INTEGER_CACHE_NNEG] = *dummylong_zero;
+    s->caches.integers.slots[INTEGER_CACHE_NNEG] = *dummylong_zero;
     
     // Then store positive values
     for (size_t i = 1; i < INTEGER_CACHE_SLOTS - INTEGER_CACHE_NNEG; ++i)
     {
         size_t idx = i + INTEGER_CACHE_NNEG; // Skip over negatives and zero
 
-        s->caches.integers[idx] = *dummylong_pos;
+        s->caches.integers.slots[idx] = *dummylong_pos;
 
         // Set the integer value to the current index
-        s->caches.integers[idx].long_value.ob_digit[0] = i;
+        s->caches.integers.slots[idx].long_value.ob_digit[0] = i;
     }
 
     // Restore the dummy refcount
@@ -2823,7 +2798,7 @@ static void cleanup_mstates(PyObject *m)
 
     // Remove references from the string cache
     for (size_t i = 0; i < STRING_CACHE_SLOTS; ++i)
-        Py_XDECREF(s->caches.strings.strings[i]);
+        Py_XDECREF(s->caches.strings.slots[i]);
     
     
     // Lose references to the global ext objects' dict and functions
@@ -2988,7 +2963,9 @@ PyMODINIT_FUNC PyInit_cmsgpack(void)
 
     // Create main module
     m = PyModule_Create(&cmsgpack);
-    NULLCHECK(m);
+
+    if (!m)
+        return NULL;
 
     // Add the module to the state
     if (PyState_AddModule(m, &cmsgpack) != 0) {
