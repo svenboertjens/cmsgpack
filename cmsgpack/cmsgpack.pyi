@@ -77,7 +77,7 @@ class FileStream:
     str_keys: bool
     extensions: Extensions
     
-    def __init__(self, file_name: str, reading_offset: int=0, chunk_size: int=16384, str_keys: bool=False, extensions: Extensions=None):
+    def __init__(self, file_name: str, reading_offset: int=0, chunk_size: int=8192, str_keys: bool=False, extensions: Extensions=None):
         ...
     
     def encode(self, obj: any, /) -> NoReturn:

@@ -187,8 +187,9 @@ These types are supported "as-is", and decoded data will always output in these 
 These are not the only supported types, but any other types *will lose their exact type info*. These are the other supported types and what they will be encoded as:
 - `dict` subclasses, encoded as a regular `dict`
 - `list` subclasses, encoded as a regular `list`
+- `bytes` subclasses, encoded as a regular `bytes`
 - `tuple` and `tuple` subclasses, encoded as a `list`
-- `bytearray` & `memoryview`, encoded as `bytes`
+- `bytearray` and `memoryview` (and subclasses of those), encoded as `bytes`
 
 Besides these types, MessagePack also offers "Extension Types". These types are identified using an ID instead, and require manually defined functions for encoding/decoding. More on those at the [Extension types](#extension-types) section below.
 

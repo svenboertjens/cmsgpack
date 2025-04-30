@@ -89,6 +89,17 @@ if test.success(lambda: enc(test_values)) and test.success(lambda: dec()):
     enc(test_values)
     test.equal(test_values, dec())
 
+# Test if string-keys-only is enforced when requested
+test.exception(lambda: enc({1: 2}, str_keys=True), TypeError)
+test.exception(lambda: dec(enc({1: 2}), str_keys=True), TypeError)
+
+# Clear the file and write 1 byte for the reading offset check
+open(FNAME, "wb").write(b'\0')
+
+# Test if the reading offset argument is enforced
+stream_rdoff = cm.FileStream(FNAME, reading_offset=1)
+stream_rdoff.encode(test_values)
+test.equal(test_values, stream_rdoff.decode())
 
 test.print()
 

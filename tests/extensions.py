@@ -89,7 +89,7 @@ test.exception(lambda: cm.Extensions(false_kwarg=123), TypeError)
 # Test if the objects can be encoded and decoded
 test_value = [
     2j + 3, 3j + 2,
-    [MyClass("a" * i) for i in range(17)]
+    [MyClass("a" * i) for i in range(256)]
 ]
 
 if test.success(lambda: cm.decode(cm.encode(test_value, extensions=ext), extensions=ext)):

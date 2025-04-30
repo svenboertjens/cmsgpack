@@ -11,9 +11,10 @@ RUN apt-get update && apt-get install -y \
 # Copy data to the container
 COPY cmsgpack /usr/src/app/cmsgpack
 COPY tests /usr/src/app/tests
-COPY setup.py /usr/src/app/setup.py
+COPY meson.build /usr/src/app/meson.build
 COPY pyproject.toml /usr/src/app/pyproject.toml
 COPY README.md /usr/src/app/README.md
+COPY LICENSE /usr/src/app/LICENSE
 
 WORKDIR /usr/src/app
 

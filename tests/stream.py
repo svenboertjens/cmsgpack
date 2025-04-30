@@ -17,14 +17,18 @@ if not test.success(lambda: cm.Stream()):
     test.print()
     exit()
 
-# Classe to use for tests
+# Classes to use for tests
 stream = cm.Stream()
 enc = stream.encode
 dec = stream.decode
 
-# Test the test values object itself
+# Test the test values object
 if test.success(lambda: dec(enc(test_values))):
     test.equal(test_values, dec(enc(test_values)))
+
+# Test if string-keys-only is enforced when requested
+test.exception(lambda: enc({1: 2}, str_keys=True), TypeError)
+test.exception(lambda: dec(enc({1: 2}), str_keys=True), TypeError)
 
 # Test if unsupported types are caught properly
 test.exception(lambda: enc(2j + 3), TypeError)

@@ -13,19 +13,13 @@
     #include <stdatomic.h>
 #endif
 
-// Python versions for version-specific macros
-#define PYVER13 (PY_VERSION_HEX >= 0x030D0000)
-
 
 ///////////////////
 //   CONSTANTS   //
 ///////////////////
 
-// Default buffer size
-#define BUFFER_DEFAULTSIZE 256
-
 // Default file buffer size
-#define FILEBUF_DEFAULTSIZE 16384 // 16 KB
+#define FILEBUF_DEFAULTSIZE 8192 // 8 KB
 
 // The number of slots to use in caches
 #define STRING_CACHE_SLOTS 1024
@@ -40,7 +34,10 @@
 #define RECURSION_LIMIT 1000
 
 // Immortal refcount value
-#define _immortal_refcnt _Py_IMMORTAL_REFCNT
+#define IMMORTAL_REFCNT _Py_IMMORTAL_REFCNT
+
+// Whether the Python version is 3.13+
+#define PYVER13 (PY_VERSION_HEX >= 0x030D0000)
 
 ///////////////////////////
 //  TYPEDEFS & FORWARDS  //
@@ -973,33 +970,78 @@ static _always_inline bool write_integer(buffer_t *b, PyObject *obj)
 {
     // No ensure_space, already done globally
 
-    // Cast the object to a long value to access internals
+    // Cast the object to a LongObject for easy internals access
     PyLongObject *lobj = (PyLongObject *)obj;
-    uint64_t num = lobj->long_value.ob_digit[0];
 
-    const uintptr_t tag = lobj->long_value.lv_tag & 0b11010; // Bit 4/5 store size, bit 2 stores signedness (0 is positive)
-    if ((tag == 0b01000 || tag == 0b00000)) // Positive, 1 digit, or zero
+    // Get the long_value fields for easy access
+    digit *digits = lobj->long_value.ob_digit;
+    uintptr_t tag = lobj->long_value.lv_tag;
+
+    // Get the number of digits and whether the number is positive
+    size_t ndigits = tag >> _PyLong_NON_SIZE_BITS;
+    bool positive = (tag & 0b11) != 0b10; // Check if the number is positive (or zero)
+
+    // Start the number off with the first digit
+    uint64_t num = digits[0];
+
+    // Iterate over the digits besides the first digit, using `ndigits` as the index to `digits`
+    while (ndigits > 1)
+    {
+        // Decrement to get it as index, working from top to bottom
+        --ndigits;
+
+        uint64_t dig = digits[ndigits];
+
+        // Calculate the shift amount for this digit
+        int shift = PyLong_SHIFT * ndigits;
+
+        // Shift the digit in place
+        uint64_t shifted = dig << shift;
+
+        // Check for overflow
+        if ((shifted >> shift) != dig)
+        {
+            overflow_case: // Jump label for the extra 64-bit negative check
+
+            PyErr_SetString(PyExc_OverflowError, "Integer values cannot exceed `2^64-1` or `-2^63` (must be within the 64-bit boundary)");
+            return false;
+        }
+
+        // Add the shifted digit to the total number
+        num |= shifted;
+    }
+
+    if (positive)
     {
         if (num <= LIMIT_UINT_FIXED)
         {
             write_mask(b, DT_UINT_FIXED, num, 0);
         }
-        else if (num <= LIMIT_UINT_BIT8)
+        else if (num <= LIMIT_SMALL)
         {
             write_mask(b, DT_UINT_BIT8, num, 1);
         }
-        else if (num <= LIMIT_UINT_BIT16)
+        else if (num <= LIMIT_MEDIUM)
         {
             write_mask(b, DT_UINT_BIT16, num, 2);
         }
-        else
+        else if (num <= LIMIT_LARGE)
         {
             write_mask(b, DT_UINT_BIT32, num, 4);
         }
+        else
+        {
+            write_mask(b, DT_UINT_BIT64, num, 8);
+        }
     }
-    else if (tag == 0b01010) // Negative, 1 digit
+    else
     {
-        int64_t snum = -((int64_t)num);
+        // Get the number as signed and negative
+        int64_t snum = -num;
+
+        // Test if the limit was exceeded by checking if the negative number shows up as positive
+        if (snum >= 0)
+            goto overflow_case;
 
         if (snum >= LIMIT_INT_FIXED)
         {
@@ -1013,61 +1055,13 @@ static _always_inline bool write_integer(buffer_t *b, PyObject *obj)
         {
             write_mask(b, DT_INT_BIT16, snum, 2);
         }
-        else
+        else if (snum >= LIMIT_INT_BIT32)
         {
             write_mask(b, DT_INT_BIT32, snum, 4);
         }
-    }
-    else // More than 1 digit
-    {
-        bool positive = (tag & _PyLong_SIGN_MASK) == 0;
-
-        num |= (uint64_t)(lobj->long_value.ob_digit[1]) << PyLong_SHIFT;
-
-        if ((tag & 0b11000) == 0b11000) // 3 digits
-        {
-            uint64_t shift = (PyLong_SHIFT * 2);
-            uint64_t digit3 = lobj->long_value.ob_digit[2];
-
-            uint64_t shifted = digit3 << shift;
-
-            // Shift one less if negative to account for signed going up to 63 bits instead of 64
-            if (!positive)
-            {
-                shift--;
-                digit3 <<= 1;
-            }
-            
-            if (shifted >> shift != digit3)
-            {
-                PyErr_SetString(PyExc_OverflowError, "Integer values cannot exceed `-2^63` or `2^64-1`");
-                return false;
-            }
-
-            num |= shifted;
-        }
-
-        if (positive)
-        {
-            if (num <= LIMIT_UINT_BIT32)
-            {
-                write_mask(b, DT_UINT_BIT32, num, 4);
-            }
-            else
-            {
-                write_mask(b, DT_UINT_BIT64, num, 8);
-            }
-        }
         else
         {
-            if ((int64_t)(-num) >= LIMIT_INT_BIT32)
-            {
-                write_mask(b, DT_INT_BIT32, -num, 4);
-            }
-            else
-            {
-                write_mask(b, DT_INT_BIT64, -num, 8);
-            }
+            write_mask(b, DT_INT_BIT64, snum, 8);
         }
     }
 
@@ -1515,15 +1509,15 @@ static bool encode_object(buffer_t *b, PyObject *obj, PyTypeObject *tp)
     {
         return write_tuple(b, obj);
     }
-    else if (tp == &PyBytes_Type)
+    else if (PyBytes_Check(obj))
     {
         return write_bytes(b, obj);
     }
-    else if (tp == &PyByteArray_Type)
+    else if (PyByteArray_Check(obj))
     {
         return write_bytearray(b, obj);
     }
-    else if (tp == &PyMemoryView_Type)
+    else if (PyMemoryView_Check(obj))
     {
         return write_memoryview(b, obj);
     }
@@ -2436,6 +2430,7 @@ static PyObject *stream_set_extensions(stream_t *stream, PyObject *arg, void *cl
 
 static bool filestream_setup_fdata(filestream_t *stream, PyObject *filename, PyObject *reading_offset, PyObject *chunk_size)
 {
+
     // Get the filename data if we got a filename object
     size_t fname_size;
     const char *fname = PyUnicode_AsUTF8AndSize(filename, (Py_ssize_t *)&fname_size);
@@ -2454,7 +2449,16 @@ static bool filestream_setup_fdata(filestream_t *stream, PyObject *filename, PyO
     stream->fbuf_size = FILEBUF_DEFAULTSIZE;
     if (chunk_size)
     {
-        stream->fbuf_size = PyLong_AS_LONG(chunk_size);
+        int overflow = 0;
+        stream->fbuf_size = PyLong_AsLongLongAndOverflow(chunk_size, &overflow);
+
+        if (overflow != 0)
+        {
+            free(stream->fname);
+
+            PyErr_SetString(PyExc_ValueError, "The value of argument 'chunk_size' exceeded the 64-bit integer limit");
+            return false;
+        }
     }
 
     // Allocate the file buffer for decoding
@@ -2485,7 +2489,17 @@ static bool filestream_setup_fdata(filestream_t *stream, PyObject *filename, PyO
     stream->foff = 0;
     if (reading_offset)
     {
-        stream->foff = PyLong_AS_LONG(chunk_size);
+        int overflow = 0;
+        stream->foff = PyLong_AsLongLongAndOverflow(reading_offset, &overflow);
+
+        if (overflow != 0)
+        {
+            free(stream->fbuf);
+            free(stream->fname);
+            
+            PyErr_SetString(PyExc_ValueError, "The value of argument 'reading_offset' exceeded the 64-bit integer limit");
+            return false;
+        }
     }
 
     // Initialize the file lock
@@ -2726,9 +2740,9 @@ static bool setup_mstates(PyObject *m)
     Py_ssize_t dummylong_pos_refcnt = Py_REFCNT(dummylong_pos);
     Py_ssize_t dummylong_neg_refcnt = Py_REFCNT(dummylong_neg);
     Py_ssize_t dummylong_zero_refcnt = Py_REFCNT(dummylong_zero);
-    Py_SET_REFCNT(dummylong_pos, _immortal_refcnt);
-    Py_SET_REFCNT(dummylong_neg, _immortal_refcnt);
-    Py_SET_REFCNT(dummylong_zero, _immortal_refcnt);
+    Py_SET_REFCNT(dummylong_pos, IMMORTAL_REFCNT);
+    Py_SET_REFCNT(dummylong_neg, IMMORTAL_REFCNT);
+    Py_SET_REFCNT(dummylong_zero, IMMORTAL_REFCNT);
     
     // First store the negative values
     for (size_t i = 0; i < INTEGER_CACHE_NNEG; ++i)
@@ -2768,7 +2782,7 @@ static bool setup_mstates(PyObject *m)
 
     // Set the ext object type and make them immortal
     Py_SET_TYPE((PyObject *)&s->extensions, &ExtensionsObj);
-    Py_SET_REFCNT((PyObject *)&s->extensions, _immortal_refcnt);
+    Py_SET_REFCNT((PyObject *)&s->extensions, IMMORTAL_REFCNT);
 
     // Create the dict object for the encoding extension types
     s->extensions.data.dict = PyDict_New();
