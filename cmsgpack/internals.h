@@ -174,6 +174,4 @@ static _always_inline bool memcmp_small(const void *s1, const void *s2, size_t s
     return true;
 }
 
-
-
 #endif // CMSGPACK_INTERNALS_H

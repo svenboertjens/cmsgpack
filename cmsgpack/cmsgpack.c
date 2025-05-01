@@ -979,7 +979,7 @@ static _always_inline bool write_integer(buffer_t *b, PyObject *obj)
 
     // Get the number of digits and whether the number is positive
     size_t ndigits = tag >> _PyLong_NON_SIZE_BITS;
-    bool positive = (tag & 0b11) != 0b10; // Check if the number is positive (or zero)
+    bool positive = (tag & 3) != 2; // Check if the number is positive (or zero)
 
     // Start the number off with the first digit
     uint64_t num = digits[0];
@@ -1443,11 +1443,11 @@ static _always_inline PyObject *create_map(buffer_t *b, const size_t npairs)
 
         // Special case for fixsize strings
         const unsigned char mask = b->offset[0];
-        if ((mask & 0b11100000) == DT_STR_FIXED)
+        if ((mask & 224) == DT_STR_FIXED) // 224 = 0b11100000
         {
             b->offset++;
 
-            const size_t size = mask & 0b11111;
+            const size_t size = mask & 31; // 31 = 0b11111
 
             key = get_cached_str(b, size);
             b->offset += size;
@@ -1571,15 +1571,15 @@ static _always_inline bool encode_object_inline(buffer_t *b, PyObject *obj)
 #define SIZEBYTE ((unsigned char)(b->offset++)[0])
 
 // Masks away the top 3 bits of a mask for varlen cases, as they all have the same upper 3 bits
-#define VARLEN_DT(mask) (mask & 0b11111)
+#define VARLEN_DT(mask) (mask & 31) // 31 = 0b11111
 
 // Decoding of fixsize objects
 static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char mask)
 {
     // Check which type we got
-    if ((mask & 0b11100000) == DT_STR_FIXED)
+    if ((mask & 224) == DT_STR_FIXED) // 224 = 0b11100000
     {
-        mask &= 0x1F;
+        mask &= 31; // 31 = 0b11111
 
         if (!overread_check(b, mask))
             return NULL;
@@ -1589,24 +1589,25 @@ static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char 
 
         return obj;
     }
-    else if ((mask & 0x80) == DT_UINT_FIXED) // uint only has upper bit set to 0
+    else if ((mask & 128) == DT_UINT_FIXED) // 128 = 0b10000000, uint only has upper bit set to 0
     {
         return get_cached_int(b, mask);
     }
-    else if ((mask & 0b11100000) == DT_INT_FIXED)
+    else if ((mask & 224) == DT_INT_FIXED)
     {
-        int8_t num = mask & 0b11111;
+        int8_t num = mask & 31;
 
-        if ((num & 0b10000) == 0b10000)
-            num |= ~0b11111;
+        // Sign-extend the number if it's negative
+        if ((num & 16) == 16) // 16 = 0b10000
+            num |= ~31; // 31 = 0b11111
 
         return get_cached_int(b, num);
     }
-    else if ((mask & 0b11110000) == DT_ARR_FIXED) // Bit 5 is also set on ARR and MAP
+    else if ((mask & 240) == DT_ARR_FIXED) // 240 = 0b11110000, bit 5 is also set on ARR and MAP
     {
         return create_array(b, mask & 0x0F);
     }
-    else if ((mask & 0b11110000) == DT_MAP_FIXED)
+    else if ((mask & 240) == DT_MAP_FIXED)
     {
         return create_map(b, mask & 0x0F);
     }
@@ -1951,7 +1952,7 @@ static PyObject *decode_bytes(buffer_t *b)
     const unsigned char mask = SIZEBYTE;
 
     // Only fixsize values don't have `110` set on the upper 3 mask bits
-    if ((mask & 0b11100000) != 0b11000000)
+    if ((mask & 224) != 192) // 224 = 0b11100000, 192 = 0b11000000
     {
         return decode_bytes_fixsize(b, mask);
     }
@@ -2024,7 +2025,10 @@ static _always_inline PyObject *encoding_write_file(buffer_t *b, filestream_t *f
     lock_flag(&fstream->lock);
 
     // Write the data to the file
-    size_t written = fwrite(PyBytes_AS_STRING(b->base), 1, datasize, fstream->file);
+    size_t written;
+    Py_BEGIN_ALLOW_THREADS
+        written = fwrite(PyBytes_AS_STRING(b->base), 1, datasize, fstream->file);
+    Py_END_ALLOW_THREADS
 
     // Remove reference to the bytes object as we won't return it
     Py_DECREF(b->base);
@@ -2135,7 +2139,7 @@ static _always_inline PyObject *decoding_start(PyObject *encoded, mstates_t *sta
         
         // Set the buffer fields (base not used for regular decoding)
         b.offset = buf.buf;
-        b.maxoffset = buf.buf + buf.len;
+        b.maxoffset = (char *)buf.buf + buf.len;
         
         // Decode the data
         PyObject *result = decode_bytes(&b);
@@ -2232,7 +2236,10 @@ static bool decoding_refresh_fbuf(buffer_t *b, size_t required)
     }
 
     // Read new data into the buffer above the unused data
-    size_t read = fread(b->base + unused, 1, b->fbuf_size - unused, b->file);
+    size_t read;
+    Py_BEGIN_ALLOW_THREADS
+        read = fread(b->base + unused, 1, b->fbuf_size - unused, b->file);
+    Py_END_ALLOW_THREADS
 
     // Check if we have less data than required, meaning we reached EOF
     if (read + unused < required)
@@ -2459,6 +2466,15 @@ static bool filestream_setup_fdata(filestream_t *stream, PyObject *filename, PyO
             PyErr_SetString(PyExc_ValueError, "The value of argument 'chunk_size' exceeded the 64-bit integer limit");
             return false;
         }
+
+        // Check if the number wasn't negative
+        if ((ssize_t)(stream->fbuf_size) < 0)
+        {
+            free(stream->fname);
+            
+            PyErr_SetString(PyExc_ValueError, "The value of argument 'chunk_size' was smaller than 0, but must be positive");
+            return false;
+        }
     }
 
     // Allocate the file buffer for decoding
@@ -2468,6 +2484,33 @@ static bool filestream_setup_fdata(filestream_t *stream, PyObject *filename, PyO
     {
         free(stream->fname);
         return PyErr_NoMemory();
+    }
+
+    // Get the file offset
+    stream->foff = 0;
+    if (reading_offset)
+    {
+        int overflow = 0;
+        stream->foff = PyLong_AsLongLongAndOverflow(reading_offset, &overflow);
+
+        if (overflow != 0)
+        {
+            free(stream->fbuf);
+            free(stream->fname);
+            
+            PyErr_SetString(PyExc_ValueError, "The value of argument 'reading_offset' exceeded the 64-bit integer limit");
+            return false;
+        }
+
+        // Check if the number wasn't negative
+        if ((ssize_t)(stream->foff) < 0)
+        {
+            free(stream->fbuf);
+            free(stream->fname);
+            
+            PyErr_SetString(PyExc_ValueError, "The value of argument 'reading_offset' was smaller than 0, but must be positive");
+            return false;
+        }
     }
 
     // Attempt to open the file
@@ -2484,23 +2527,6 @@ static bool filestream_setup_fdata(filestream_t *stream, PyObject *filename, PyO
 
     // Disable file buffering as we already read/write in a chunk-like manner
     setbuf(stream->file, NULL);
-
-    // Initialize the file offset
-    stream->foff = 0;
-    if (reading_offset)
-    {
-        int overflow = 0;
-        stream->foff = PyLong_AsLongLongAndOverflow(reading_offset, &overflow);
-
-        if (overflow != 0)
-        {
-            free(stream->fbuf);
-            free(stream->fname);
-            
-            PyErr_SetString(PyExc_ValueError, "The value of argument 'reading_offset' exceeded the 64-bit integer limit");
-            return false;
-        }
-    }
 
     // Initialize the file lock
     clear_flag(&stream->lock);

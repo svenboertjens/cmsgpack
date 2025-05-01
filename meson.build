@@ -3,7 +3,9 @@ project(
   'c',
   version: '0.1.1',
   meson_version: '>=1.2.0',
-  default_options: ['buildtype=release'],
+  default_options: [
+    'buildtype=release',
+  ],
 )
 
 python = import('python')
