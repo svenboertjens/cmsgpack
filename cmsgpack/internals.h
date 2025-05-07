@@ -35,7 +35,7 @@
 #endif
 
 
-#ifdef Py_NOGIL
+#if defined(Py_GIL_DISABLED)
 
     // Define macro for needing thread-safety
     #define _need_threadsafe
@@ -123,55 +123,11 @@
 
 #else
 
+    // Simulate a false return when we don't have a file truncate function
     #define _ftruncate(file, size) \
         false
 
 #endif
 
-
-static _always_inline bool memcmp_small(const void *s1, const void *s2, size_t size)
-{
-    char *buf1 = (char *)s1;
-    char *buf2 = (char *)s2;
-
-    if (size == 0)
-        return true;
-
-    while (size >= 8)
-    {
-        uint64_t v1, v2;
-        memcpy(&v1, buf1, 8);
-        memcpy(&v2, buf2, 8);
-
-        if (v1 != v2)
-            return false;
-        
-        buf1 += 8;
-        buf2 += 8;
-        size -= 8;
-    }
-
-    while (size >= 4)
-    {
-        uint32_t v1, v2;
-        memcpy(&v1, buf1, 4);
-        memcpy(&v2, buf2, 4);
-
-        if (v1 != v2)
-            return false;
-        
-        buf1 += 4;
-        buf2 += 4;
-        size -= 4;
-    }
-
-    while (size--)
-    {
-        if (*buf1++ != *buf2++)
-            return false;
-    }
-
-    return true;
-}
 
 #endif // CMSGPACK_INTERNALS_H

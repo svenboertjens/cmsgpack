@@ -17,8 +17,8 @@ modules = {
     },
 }
 
-RUNS = 100
-ITERATIONS = 1000
+RUNS = 10
+ITERATIONS = 100
 
 
 
@@ -27,52 +27,117 @@ import timeit
 import random
 import string
 
+random.seed(0xA1B2C3D4)
+
 def generate_test_values():
     return {
-        "strings": [
-            ''.join(random.choices(string.ascii_letters + string.digits, k=random.randint(1, 256)))
-            for _ in range(256)
+        "fixstr": [
+            ''.join(random.choices(string.ascii_letters + string.digits, k=random.randint(0, 31)))
+            for _ in range(2048)
         ],
 
-        "bytes": [
-            bytes(random.choices(range(256), k=random.randint(1, 256)))
-            for _ in range(256)
-        ],
-
-        "integers": [
-            random.choice([random.randint(-2**31, 2**31), random.randint(0, 1024), random.randint(2**32, 2**48)])
+        "str8": [
+            ''.join(random.choices(string.ascii_letters + string.digits, k=random.randint(32, 255)))
             for _ in range(1024)
         ],
 
-        "floats": [
-            float(i) for i in range(256)
+        "str16": [
+            ''.join(random.choices(string.ascii_letters + string.digits, k=random.randint(256, 0xFFF)))
+            for _ in range(256)
         ],
 
-        # Lists with varied nesting structures
-        "lists": [
-            random.sample(range(100), k=random.randint(5, 15)),
-            [random.randint(1, 10), [random.randint(11, 20), [random.randint(21, 30)]]],
-            [random.choices(range(50), k=random.randint(3, 8)) for _ in range(3)]
-        ] * 5,
+        "bin8": [
+            bytes(random.choices(range(256), k=random.randint(0, 255)))
+            for _ in range(2048)
+        ],
 
-        "dicts": [
-            {str(random.randint(1, 10)): {str(random.randint(11, 20)): {str(random.randint(21, 30)): {}}}}
-            for _ in range(5)
-        ] * 5,
+        "bin16": [
+            bytes(random.choices(range(256), k=random.randint(256, 0xFFF)))
+            for _ in range(256)
+        ],
+
+        "fixint": [
+            random.randint(-32, 128)
+            for _ in range(4096)
+        ],
+
+        "int8": [
+            x
+            for _ in range(4096)
+            for x in (random.randint(-0x7F, -32), random.randint(128, 0xFF))
+        ],
+
+        "int16": [
+            x
+            for _ in range(4096)
+            for x in (random.randint(-0x7FFF, -0x80), random.randint(0x100, 0xFFFF))
+        ],
+
+        "int32": [
+            x
+            for _ in range(2048)
+            for x in (random.randint(-0x7FFFFFFF, -0x8000), random.randint(0x10000, 0xFFFFFFFF))
+        ],
+
+        "int64": [
+            x
+            for _ in range(1024)
+            for x in (random.randint(-0x7FFFFFFFFFFFFFFF, -0x80000000), random.randint(0x100000000, 0xFFFFFFFFFFFFFFFF))
+        ],
+
+        "float64": [
+            random.uniform(-1e308, 1e308)
+            for _ in range(4096)
+        ],
+
+        "fixarray": [
+            [None] * 15
+            for _ in range(1024)
+        ],
+
+        "array16": [
+            [None] * random.randint(16, 0xFF)
+            for _ in range(64)
+        ],
+
+        "fixmap": [
+            {
+                str(random.randint(0, 0xFFFF)): None
+                for _ in range(15)
+            }
+            for _ in range(256)
+        ],
+
+        "map16": [
+            {
+                str(random.randint(0, 0xFFFF)): None
+                for _ in range(16, 0xFF)
+            }
+            for _ in range(32)
+        ],
 
         "states": [
             True, False, None
-        ] * 500,
+        ] * 4096,
     }
 
 
 categories = [
-    "strings",
-    "bytes",
-    "integers",
-    "floats",
-    "lists",
-    "dicts",
+    "fixstr",
+    "str8",
+    "str16",
+    "bin8",
+    "bin16",
+    "fixint",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "float64",
+    "fixarray",
+    "array16",
+    "fixmap",
+    "map16",
     "states"
 ]
 

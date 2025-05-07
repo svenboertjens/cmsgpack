@@ -9,7 +9,7 @@ test_values = [
 
     0.0, -0.0, 3.14159, -3.14159, 1.5e-45, -1.5e-45, 1.5e+308, -1.5e+308, float('inf'), float('-inf'), # NaN tested explicitly because NaN != NaN
 
-    "", "Hello, world!", "with\0null", "a" * 31, "a" * 32, "a" * 0xFF, "a" * (0xFF + 1), "a" * 0xFFFF, "a" * (0xFFFF + 1), "a" * 0xFFFFFF, "你好", "emoji 😊",
+    "", "Hello, world!", "with\0null", "a" * 31, "a" * 32, "a" * 0xFF, "a" * 0x100, "a" * 0xFFFF, "a" * 0x10000, "你好", "emoji 😊",
 
     {}, {"a": 1, "b": 2}, {"key": None, "nested": {"inner": True, "value": 3.14}},
     {"list": [1, 2, 3], "bools": [True, False]},
@@ -22,8 +22,8 @@ test_values = [
 ]
 
 # Offer the list and bytes test values so they can be tested as tuples, bytearrays, and memoryviews
-list_values = ( [],  [1, "2", 3.0, True, False, None, b"in", [], {}], ["a"] * 15, ["a"] * 0xFF, ["a"] * 0xFFFFF )
-bytes_values = ( b"", b"Hello, world!", b"with\0null", b"a" * 31, b"a" * 32, b"a" * 0xFF, b"a" * (0xFF + 1), b"a" * 0xFFFF, b"a" * (0xFFFF + 1), b"a" * 0xFFFFFF, bytes(range(256)) )
+list_values = ( [],  [1, "2", 3.0, True, False, None, b"in", [], {}], ["a"] * 15, ["a"] * 0xFF, ["a"] * 0x10000 )
+bytes_values = ( b"", b"Hello, world!", b"with\0null", b"a" * 31, b"a" * 32, b"a" * 0xFF, b"a" * 0x100, b"a" * 0xFFFF, b"a" * 0x10000, bytes(range(256)) )
 
 # Add the list and bytes values to the list
 test_values.extend(list_values)

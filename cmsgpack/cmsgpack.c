@@ -13,7 +13,6 @@
     #include <stdatomic.h>
 #endif
 
-
 ///////////////////
 //   CONSTANTS   //
 ///////////////////
@@ -22,13 +21,13 @@
 #define FILEBUF_DEFAULTSIZE 8192 // 8 KB
 
 // The number of slots to use in caches
-#define STRING_CACHE_SLOTS 1024
-#define INTEGER_CACHE_SLOTS (1024 + 128) // 1023 positive, 128 negative, and a zero
+#define STRING_CACHE_SLOTS 512
+#define INTEGER_CACHE_SLOTS (255 + 1 + 128) // 255 positive, 128 negative, and a zero
 #define INTEGER_CACHE_NNEG 128 // Number of negative slots in the integer cache
 
-// Minimum sizes for the 'extra' and 'item' adaptive allocation weights
-#define EXTRA_ALLOC_MIN 64
-#define ITEM_ALLOC_MIN 6
+// Defaults for the AVG scale variables
+#define AVG_ITEM_SIZE_DEFAULT 16.0
+#define AVG_FLUCTUATION_DEFAULT 0.25
 
 // Recursion limit
 #define RECURSION_LIMIT 1000
@@ -46,6 +45,7 @@
 // Dict item for extensions
 typedef struct {
     PyObject_HEAD
+
     char id;        // ID of the type
     PyObject *func; // The function used for encoding objects of the type set as the dict's key
 } ext_dictitem_t;
@@ -61,8 +61,9 @@ typedef struct {
 // Extensions object
 typedef struct {
     PyObject_HEAD
+
     ext_data_t data;
-    PyObject *funcs[256]; // The functions array, inlined to avoid having to allocate it
+    PyObject *funcs[256]; // The functions array
 } extensions_t;
 
 static PyTypeObject ExtDictItemObj;
@@ -101,7 +102,6 @@ typedef struct {
         PyObject *file_name;
         PyObject *types;
         PyObject *extensions;
-        PyObject *allow_subclasses;
         PyObject *pass_memoryview;
         PyObject *str_keys;
         PyObject *reading_offset;
@@ -143,17 +143,23 @@ typedef struct {
 typedef struct {
     PyObject_HEAD
 
+    // Stream-specific averages
+    double avg_item_size;
+    double avg_fluctuation;
+
     bool str_keys;     // Whether to allow string keys
     PyObject *ext;     // The extensions object to use
     mstates_t *states; // The module states
+
+    PyObject *module;  // Reference to the module
 } stream_t;
 
 typedef struct {
     PyObject_HEAD
 
-    #ifdef _need_threadsafe
-    atomic_flag lock; // Object lock for multithreaded environments
-    #endif
+    // Stream-specific averages
+    double avg_item_size;
+    double avg_fluctuation;
 
     bool str_keys;     // Whether to allow string keys
     PyObject *ext;     // The extensions object to use
@@ -166,6 +172,8 @@ typedef struct {
     size_t fbuf_size; // The size of the file buffer
 
     char *fname;      // The filename
+
+    PyObject *module; // Reference to the module
 } filestream_t;
 
 static PyTypeObject StreamObj;
@@ -581,12 +589,10 @@ static PyObject *Extensions(PyObject *self, PyObject **args, Py_ssize_t nargs, P
     mstates_t *states = get_mstates(self);
 
     PyObject *dict = NULL;
-    PyObject *allow_subclasses = NULL;
     PyObject *pass_memview = NULL;
 
     keyarg_t keyargs[] = {
         KEYARG(&dict, &PyDict_Type, states->interned.types),
-        KEYARG(&allow_subclasses, &PyBool_Type, states->interned.allow_subclasses),
         KEYARG(&pass_memview, &PyBool_Type, states->interned.pass_memoryview),
     };
 
@@ -1310,30 +1316,48 @@ static _always_inline bool write_extension(buffer_t *b, PyObject *obj)
 //  OBJECT CACHES  //
 /////////////////////
 
-static _always_inline uint32_t fnv1a_32(const char *data, size_t size)
-{
-    uint32_t hash = 0x811c9dc5;
+#define MM2_CONSTANT 0x5BD1E995
 
-    for (size_t i = 0; i < size; ++i)
+static _always_inline uint32_t murmur2_hash(char *data, size_t size)
+{
+    uint32_t hash = size;
+
+    while (size >= 4)
     {
-        hash ^= data[i];
-        hash *= 0x01000193;
+        uint32_t chunk;
+        memcpy(&chunk, data, 4);
+
+        chunk *= MM2_CONSTANT;
+        chunk ^= chunk >> 24;
+        chunk *= MM2_CONSTANT;
+
+        hash *= MM2_CONSTANT;
+        hash ^= chunk;
+
+        data += 4;
+        size -= 4;
     }
+
+    switch (size)
+    {
+    case 3: hash ^= data[2] << 16;
+    case 2: hash ^= data[1] <<  8;
+    case 1: hash ^= data[0];
+            hash *= MM2_CONSTANT;
+    }
+
+    hash ^= hash >> 13;
+    hash *= MM2_CONSTANT;
+    hash ^= hash >> 15;
 
     return hash;
 }
 
-// Create a string (<32 bytes) and attempt to get it from cache
-static _always_inline PyObject *get_cached_str(buffer_t *b, size_t size)
+// Attempt to get a string from the string cache before constructing it from scratch
+static _always_inline PyObject *get_cached_str(char *ptr, size_t size, strcache_t *cache)
 {
-    // Pointer to the string is at the current offset
-    const char *ptr = b->offset;
-
-    // Get the string cache
-    strcache_t *cache = &b->states->caches.strings;
-
     // Calculate the hash of the string
-    const size_t hash = fnv1a_32(ptr, size) & (STRING_CACHE_SLOTS - 1);
+    const size_t hash = murmur2_hash(ptr, size) % STRING_CACHE_SLOTS;
 
     // Lock the cache slot
     lock_flag(&cache->locks[hash]);
@@ -1348,7 +1372,7 @@ static _always_inline PyObject *get_cached_str(buffer_t *b, size_t size)
         const size_t msize = match->length;
 
         // Compare the match to the required string
-        if (msize == size && memcmp_small(mbase, ptr, size))
+        if (msize == size && memcmp(mbase, ptr, size) == 0)
         {
             // Get reference to the match object
             Py_INCREF(match);
@@ -1443,13 +1467,13 @@ static _always_inline PyObject *create_map(buffer_t *b, const size_t npairs)
 
         // Special case for fixsize strings
         const unsigned char mask = b->offset[0];
-        if ((mask & 224) == DT_STR_FIXED) // 224 = 0b11100000
+        if ((mask & 224) == DT_STR_FIXED)
         {
             b->offset++;
 
-            const size_t size = mask & 31; // 31 = 0b11111
+            const size_t size = mask & 31;
 
-            key = get_cached_str(b, size);
+            key = PyUnicode_DecodeUTF8(b->offset, size, NULL);
             b->offset += size;
         }
         else
@@ -1571,25 +1595,25 @@ static _always_inline bool encode_object_inline(buffer_t *b, PyObject *obj)
 #define SIZEBYTE ((unsigned char)(b->offset++)[0])
 
 // Masks away the top 3 bits of a mask for varlen cases, as they all have the same upper 3 bits
-#define VARLEN_DT(mask) (mask & 31) // 31 = 0b11111
+#define VARLEN_DT(mask) (mask & 31)
 
 // Decoding of fixsize objects
 static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char mask)
 {
     // Check which type we got
-    if ((mask & 224) == DT_STR_FIXED) // 224 = 0b11100000
+    if ((mask & 224) == DT_STR_FIXED)
     {
-        mask &= 31; // 31 = 0b11111
+        mask &= 31;
 
         if (!overread_check(b, mask))
             return NULL;
 
-        PyObject *obj = get_cached_str(b, mask);
+        PyObject *obj = PyUnicode_DecodeUTF8(b->offset, mask, NULL);
         b->offset += mask;
 
         return obj;
     }
-    else if ((mask & 128) == DT_UINT_FIXED) // 128 = 0b10000000, uint only has upper bit set to 0
+    else if ((mask & 128) == DT_UINT_FIXED) // Uint only has upper bit set to 0
     {
         return get_cached_int(b, mask);
     }
@@ -1598,12 +1622,12 @@ static _always_inline PyObject *decode_bytes_fixsize(buffer_t *b, unsigned char 
         int8_t num = mask & 31;
 
         // Sign-extend the number if it's negative
-        if ((num & 16) == 16) // 16 = 0b10000
-            num |= ~31; // 31 = 0b11111
+        if ((num & 16) == 16)
+            num |= ~31;
 
         return get_cached_int(b, num);
     }
-    else if ((mask & 240) == DT_ARR_FIXED) // 240 = 0b11110000, bit 5 is also set on ARR and MAP
+    else if ((mask & 240) == DT_ARR_FIXED) // The 5th bit is used on ARR and MAP too, instead of just the upper 3
     {
         return create_array(b, mask & 0x0F);
     }
@@ -1674,9 +1698,6 @@ static _always_inline PyObject *decode_bytes_varlen(buffer_t *b, const unsigned 
 
         uint16_t num = SIZEBYTE << 8;
         num |= SIZEBYTE;
-
-        if (num <= 1023)
-            return get_cached_int(b, num);
         
         return PyLong_FromUnsignedLongLong(num);
     }
@@ -1952,7 +1973,7 @@ static PyObject *decode_bytes(buffer_t *b)
     const unsigned char mask = SIZEBYTE;
 
     // Only fixsize values don't have `110` set on the upper 3 mask bits
-    if ((mask & 224) != 192) // 224 = 0b11100000, 192 = 0b11000000
+    if ((mask & 224) != 192)
     {
         return decode_bytes_fixsize(b, mask);
     }
@@ -1968,51 +1989,44 @@ static PyObject *decode_bytes(buffer_t *b)
 //  ADAPTIVE ALLOCATION  //
 ///////////////////////////
 
-// Use thread-local variables instead of atomic variables for thread-safety and
-// to keep the averages more local, and to prevent counterintuitive scaling
-_Thread_local size_t extra_avg = (EXTRA_ALLOC_MIN * 2);
-_Thread_local size_t item_avg = (ITEM_ALLOC_MIN * 2);
+// Global averages, made thread-local for thread safety
+_Thread_local double avg_item_size = AVG_ITEM_SIZE_DEFAULT;
+_Thread_local double avg_fluctuation = AVG_FLUCTUATION_DEFAULT;
 
-static _always_inline size_t biased_average(size_t curr, size_t new)
+static _always_inline void update_adaptive_allocation(buffer_t *b, size_t nitems, double *_avg_item_size, double *_avg_fluctuation)
 {
-    const size_t curr_doubled = curr * 2;
-
-    // Safety against growing too quickly by limiting growth size to a factor of 2
-    if (curr_doubled < new)
-        return curr_doubled;
-    
-    // Return a biased average leaning more towards the current value
-    return (curr_doubled + new) / 3;
-}
-
-// Safely set a minimum value in a way that accounts for overflow cases
-#define _SAFE_MIN(val, min) \
-    (Py_ssize_t)val < min ? min : val
-
-static _always_inline void update_adaptive_allocation(buffer_t *b, size_t nitems)
-{
-    const size_t needed = (size_t)(b->offset - PyBytes_AS_STRING(b->base));
-
-    // Take the average between how much we needed and the currently set value
-    extra_avg = biased_average(extra_avg, needed);
-
-    // Enforce the minimum value of EXTRA_ALLOC_MIN
-    extra_avg = _SAFE_MIN(extra_avg, EXTRA_ALLOC_MIN);
-    
-    // Return if NITEMS is 0 to avoid division by zero
     if (nitems == 0)
         return;
+    
+    double avg_item_size = *_avg_item_size;
+    double avg_fluctuation = *_avg_fluctuation;
 
-    // Size allocated per item and required per item
-    const size_t needed_per_item = needed * pow((double)nitems, -1.0); // Multiply by reciprocal, faster than division
+    double used  = (double)(b->offset - PyBytes_AS_STRING(b->base)) / nitems;
+    double extra = (double)(b->maxoffset - b->offset) / nitems;
 
-    // Take the average between the currently set per-item value and that of this round
-    item_avg = biased_average(item_avg, needed_per_item);
+    double fluctuation = extra / used;
 
-    // Ensure a minimum value of ITEM_ALLOC_MIN
-    item_avg = _SAFE_MIN(item_avg, ITEM_ALLOC_MIN);
+    if (used < avg_item_size)
+    {
+        avg_item_size = ((avg_item_size * 3) + used) / 4;
+    }
+    else
+    {
+        avg_item_size = (avg_item_size + (used * 2)) / 3;
+    }
 
-    return;
+    avg_fluctuation = ((avg_fluctuation * 7) + fluctuation) / 8;
+
+    // Ensure a minimum avg size of 6
+    if (avg_item_size < 6)
+        avg_item_size = 6;
+    
+    // Ensure a maximum avg fluctuation of 0.8
+    if (avg_fluctuation > 0.8)
+        avg_fluctuation = 0.8;
+    
+    *_avg_item_size = avg_item_size;
+    *_avg_fluctuation = avg_fluctuation;
 }
 
 
@@ -2022,8 +2036,6 @@ static _always_inline void update_adaptive_allocation(buffer_t *b, size_t nitems
 
 static _always_inline PyObject *encoding_write_file(buffer_t *b, filestream_t *fstream, size_t datasize)
 {
-    lock_flag(&fstream->lock);
-
     // Write the data to the file
     size_t written;
     Py_BEGIN_ALLOW_THREADS
@@ -2053,17 +2065,13 @@ static _always_inline PyObject *encoding_write_file(buffer_t *b, filestream_t *f
                 "\n\tErrno %i: %s", start_offset, written, err, strerror(err));
         }
 
-        unlock_flag(&fstream->lock);
-
         return NULL;
     }
-
-    unlock_flag(&fstream->lock);
 
     Py_RETURN_NONE;
 }
 
-static _always_inline PyObject *encoding_start(PyObject *obj, mstates_t *states, PyObject *ext, bool str_keys, filestream_t *fstream)
+static _always_inline PyObject *encoding_start(PyObject *obj, mstates_t *states, PyObject *ext, bool str_keys, filestream_t *fstream, double *avg_item_size, double *avg_fluctuation)
 {
     buffer_t b;
 
@@ -2074,14 +2082,19 @@ static _always_inline PyObject *encoding_start(PyObject *obj, mstates_t *states,
     b.recursion = 0;
 
     // Estimate how much to allocate for the encoding buffer
-    size_t buffersize = extra_avg;
+    size_t buffersize = 64; // Default size of 64
     size_t nitems = 0;
 
     // Check if the object is a list/tuple/dict for adaptive allocation
-    if (PyList_CheckExact(obj) || PyTuple_CheckExact(obj) || PyDict_CheckExact(obj))
+    if (PyList_Check(obj) || PyTuple_Check(obj) || PyDict_Check(obj))
     {
+        // Set the fluctuation weight to at least 0.15
+        double fluctuation_weight = *avg_fluctuation < 0.15 ? 0.15 : *avg_fluctuation;
+
         nitems = Py_SIZE(obj);
-        buffersize += item_avg * nitems;
+
+        // Add the fluctuation weight to allow headroom for fluctuations in data size
+        buffersize += *avg_item_size * nitems * (1.0 + fluctuation_weight);
     }
     
     // Allocate the buffer
@@ -2106,7 +2119,7 @@ static _always_inline PyObject *encoding_start(PyObject *obj, mstates_t *states,
     Py_SET_SIZE(b.base, datasize);
 
     // Update the adaptive allocation
-    update_adaptive_allocation(&b, nitems);
+    update_adaptive_allocation(&b, nitems, avg_item_size, avg_fluctuation);
 
     // If not streaming, just return the object
     if (!fstream)
@@ -2185,15 +2198,13 @@ static _always_inline PyObject *decoding_start(PyObject *encoded, mstates_t *sta
     fstream->fbuf = b.base;
     fstream->fbuf_size = b.fbuf_size;
 
-    unlock_flag(&fstream->lock);
-
     return result;
 }
 
 // Expand the encoding buffer when it doesn't have enough space
 static bool encoding_expand_buffer(buffer_t *b, size_t required)
 {
-    // Scale the size by factor 1.5x
+    // Scale the size by a factor of 1.5x
     const size_t allocsize = ((size_t)(b->offset - PyBytes_AS_STRING(b->base)) + required) * 1.5;
 
     // Reallocate the object (also allocate space for the bytes object itself)
@@ -2315,7 +2326,7 @@ static PyObject *encode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     if (!parse_keywords(npositional, args, nargs, kwargs, keyargs, NKEYARGS(keyargs)))
         return NULL;
 
-    return encoding_start(obj, states, ext, str_keys == Py_True, NULL);
+    return encoding_start(obj, states, ext, str_keys == Py_True, NULL, &avg_item_size, &avg_fluctuation);
 }
 
 static PyObject *decode(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObject *kwargs)
@@ -2376,6 +2387,13 @@ static PyObject *Stream(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
     stream->states = states;
     stream->str_keys = str_keys == Py_True;
 
+    stream->avg_item_size = AVG_ITEM_SIZE_DEFAULT;
+    stream->avg_fluctuation = AVG_FLUCTUATION_DEFAULT;
+
+    // Keep a reference to the module
+    Py_INCREF(self);
+    stream->module = self;
+
     // Keep a reference to the ext object
     Py_INCREF(ext);
 
@@ -2384,14 +2402,15 @@ static PyObject *Stream(PyObject *self, PyObject **args, Py_ssize_t nargs, PyObj
 
 static void stream_dealloc(stream_t *stream)
 {
-    // Remove reference to the ext object
+    Py_DECREF(stream->module);
     Py_DECREF(stream->ext);
+
     PyObject_Del(stream);
 }
 
 static PyObject *stream_encode(stream_t *stream, PyObject *obj)
 {
-    return encoding_start(obj, stream->states, stream->ext, stream->str_keys, NULL);
+    return encoding_start(obj, stream->states, stream->ext, stream->str_keys, NULL, &stream->avg_item_size, &stream->avg_fluctuation);
 }
 
 static PyObject *stream_decode(stream_t *stream, PyObject *encoded)
@@ -2528,9 +2547,6 @@ static bool filestream_setup_fdata(filestream_t *stream, PyObject *filename, PyO
     // Disable file buffering as we already read/write in a chunk-like manner
     setbuf(stream->file, NULL);
 
-    // Initialize the file lock
-    clear_flag(&stream->lock);
-
     return true;
 }
 
@@ -2580,6 +2596,13 @@ static PyObject *FileStream(PyObject *self, PyObject **args, Py_ssize_t nargs, P
     stream->states = states;
     stream->str_keys = str_keys == Py_True;
 
+    stream->avg_item_size = AVG_ITEM_SIZE_DEFAULT;
+    stream->avg_fluctuation = AVG_FLUCTUATION_DEFAULT;
+
+    // Keep a reference to the module
+    Py_INCREF(self);
+    stream->module = self;
+
     // Keep a reference to the ext object
     Py_INCREF(ext);
 
@@ -2593,7 +2616,7 @@ static void filestream_dealloc(filestream_t *stream)
     free(stream->fname);
     fclose(stream->file);
 
-    // Remove reference to the ext object
+    Py_DECREF(stream->module);
     Py_DECREF(stream->ext);
 
     PyObject_Del(stream);
@@ -2601,7 +2624,7 @@ static void filestream_dealloc(filestream_t *stream)
 
 static PyObject *filestream_encode(filestream_t *stream, PyObject *obj)
 {
-    return encoding_start(obj, stream->states, stream->ext, stream->str_keys, stream);
+    return encoding_start(obj, stream->states, stream->ext, stream->str_keys, stream, &stream->avg_item_size, &stream->avg_fluctuation);
 }
 
 static PyObject *filestream_decode(filestream_t *stream)
@@ -2731,7 +2754,6 @@ static bool setup_mstates(PyObject *m)
     GET_ISTR(file_name)
     GET_ISTR(types)
     GET_ISTR(extensions)
-    GET_ISTR(allow_subclasses)
     GET_ISTR(pass_memoryview)
     GET_ISTR(str_keys)
     GET_ISTR(reading_offset)
@@ -3022,4 +3044,3 @@ PyMODINIT_FUNC PyInit_cmsgpack(void)
 
     return m;
 }
-

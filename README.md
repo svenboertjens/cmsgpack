@@ -83,9 +83,7 @@ assert obj == decoded # True
 
 ## GIL-free Python
 
-This module is compatible with the GIL-free Python version. Any concurrency hazards are addressed with thread-local variables and atomic locks, to avoid race conditions or corruption. As these measures have a small performance cost, they are only enabled when `Py_NOGIL` is declared by Python, saving the performance cost when it's not needed.
-
-If you plan to use the `FileStream` class in a GIL-free Python build, it is recommended to use a separate instance per thread. This object is locked internally when in use, so any other threads attempting to use it will be halted indefinitely.
+This module is compatible with GIL-free Python builds. Internal concurrency concerns are addressed by making them thread-local or adding atomic locks around them. However, class objects (`Stream`/`FileStream`/`Extensions`) are **not** thread-safe and should only be used concurrently by a single thread.
 
 
 ## Questions and feedback
