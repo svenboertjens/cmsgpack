@@ -1467,14 +1467,26 @@ static _always_inline PyObject *create_map(buffer_t *b, const size_t npairs)
 
             const size_t size = mask & 31;
 
-            key = PyUnicode_DecodeUTF8(b->offset, size, NULL);
+            if (!overread_check(b, size))
+            {
+                Py_DECREF(dict);
+                return NULL;
+            }
+
+            key = get_cached_str(b->offset, size, &b->states->caches.strings);
             b->offset += size;
+
+            if (!key)
+            {
+                Py_DECREF(dict);
+                return NULL;
+            }
         }
         else
         {
             key = decode_bytes(b);
 
-            if (key == NULL)
+            if (!key)
             {
                 Py_DECREF(dict);
                 return NULL;
@@ -2089,8 +2101,8 @@ static _always_inline PyObject *encoding_start(PyObject *obj, mstates_t *states,
 
         nitems = Py_SIZE(obj);
 
-        // Add the fluctuation weight to allow headroom for fluctuations in data size
-        buffersize = *avg_item_size * nitems * (1.0 + fluctuation_weight);
+        // Add the fluctuation weight to allow headroom for fluctuations in data size, and add 1 to ensure it's not zero
+        buffersize = (*avg_item_size * nitems * (1.0 + fluctuation_weight)) + 1;
 
         b.base = (char *)PyBytes_FromStringAndSize(NULL, buffersize);
 
@@ -2210,7 +2222,7 @@ static _always_inline PyObject *decoding_start(PyObject *encoded, mstates_t *sta
 // Expand the encoding buffer when it doesn't have enough space
 static bool encoding_expand_buffer(buffer_t *b, size_t required)
 {
-    // Scale the size by a factor of 1.5x
+    // Scale the size by a factor of 1.5
     const size_t allocsize = ((size_t)(b->offset - PyBytes_AS_STRING(b->base)) + required) * 1.5;
 
     // Reallocate the object (also allocate space for the bytes object itself)

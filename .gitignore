@@ -1,6 +1,7 @@
 build
 dist
 local
+wheelhouse
 
 .vscode
 .obsidian

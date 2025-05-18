@@ -29,20 +29,23 @@ import string
 
 random.seed(0xA1B2C3D4)
 
+def random_string(mmin, mmax):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=random.randint(mmin, mmax)))
+
 def generate_test_values():
     return {
         "fixstr": [
-            ''.join(random.choices(string.ascii_letters + string.digits, k=random.randint(0, 31)))
+            random_string(0, 31)
             for _ in range(2048)
         ],
 
         "str8": [
-            ''.join(random.choices(string.ascii_letters + string.digits, k=random.randint(32, 255)))
+            random_string(32, 255)
             for _ in range(1024)
         ],
 
         "str16": [
-            ''.join(random.choices(string.ascii_letters + string.digits, k=random.randint(256, 0xFFF)))
+            random_string(256, 0xFFF)
             for _ in range(256)
         ],
 
@@ -102,19 +105,17 @@ def generate_test_values():
 
         "fixmap": [
             {
-                str(random.randint(0, 0xFFFF)): None
+                random_string(4, 31): None
                 for _ in range(15)
             }
-            for _ in range(256)
-        ],
+        ] * 256,
 
         "map16": [
             {
-                str(random.randint(0, 0xFFFF)): None
+                random_string(4, 31): None
                 for _ in range(16, 0xFF)
             }
-            for _ in range(32)
-        ],
+        ] * 32,
 
         "states": [
             True, False, None

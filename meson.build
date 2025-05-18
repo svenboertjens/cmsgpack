@@ -1,7 +1,7 @@
 project(
   'cmsgpack',
   'c',
-  version: '0.1.1',
+  version: '0.1.2',
   meson_version: '>=1.2.0',
   default_options: [
     'buildtype=release',
