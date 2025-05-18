@@ -6,11 +6,6 @@
 //  SUPPORT CHECKS  //
 //////////////////////
 
-// MSVC is not supported
-#ifdef _MSC_VER
-    #error "The MSVC compiler is not supported due to its lack of C standard support"
-#endif
-
 // Dummy __has_builtin macro always resulting in false
 #ifndef __has_builtin
     #define __has_builtin(name) 0
@@ -35,31 +30,17 @@
 #endif
 
 
-#if defined(Py_GIL_DISABLED)
+// Lock a flag
+#define lock_flag(flag) \
+    { while (atomic_flag_test_and_set_explicit(flag, memory_order_acquire)) { } }
 
-    // Define macro for needing thread-safety
-    #define _need_threadsafe
+// Unlock a flag
+#define unlock_flag(flag) \
+    { atomic_flag_clear_explicit(flag, memory_order_release); }
 
-    // Lock a flag
-    #define lock_flag(flag) \
-        { while (atomic_flag_test_and_set_explicit(flag, memory_order_acquire)) { } }
-
-    // Unlock a flag
-    #define unlock_flag(flag) \
-        { atomic_flag_clear_explicit(flag, memory_order_release); }
-
-    // Clear a flag / initialize it to unset
-    #define clear_flag(flag) \
-        { atomic_flag_clear(flag); }
-
-#else
-
-    // Dummy macros with no effect
-    #define lock_flag(flag)
-    #define unlock_flag(flag)
-    #define clear_flag(flag)
-
-#endif
+// Clear a flag / initialize it to unset
+#define clear_flag(flag) \
+    { atomic_flag_clear(flag); }
 
 
 #ifdef _big_endian

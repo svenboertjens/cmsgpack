@@ -1,97 +1,81 @@
 # `cmsgpack`
 
-**Contents:**
-- [Introduction](#introduction)
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [GIL-free Python](#gil-free-python)
-- [Questions/feedback](#questions-and-feedback)
-- [License](#license)
 
 ## Introduction
 
-`cmsgpack` is a serializer for Python. It supports and uses the [MessagePack](https://msgpack.org/) format, as the name may have given away already.
+`cmsgpack` is an optimized MessagePack implementation for Python, offering high performance and a developer-friendly API.
 
-But why use `cmsgpack`, and not an existing solution like `msgpack`, or even an optimized solution like `msgspec` or `ormsgpack`? While these options are already great, `cmsgpack` aims to be even better by offering a **development-friendly API** with many useful features, **extremely fast serialization**, and **optimized memory usage**.
+But why use `cmsgpack`, and not the default `msgpack`? Well, `cmsgpack`...
+- is optimized for **high-performance serialization** and uses heuristics-based allocation to avoid reallocations and memory waste where possible;
+- supports native, chunked file streaming for efficient large file operations;
+- provides unique features that make the API more intuitive and flexible.
 
-`cmsgpack` uses smart caching techniques and adaptive allocation to reduce the number of memory allocations, which is beneficial for not only performance, but also for memory fragmentation, which can make performance suffer in the long run.
+If you're looking for something specific, see these:
+- :rocket: **Quick Start**: For a quick look on how to use `cmsgpack`, see the [Quick Start](#quick-start).
+- :wrench: **API & Usage**: For details on `cmsgpack`'s API and how to use it, see [USAGE](USAGE.md).
+- :watch: **Benchmarks**: For benchmark comparisons, see [BENCHMARK](BENCHMARK.md).
+- :information_source: **Compatibility**: For compatibility details, see [Compatibility](#compatibility)
 
-For performance benchmarks, see the [benchmark script](benchmarks/benchmark.py) for a benchmark comparison between `cmsgpack`, `ormsgpack`, and `msgspec`.
 
+## Quick Start
 
-## Installation
+This section gives a basic example of how to install and use `cmsgpack`. See [USAGE](USAGE.md) for the complete documentation.
 
-The Python module is available via **pip**. To install it, you can use this command:
+### Installation
+
+`cmsgpack` can be installed using **pip**:
 
 ```shell
 pip install cmsgpack
 ```
 
-If you want to manually install it from the source, you can use **git**. Do note that this method might install a version with unfinished or unstable changes.
 
-```shell
-git clone https://github.com/svenboertjens/cmsgpack.git
-cd cmsgpack
-pip install .
-```
+### Basic Serialization
 
-> [Note]
->
-> The module is distributed as a "source distribution" (sdist) package, meaning it must be compiled during installation. This requires a C compiler (with C11 support). Recommended compilers are **GCC** and **Clang**. **MSVC is not supported** due to its lack of standards compliance.
-
-
-## Quick start
-
-Need just the basics? Here's a quick start guide! For the complete guide, see the [usage](USAGE.md) file.
-
-For encoding our Python objects, we use the function `encode`, and for decoding data we use the function `decode`. These are the (simplified) function signatures of these functions:
-
-For encoding Python objects, we use the function `encode`. This function accepts any of the [supported types](USAGE.md#supported-types) and returns a `bytes` object with the encoded data.
-For decoding any MessagePack-encoded data (like what `encode` returns), we use the function `decode`. This function accepts the encoded data and returns the decoded Python object.
-
-These are the simplified function signatures of the functions:
+To serialize data, use `cmsgpack.encode` and `cmsgpack.decode`:
 
 ```python
 cmsgpack.encode(obj: any) -> bytes
 cmsgpack.decode(encoded: bytes) -> any
 ```
 
-For `encode`, the argument `obj` is the Python object to encode.
-For `decode`, the argument `encoded` is the object holding the encoded data.
-
-Here is a basic example on how these functions are used:
+An example of how these functions can be used:
 
 ```python
 import cmsgpack
 
-# This is the value we want to encode
-obj = ["Hello", "world!"]
+# Any value we want to encode
+obj = "Hello, world!"
 
-# We can encode it using `encode`
+# Encode it using `cmsgpack.encode`:
 encoded = cmsgpack.encode(obj)
 
-# Your code...
-...
+# `encoded` now holds our encoded data as bytes
 
-# We can decode it again using `decode`
+# Decode it again using `cmsgpack.decode`:
 decoded = cmsgpack.decode(encoded)
 
-# Now, `decoded` is a copy of `obj`
+# `decoded` now holds the original value, `obj`
 assert obj == decoded # True
 ```
 
-
-## GIL-free Python
-
-This module is compatible with GIL-free Python builds. Internal concurrency concerns are addressed by making them thread-local or adding atomic locks around them. However, class objects (`Stream`/`FileStream`/`Extensions`) are **not** thread-safe and should only be used concurrently by a single thread.
+If you are unsure if a type is supported, check the [supported types](USAGE.md#supported-types) to see if it's mentioned there, or what to do otherwise.
 
 
-## Questions and feedback
+## Compatibility
 
-If you have any questions or feedback, feel free to contact me by [mail](mailto:boertjens.sven@gmail.com) or create an issue on the [GitHub](https://github.com/svenboertjens/cmsgpack) page.
+- **Compilers**: Supports all compilers compatible with C11. When building from source, ensure a compliant compiler is used.
+- **Endianness**: Supports both big-endian and little-endian systems. Endianness is determined at compile-time; runtime changes are not supported.
+- **Word size**: Tested on 64-bit systems; 32-bit systems are expected to work but are not officially tested.
+- **Multi-Threading**: Internal thread safety is ensured for no-GIL Python builds. All class objects (`Stream`, `FileStream`, and `Extemsions`) must not be used concurrently across threads.
 
 
-# License
+## Questions & Feedback
 
-This library is licensed under the MIT license. See the [license file](LICENSE).
+Have a question, issue, or idea? Feel free to [open an issue](https://github.com/svenboertjens/cmsgpack/issues) or [email me](mailto:boertjens.sven@gmail.com).
+
+
+## License
+
+This library is licensed under the MIT license. See [LICENSE](LICENSE).
 

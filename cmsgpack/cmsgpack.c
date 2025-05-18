@@ -7,11 +7,7 @@
 
 #include <Python.h>
 #include <stdbool.h>
-
-// Check if we need to consider thread-safety (for GIL-free Python)
-#ifdef _need_threadsafe
-    #include <stdatomic.h>
-#endif
+#include <stdatomic.h>
 
 ///////////////////
 //   CONSTANTS   //
@@ -84,9 +80,7 @@ typedef struct {
     uint8_t match_strength[STRING_CACHE_SLOTS];
 
     // One lock for each slot
-    #ifdef _need_threadsafe
     atomic_flag locks[STRING_CACHE_SLOTS];
-    #endif
 } strcache_t;
 
 // Integer cache struct
@@ -2081,9 +2075,11 @@ static _always_inline PyObject *encoding_start(PyObject *obj, mstates_t *states,
     b.states = states;
     b.recursion = 0;
 
-    // Estimate how much to allocate for the encoding buffer
-    size_t buffersize = 64; // Default size of 64
+    // This will hold the number of items of the object if it's a container type
     size_t nitems = 0;
+
+    // This will hold the size of the allocated buffer
+    size_t buffersize;
 
     // Check if the object is a list/tuple/dict for adaptive allocation
     if (PyList_Check(obj) || PyTuple_Check(obj) || PyDict_Check(obj))
@@ -2094,14 +2090,24 @@ static _always_inline PyObject *encoding_start(PyObject *obj, mstates_t *states,
         nitems = Py_SIZE(obj);
 
         // Add the fluctuation weight to allow headroom for fluctuations in data size
-        buffersize += *avg_item_size * nitems * (1.0 + fluctuation_weight);
-    }
-    
-    // Allocate the buffer
-    b.base = (char *)PyBytes_FromStringAndSize(NULL, buffersize);
+        buffersize = *avg_item_size * nitems * (1.0 + fluctuation_weight);
 
-    if (!b.base)
-        return PyErr_NoMemory();
+        b.base = (char *)PyBytes_FromStringAndSize(NULL, buffersize);
+
+        // Do a flat allocation if we couldn't allocate with this
+        if (!b.base)
+            goto flat_alloc;
+    }
+    else
+    {
+        flat_alloc:
+
+        buffersize = 256;
+        b.base = (char *)PyBytes_FromStringAndSize(NULL, buffersize);
+
+        if (!b.base)
+            return PyErr_NoMemory();
+    }
     
     // Set the offset and max offset
     b.offset = PyBytes_AS_STRING(b.base);
@@ -2767,13 +2773,9 @@ static bool setup_mstates(PyObject *m)
     // Initialize match strengths as 1 so that they'll immediately reach 0 on the first decrement
     memset(s->caches.strings.match_strength, 1, sizeof(s->caches.strings.match_strength));
 
-    #ifdef _need_threadsafe
-
     // Initialize the string cache's locks to a clear state
     for (size_t i = 0; i < STRING_CACHE_SLOTS; ++i)
         clear_flag(&s->caches.strings.locks[i]);
-
-    #endif
 
 
     // Dummy objects to copy into the cache
