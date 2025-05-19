@@ -2021,7 +2021,7 @@ static _always_inline void update_adaptive_allocation(buffer_t *b, size_t nitems
         avg_item_size = (avg_item_size + (used * 2)) / 3;
     }
 
-    avg_fluctuation = ((avg_fluctuation * 7) + fluctuation) / 8;
+    avg_fluctuation = ((avg_fluctuation * 3) + fluctuation) / 4;
 
     // Ensure a minimum avg size of 6
     if (avg_item_size < 6)

@@ -13,7 +13,7 @@ But why use `cmsgpack`, and not the default `msgpack`? Well, `cmsgpack`...
 If you're looking for something specific, see these:
 - :rocket: **Quick Start**: For a quick look on how to use `cmsgpack`, see the [Quick Start](#quick-start).
 - :wrench: **API & Usage**: For details on `cmsgpack`'s API and how to use it, see [USAGE](USAGE.md).
-- :watch: **Benchmarks**: For benchmark comparisons, see [BENCHMARK](BENCHMARK.md).
+- :watch: **Benchmarks**: For benchmark comparisons, see the benchmark files in [benchmarks](benchmarks/) (no BENCHMARK.md yet).
 - :information_source: **Compatibility**: For compatibility details, see [Compatibility](#compatibility)
 
 

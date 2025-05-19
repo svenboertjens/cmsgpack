@@ -161,7 +161,7 @@ for _ in range(RUNS):
             data["sums"][cat][1] += timeit.timeit(lambda: dec(encoded), number=ITERATIONS)
 
 
-print(f"## MessagePack serialization benchmarking ##")
+print(f"## MessagePack serialization benchmark ##")
 print(f"\n{RUNS} runs, {ITERATIONS} iterations per category")
 
 for cat in categories:
@@ -185,4 +185,3 @@ print("--------------+---------------+--------------")
 for modname, data in modules.items():
     totals = data["total"]
     print(f"  {modname:11s} |  {(str(totals[0])):.9s} s  |  {(str(totals[1])):.9s} s")
-
